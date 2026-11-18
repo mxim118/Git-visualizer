@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "git-visualizer"
+version = "0.1.0"
+description = "Desktop Git client with an interactive commit graph"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # Essentials содержит QtCore/QtGui/QtWidgets — этого достаточно для проекта.
+    # Метапакет PySide6 дополнительно тянет Addons и WebEngine (сотни МБ), они не нужны.
+    "PySide6-Essentials>=6.7,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+git-visualizer = "git_visualizer.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Позволяет запускать pytest и без установки пакета (pip install -e).
+pythonpath = ["src"]

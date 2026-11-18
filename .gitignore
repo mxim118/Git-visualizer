@@ -1,0 +1,35 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# --- Виртуальное окружение ---
+.venv/
+venv/
+env/
+
+# --- Тесты и инструменты ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- Сборка и дистрибутивы (setuptools, будущий PyInstaller) ---
+build/
+dist/
+# Файлы *.spec PyInstaller намеренно не игнорируются:
+# после ручной настройки (итерация 8) их стоит хранить в репозитории.
+
+# --- IDE и редакторы ---
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Файлы ОС ---
+.DS_Store
+Thumbs.db
+Desktop.ini
