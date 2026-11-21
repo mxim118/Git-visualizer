@@ -3,12 +3,39 @@
 Сообщения исключений технические и на английском. Перевод в понятные
 пользователю русские тексты выполняется на уровне Presentation (см. ТЗ 9.4, 9.5).
 
-Классификация по содержимому stderr (авторизация, сеть, конфликт и т. п.)
-в этот модуль добавляется отдельным шагом; здесь только ошибки самого запуска.
+Классификация ошибок Git по тексту stderr собрана здесь же (``classify_command_error``).
+Правила рассчитаны на английские сообщения: ``GitRunner`` запускает Git с ``LC_ALL=C``.
+Новые виды ошибок добавляются в ``GitErrorKind`` и ``_STDERR_RULES`` вместе с тестом
+на реальном сообщении Git.
 """
 
 import shlex
 from collections.abc import Sequence
+from enum import Enum
+
+
+class GitErrorKind(Enum):
+    """Вид ошибки команды Git, определённый по тексту stderr."""
+
+    UNKNOWN = "unknown"
+    NOT_A_REPOSITORY = "not_a_repository"  # папка не является репозиторием
+    UNSAFE_REPOSITORY = "unsafe_repository"  # «dubious ownership»: чужой владелец каталога
+
+
+# (вид ошибки, фрагмент stderr в нижнем регистре); побеждает первое совпадение.
+_STDERR_RULES: tuple[tuple[GitErrorKind, str], ...] = (
+    (GitErrorKind.UNSAFE_REPOSITORY, "detected dubious ownership"),
+    (GitErrorKind.NOT_A_REPOSITORY, "not a git repository"),
+)
+
+
+def classify_command_error(stderr: str) -> GitErrorKind:
+    """Определяет вид ошибки по stderr; неопознанная ошибка — ``UNKNOWN``."""
+    lowered = stderr.lower()
+    for kind, fragment in _STDERR_RULES:
+        if fragment in lowered:
+            return kind
+    return GitErrorKind.UNKNOWN
 
 
 class GitError(Exception):
@@ -92,6 +119,7 @@ class GitCommandError(GitError):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+        self.kind = classify_command_error(stderr)
 
     def technical_details(self) -> str:
         return _append_streams(super().technical_details(), self.stdout, self.stderr)

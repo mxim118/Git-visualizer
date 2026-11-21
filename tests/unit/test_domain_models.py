@@ -16,6 +16,7 @@ from git_visualizer.domain.models import (
     GraphEdge,
     GraphLayout,
     GraphNode,
+    Remote,
     Repository,
 )
 
@@ -376,6 +377,24 @@ def test_graph_layout_holds_nodes_and_edges() -> None:
 
 
 # --------------------------------------------------------------------------
+# Remote
+# --------------------------------------------------------------------------
+
+
+def test_remote_urls_are_optional() -> None:
+    remote = Remote(name="origin")
+
+    assert remote.fetch_url is None
+    assert remote.push_url is None
+
+
+def test_remote_may_have_different_fetch_and_push_urls() -> None:
+    remote = Remote(name="fork", fetch_url="git@host:a.git", push_url="git@host:b.git")
+
+    assert remote.fetch_url != remote.push_url
+
+
+# --------------------------------------------------------------------------
 # Общие свойства всех моделей
 # --------------------------------------------------------------------------
 
@@ -389,6 +408,7 @@ SAMPLES = [
     GraphNode(commit_hash=H1, x=0, y=0, lane=0),
     GraphEdge(child_hash=H1, parent_hash=H2, points=()),
     GraphLayout(),
+    Remote(name="origin"),
 ]
 
 

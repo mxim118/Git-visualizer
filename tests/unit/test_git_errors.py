@@ -3,9 +3,11 @@ import pytest
 from git_visualizer.infrastructure.git.git_errors import (
     GitCommandError,
     GitError,
+    GitErrorKind,
     GitLaunchError,
     GitNotFoundError,
     GitTimeoutError,
+    classify_command_error,
 )
 
 
@@ -51,3 +53,32 @@ def test_not_found_error_keeps_executable() -> None:
 
     assert error.executable == "git"
     assert "'git'" in str(error)
+
+
+# Сообщения ниже получены от реального Git 2.43.0 (LC_ALL=C).
+NOT_A_REPOSITORY_STDERR = "fatal: not a git repository (or any of the parent directories): .git\n"
+DUBIOUS_OWNERSHIP_STDERR = (
+    "fatal: detected dubious ownership in repository at '/tmp/own/r'\n"
+    "To add an exception for this directory, call:\n\n"
+    "\tgit config --global --add safe.directory /tmp/own/r\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (NOT_A_REPOSITORY_STDERR, GitErrorKind.NOT_A_REPOSITORY),
+        (DUBIOUS_OWNERSHIP_STDERR, GitErrorKind.UNSAFE_REPOSITORY),
+        ("FATAL: NOT A GIT REPOSITORY", GitErrorKind.NOT_A_REPOSITORY),  # регистр не важен
+        ("fatal: pathspec 'x' did not match any files\n", GitErrorKind.UNKNOWN),
+        ("", GitErrorKind.UNKNOWN),
+    ],
+)
+def test_classify_command_error(stderr: str, expected: GitErrorKind) -> None:
+    assert classify_command_error(stderr) is expected
+
+
+def test_command_error_kind_is_derived_from_stderr() -> None:
+    assert GitCommandError(128, stderr=NOT_A_REPOSITORY_STDERR).kind is GitErrorKind.NOT_A_REPOSITORY
+    assert GitCommandError(128, stderr=DUBIOUS_OWNERSHIP_STDERR).kind is GitErrorKind.UNSAFE_REPOSITORY
+    assert GitCommandError(1).kind is GitErrorKind.UNKNOWN
