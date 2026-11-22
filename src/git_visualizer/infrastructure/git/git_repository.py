@@ -9,10 +9,57 @@
 
 from pathlib import Path
 
-from git_visualizer.domain.models import Remote
+from git_visualizer.domain.models import Commit, Remote
 from git_visualizer.infrastructure.git.git_errors import GitCommandError
-from git_visualizer.infrastructure.git.git_parser import parse_remotes
+from git_visualizer.infrastructure.git.git_parser import (
+    history_log_format,
+    new_history_separator,
+    parse_history,
+    parse_remotes,
+)
 from git_visualizer.infrastructure.git.git_runner import GitResult, GitRunner
+
+
+def build_history_arguments(*, include_head: bool, limit: int, separator: str) -> list[str]:
+    """Аргументы ``git log`` для получения истории (ТЗ 5.2, FR-HIST-01).
+
+    * ``--branches --remotes`` — локальные и remote-tracking ветки. ``--all`` не
+      используется: он добавляет ``refs/stash`` и служебные коммиты stash в граф.
+    * ``HEAD`` добавляется только если он указывает на коммит (``include_head``): без
+      него пропали бы коммиты detached HEAD, а в репозитории без коммитов Git с ``HEAD``
+      завершается ошибкой.
+    * ``--topo-order`` — потомки всегда выводятся раньше своих родителей, даже если даты
+      коммитов «перепутаны»; порядок по дате граф бы ломал (ТЗ FR-HIST-03).
+    * ``--decorate-refs`` — явный список декорируемых refs (``HEAD``, ветки, remote-tracking
+      ветки): настройка пользователя ``log.excludeDecoration`` иначе молча скрывала бы
+      ветки в ``%D``; теги и ``refs/stash`` отсекаются тут же. ``HEAD`` нужно перечислять
+      явно, иначе пропадает маркер ``HEAD ->``. Опция есть в Git 2.22+.
+    * ``--encoding=UTF-8`` — вывод в UTF-8, даже если у пользователя настроен
+      ``i18n.logOutputEncoding``; ``--no-show-signature`` и ``--no-color`` — вывод Git не
+      засоряется настройками пользователя; ``-z`` — записи разделены NUL.
+    * Завершающий ``--``: без него файл с именем ``HEAD`` в рабочей директории делает
+      ``git log HEAD`` неоднозначным и приводит к ошибке.
+    """
+    if limit < 1:
+        raise ValueError(f"History limit must be positive, got {limit}")
+    arguments = ["log", "--branches", "--remotes"]
+    if include_head:
+        arguments.append("HEAD")
+    arguments += [
+        "--topo-order",
+        f"--max-count={limit}",
+        "--decorate=full",
+        "--decorate-refs=HEAD",
+        "--decorate-refs=refs/heads/",
+        "--decorate-refs=refs/remotes/",
+        "--encoding=UTF-8",
+        "--no-color",
+        "--no-show-signature",
+        "-z",
+        f"--format={history_log_format(separator)}",
+        "--",
+    ]
+    return arguments
 
 
 class GitRepository:
@@ -75,6 +122,28 @@ class GitRepository:
 
     def has_head(self) -> bool:
         return self.get_head_commit() is not None
+
+    def get_history(self, *, limit: int) -> tuple[Commit, ...]:
+        """История коммитов всех локальных и remote-tracking веток и ``HEAD``.
+
+        Коммиты идут в топологическом порядке (потомок раньше родителей), новые — первыми.
+        Не более ``limit`` коммитов; значение по умолчанию намеренно не задаётся здесь —
+        оно определено в одном месте (``application``). Если ``limit`` обрезал историю,
+        родители последних коммитов в результате отсутствуют: это обычная ситуация для
+        потребителя (граф). Пустой кортеж — коммитов нет.
+
+        Запускает два процесса Git: проверку ``HEAD`` и ``git log``.
+
+        :raises ValueError: ``limit`` меньше 1.
+        :raises GitCommandError: команда Git завершилась с ошибкой.
+        :raises GitOutputParseError: вывод Git не соответствует ожидаемому формату.
+        """
+        separator = new_history_separator()
+        arguments = build_history_arguments(
+            include_head=self.has_head(), limit=limit, separator=separator
+        )
+        result = self._run(arguments)
+        return parse_history(result.stdout, separator=separator, command=result.command)
 
     def get_remotes(self) -> tuple[Remote, ...]:
         """Настроенные remote; пустой кортеж, если их нет."""

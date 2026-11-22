@@ -125,6 +125,15 @@ class GitCommandError(GitError):
         return _append_streams(super().technical_details(), self.stdout, self.stderr)
 
 
+class GitOutputParseError(GitError):
+    """Git завершился успешно, но его вывод не удалось разобрать.
+
+    Это не ошибка пользователя: вывод не соответствует формату, который запрашивало
+    приложение (повреждённый репозиторий, неожиданная версия Git, ошибка в парсере).
+    Данные не «угадываются»: разбор прерывается, подробности — в ``technical_details()``.
+    """
+
+
 def _append_streams(text: str, stdout: str, stderr: str) -> str:
     lines = [text]
     if stdout.strip():
