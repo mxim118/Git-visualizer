@@ -472,9 +472,15 @@ def test_real_git_error_is_english_regardless_of_system_locale(
     monkeypatch.setenv("LANG", "ru_RU.UTF-8")
     monkeypatch.setenv("LANGUAGE", "ru")
     monkeypatch.setenv("LC_ALL", "ru_RU.UTF-8")
+    # pytest может создать tmp_path внутри рабочего Git-репозитория проекта.
+    # Запускаем Git во вложенном каталоге и не даём подняться выше tmp_path:
+    # иначе git status найдёт родительский репозиторий и завершится успешно.
+    work = tmp_path / "not-a-repository"
+    work.mkdir()
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
 
     with pytest.raises(GitCommandError) as info:
-        GitRunner().run(["status"], cwd=tmp_path)  # tmp_path не является репозиторием
+        GitRunner().run(["status"], cwd=work)  # work не является репозиторием
 
     assert info.value.returncode == 128
     assert "not a git repository" in info.value.stderr
