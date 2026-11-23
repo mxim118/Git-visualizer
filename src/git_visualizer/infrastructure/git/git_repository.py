@@ -9,11 +9,14 @@
 
 from pathlib import Path
 
-from git_visualizer.domain.models import Commit, Remote
+from git_visualizer.domain.models import Branch, Commit, Remote
 from git_visualizer.infrastructure.git.git_errors import GitCommandError
 from git_visualizer.infrastructure.git.git_parser import (
+    BRANCH_FORMAT,
+    BRANCH_PATTERNS,
     history_log_format,
     new_history_separator,
+    parse_branches,
     parse_history,
     parse_remotes,
 )
@@ -144,6 +147,22 @@ class GitRepository:
         )
         result = self._run(arguments)
         return parse_history(result.stdout, separator=separator, command=result.command)
+
+    def get_branches(self) -> tuple[Branch, ...]:
+        """Локальные ветки и remote-tracking ветки (``git for-each-ref``, один процесс Git).
+
+        Порядок — как у Git: по полному имени, сначала локальные. Для каждой ветки заполнены
+        имя, тип, hash коммита, признак текущей (только у локальной ветки, на которую указывает
+        HEAD) и upstream (только у локальных). Symbolic refs (``origin/HEAD``) — не ветки и не
+        возвращаются. При detached HEAD текущей нет ни у одной ветки. Unborn-ветка (HEAD в
+        репозитории без коммитов) в выводе Git отсутствует — её добавляет ``BranchService``.
+        Список настроенных remote — отдельный запрос ``get_remotes``.
+
+        :raises GitError: команда Git завершилась с ошибкой.
+        :raises GitOutputParseError: вывод Git не соответствует ожидаемому формату.
+        """
+        result = self._run(["for-each-ref", f"--format={BRANCH_FORMAT}", *BRANCH_PATTERNS])
+        return parse_branches(result.stdout, command=result.command)
 
     def get_remotes(self) -> tuple[Remote, ...]:
         """Настроенные remote; пустой кортеж, если их нет."""

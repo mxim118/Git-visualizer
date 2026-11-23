@@ -5,6 +5,7 @@ from git_visualizer.domain.models.changed_file import ChangedFile, FileChange
 from git_visualizer.domain.models.commit import Commit
 from git_visualizer.domain.models.diff import Diff
 from git_visualizer.domain.models.graph import GraphEdge, GraphLayout, GraphNode, Point
+from git_visualizer.domain.models.ref_label import RefLabel
 from git_visualizer.domain.models.remote import Remote
 from git_visualizer.domain.models.repository import Repository
 
@@ -18,6 +19,7 @@ __all__ = [
     "GraphLayout",
     "GraphNode",
     "Point",
+    "RefLabel",
     "Remote",
     "Repository",
 ]

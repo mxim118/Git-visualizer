@@ -18,3 +18,14 @@ class FileChangeType(Enum):
     RENAMED = "renamed"
     COPIED = "copied"
     TYPE_CHANGED = "type_changed"
+
+
+class RefKind(Enum):
+    """Вид ссылки, для которой на графе рисуется метка (``RefLabel``).
+
+    Теги добавятся сюда вместе с реализацией тегов (ТЗ 4.2).
+    """
+
+    LOCAL_BRANCH = "local_branch"
+    REMOTE_BRANCH = "remote_branch"
+    DETACHED_HEAD = "detached_head"

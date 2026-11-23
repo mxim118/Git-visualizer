@@ -5,7 +5,7 @@ import secrets
 from collections.abc import Callable, Sequence
 from datetime import datetime
 
-from git_visualizer.domain.models import Commit, Remote
+from git_visualizer.domain.models import Branch, Commit, Remote
 from git_visualizer.infrastructure.git.git_errors import GitOutputParseError
 
 _FETCH_SUFFIX = " (fetch)"
@@ -223,3 +223,95 @@ def parse_decoration(decoration: str) -> tuple[str, ...]:
             refs.append(item)
         # Остальное (``tag: ...``, ``refs/stash``, ``grafted``, пусто) не входит в MVP-историю.
     return tuple(refs)
+
+
+# --- Ветки (``git for-each-ref``) ---
+#
+# Формат: одна строка на ref, поля разделены NUL (``%00``). В именах refs и в остальных полях
+# управляющих символов быть не может, поэтому разделитель не встретится в данных. Строки
+# разделяются только ``\n``: имя ветки может содержать U+2028, U+0085 и другие символы, по
+# которым ``str.splitlines()`` разрезал бы запись.
+
+_BRANCH_PLACEHOLDERS: tuple[str, ...] = (
+    "%(refname)",  # полное имя ref
+    "%(objectname)",  # hash коммита, на который указывает ref
+    "%(HEAD)",  # «*» у ветки, на которую указывает HEAD; иначе пробел
+    "%(upstream)",  # полное имя настроенного upstream или пусто
+    "%(symref)",  # цель, если ref символический (origin/HEAD); иначе пусто
+)
+# Не ``%(upstream:short)``: при неоднозначном имени Git выдаёт ``remotes/origin/main``.
+BRANCH_FORMAT = "%00".join(_BRANCH_PLACEHOLDERS)
+BRANCH_PATTERNS: tuple[str, ...] = ("refs/heads", "refs/remotes")
+
+_LOCAL_PREFIX = "refs/heads/"
+_REMOTE_PREFIX = "refs/remotes/"
+_CURRENT_MARKER = "*"
+
+
+def parse_branches(output: str, *, command: Sequence[str] = ()) -> tuple[Branch, ...]:
+    """Разбирает вывод ``git for-each-ref --format=<BRANCH_FORMAT> refs/heads refs/remotes``.
+
+    Порядок — как у Git (по полному имени: сначала локальные ветки, затем remote-tracking).
+    Символические ссылки (``refs/remotes/origin/HEAD``) — не ветки и пропускаются.
+    Пустой вывод — веток нет.
+
+    :raises GitOutputParseError: запись не соответствует формату, ref вне ``refs/heads`` и
+        ``refs/remotes`` или неверный hash.
+    """
+    lines = output.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    branches: list[Branch] = []
+    for index, line in enumerate(lines):
+        branch = _parse_branch_line(line.removesuffix("\r"), index, command)
+        if branch is not None:
+            branches.append(branch)
+    return tuple(branches)
+
+
+def _parse_branch_line(line: str, index: int, command: Sequence[str]) -> Branch | None:
+    def fail(problem: str) -> GitOutputParseError:
+        return GitOutputParseError(
+            f"Cannot parse git for-each-ref record #{index}: {problem}", command=command
+        )
+
+    fields = line.split("\0")
+    if len(fields) != len(_BRANCH_PLACEHOLDERS):
+        raise fail(f"expected {len(_BRANCH_PLACEHOLDERS)} fields, got {len(fields)}")
+    ref_name, object_name, head_marker, upstream, symbolic_target = fields
+
+    if symbolic_target:
+        return None  # refs/remotes/origin/HEAD и другие алиасы — не ветки
+    if not _HASH_PATTERN.fullmatch(object_name):
+        raise fail(f"invalid object name {object_name!r} for {ref_name!r}")
+
+    if ref_name.startswith(_LOCAL_PREFIX):
+        name, is_remote = ref_name.removeprefix(_LOCAL_PREFIX), False
+    elif ref_name.startswith(_REMOTE_PREFIX):
+        name, is_remote = ref_name.removeprefix(_REMOTE_PREFIX), True
+    else:
+        raise fail(f"unexpected ref {ref_name!r}")
+    if not name:
+        raise fail(f"empty branch name in {ref_name!r}")
+
+    return Branch(
+        name=name,
+        is_remote=is_remote,
+        is_current=(not is_remote and head_marker == _CURRENT_MARKER),
+        commit_hash=object_name,
+        upstream=None if is_remote else parse_upstream(upstream),
+    )
+
+
+def parse_upstream(upstream: str) -> str | None:
+    """Полное имя upstream (``%(upstream)``) → короткое, как ``Branch.name``.
+
+    ``refs/remotes/origin/main`` → ``origin/main``; локальный upstream
+    ``refs/heads/main`` → ``main``; пусто → ``None``. Иные ссылки остаются как есть.
+    """
+    if not upstream:
+        return None
+    for prefix in (_REMOTE_PREFIX, _LOCAL_PREFIX):
+        if upstream.startswith(prefix):
+            return upstream.removeprefix(prefix) or None
+    return upstream

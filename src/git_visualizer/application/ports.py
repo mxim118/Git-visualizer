@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from git_visualizer.domain.models import Commit, Remote
+from git_visualizer.domain.models import Branch, Commit, Remote
 
 
 class GitRepositoryPort(Protocol):
@@ -23,6 +23,8 @@ class GitRepositoryPort(Protocol):
     def get_current_branch(self) -> str | None: ...
 
     def get_head_commit(self) -> str | None: ...
+
+    def get_branches(self) -> tuple[Branch, ...]: ...
 
     def get_remotes(self) -> tuple[Remote, ...]: ...
 
