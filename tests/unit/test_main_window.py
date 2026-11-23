@@ -15,7 +15,15 @@ from PySide6.QtWidgets import QFileDialog, QFrame, QLabel
 from git_visualizer.application.errors import NotAGitRepositoryError
 from git_visualizer.application.services.git_environment_service import GitEnvironment
 from git_visualizer.application.services.graph_service import GraphService
-from git_visualizer.domain.models import Branch, Commit, Remote, Repository
+from git_visualizer.domain.enums import FileChangeType
+from git_visualizer.domain.models import (
+    Branch,
+    Commit,
+    Diff,
+    FileChange,
+    Remote,
+    Repository,
+)
 from git_visualizer.infrastructure.git.git_errors import (
     GitCommandError,
     GitNotFoundError,
@@ -25,6 +33,13 @@ from git_visualizer.presentation.controllers.repository_controller import (
     RepositoryController,
 )
 from git_visualizer.presentation.error_texts import user_message
+from git_visualizer.presentation.widgets.diff_view import (
+    ADDED_BACKGROUND,
+    DELETED_BACKGROUND,
+    DiffLineKind,
+    DiffView,
+    classify_diff_line,
+)
 from git_visualizer.presentation.windows.main_window import MainWindow
 
 NOW = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
@@ -34,21 +49,28 @@ def make_commit(
     label: str,
     *,
     subject: str = "Subject",
+    body: str = "",
     parents: tuple[str, ...] = (),
+    refs: tuple[str, ...] = (),
+    author_name: str = "Test Author",
+    author_email: str = "author@example.com",
+    committer_name: str = "Test Committer",
+    committer_email: str = "committer@example.com",
 ) -> Commit:
     commit_hash = label.ljust(40, "0")
     return Commit(
         hash=commit_hash,
         short_hash=commit_hash[:7],
         parent_hashes=parents,
-        author_name="Test Author",
-        author_email="author@example.com",
+        author_name=author_name,
+        author_email=author_email,
         authored_at=NOW,
-        committer_name="Test Author",
-        committer_email="author@example.com",
+        committer_name=committer_name,
+        committer_email=committer_email,
         committed_at=NOW,
         subject=subject,
-        body="",
+        body=body,
+        refs=refs,
     )
 
 
@@ -124,6 +146,36 @@ class FakeBranchService:
         return self.branches
 
 
+class FakeDiffService:
+    def __init__(
+        self,
+        files: tuple[FileChange, ...] = (),
+        diff: Diff | None = None,
+        *,
+        files_error: BaseException | None = None,
+        diff_error: BaseException | None = None,
+    ) -> None:
+        self.files = files
+        self.diff = diff
+        self.files_error = files_error
+        self.diff_error = diff_error
+
+    def get_commit_files(
+        self, repository: Repository, commit: Commit
+    ) -> tuple[FileChange, ...]:
+        if self.files_error is not None:
+            raise self.files_error
+        return self.files
+
+    def get_file_diff(
+        self, repository: Repository, commit: Commit, file_change: FileChange
+    ) -> Diff:
+        if self.diff_error is not None:
+            raise self.diff_error
+        assert self.diff is not None
+        return self.diff
+
+
 def build_controller(
     *,
     repository: Repository,
@@ -132,6 +184,10 @@ def build_controller(
     remotes: tuple[Remote, ...] = (),
     open_error: BaseException | None = None,
     history_error: BaseException | None = None,
+    files: tuple[FileChange, ...] = (),
+    diff: Diff | None = None,
+    files_error: BaseException | None = None,
+    diff_error: BaseException | None = None,
     environment: GitEnvironment | None = None,
     environment_error: BaseException | None = None,
 ) -> tuple[RepositoryController, FakeHistoryService]:
@@ -143,6 +199,9 @@ def build_controller(
         history_service=history,
         branch_service=FakeBranchService(branches),
         graph_service=GraphService(),
+        diff_service=FakeDiffService(
+            files, diff, files_error=files_error, diff_error=diff_error
+        ),
         git_environment_service=FakeEnvironmentService(
             environment=environment, error=environment_error
         ),
@@ -358,7 +417,17 @@ def test_selecting_commit_saves_hash_and_updates_details(
     qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     old = make_commit("old", subject="Первый коммит")
-    new = make_commit("new", subject="Второй коммит", parents=(old.hash,))
+    new = make_commit(
+        "new",
+        subject="Второй коммит",
+        body="Подробное сообщение\nвторая строка",
+        parents=(old.hash,),
+        refs=("HEAD", "refs/heads/main", "refs/remotes/origin/main"),
+        author_name="Анна Автор",
+        author_email="anna@example.com",
+        committer_name="Иван Коммиттер",
+        committer_email="ivan@example.com",
+    )
     controller, _ = build_controller(
         repository=make_repository(tmp_path, head_commit=new.hash),
         commits=(new, old),
@@ -380,13 +449,253 @@ def test_selecting_commit_saves_hash_and_updates_details(
 
         window.workspace_page.graph_view.commit_selected.emit(old.hash)
 
+        details = window.workspace_page.details_panel
         assert window.selected_commit_hash == old.hash
-        assert window.workspace_page.details_panel.current_commit is old
-        assert (
-            window.workspace_page.details_panel.hash_value.text() == old.hash
-        )
-        assert "Первый коммит" in window.workspace_page.details_panel.message_value.text()
+        assert details.current_commit is old
         assert selected == [old.hash]
+
+        window.workspace_page.graph_view.commit_selected.emit(new.hash)
+        metadata = details.metadata_view.toPlainText()
+        assert new.short_hash in metadata
+        assert new.hash in metadata
+        assert "Анна Автор" in metadata
+        assert "anna@example.com" in metadata
+        assert "Иван Коммиттер" in metadata
+        assert "ivan@example.com" in metadata
+        assert "main, origin/main" in metadata
+        assert "Второй коммит" in metadata
+        assert "Подробное сообщение" in metadata
+        assert "Изменения относительно родителя" in metadata
+
+
+def test_commit_files_and_diffs_are_shown_for_merge_commit(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_parent = make_commit("first-parent", subject="Первый родитель")
+    second_parent = make_commit("second-parent", subject="Второй родитель")
+    merge = make_commit(
+        "merge",
+        subject="Merge feature",
+        parents=(first_parent.hash, second_parent.hash),
+    )
+    files = (
+        FileChange(path="added.txt", change_type=FileChangeType.ADDED),
+        FileChange(path="modified.txt", change_type=FileChangeType.MODIFIED),
+        FileChange(
+            path="renamed.txt",
+            change_type=FileChangeType.RENAMED,
+            old_path="old.txt",
+        ),
+        FileChange(path="deleted.txt", change_type=FileChangeType.DELETED),
+        FileChange(
+            path="copy.txt",
+            change_type=FileChangeType.COPIED,
+            old_path="source.txt",
+        ),
+    )
+    diff = Diff(
+        path="renamed.txt",
+        old_path="old.txt",
+        text=(
+            "diff --git a/old.txt b/renamed.txt\n"
+            "similarity index 100%\n"
+            "rename from old.txt\n"
+            "rename to renamed.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old line\n"
+            "+new line\n"
+        ),
+        base_commit_hash=first_parent.hash,
+    )
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=merge.hash),
+        commits=(merge, first_parent, second_parent),
+        branches=(
+            Branch(
+                name="main",
+                is_remote=False,
+                is_current=True,
+                commit_hash=merge.hash,
+            ),
+        ),
+        files=files,
+        diff=diff,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller) as window:
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None,
+        )
+        window.workspace_page.graph_view.commit_selected.emit(merge.hash)
+        details = window.workspace_page.details_panel
+        wait_until(qt_app, lambda: len(details.files) == len(files))
+
+        metadata = details.metadata_view.toPlainText()
+        assert "Merge-коммит" in metadata
+        assert first_parent.short_hash in metadata
+        assert details.files_tree.topLevelItemCount() == len(files)
+        assert details.files_tree.topLevelItem(0).text(1) == "добавлен"
+        assert details.files_tree.topLevelItem(2).text(0) == "old.txt → renamed.txt"
+        assert details.files_tree.topLevelItem(2).text(1) == "переименован"
+        assert details.files_tree.topLevelItem(3).text(1) == "удалён"
+        assert details.files_tree.topLevelItem(4).text(1) == "скопирован"
+
+        details.files_tree.setCurrentItem(details.files_tree.topLevelItem(2))
+        wait_until(qt_app, lambda: bool(details.diff_view.text))
+
+        assert details.selected_file == files[2]
+        assert window.workspace_page.selected_file == files[2]
+        assert details.diff_view.text == diff.text
+        assert "первым родителем" in details.diff_view.base_label.text()
+        assert first_parent.short_hash in details.diff_view.base_label.text()
+        assert "renamed.txt" in details.diff_view.header_label.text()
+
+
+def test_root_commit_uses_empty_tree_comparison(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_commit("root", subject="Первый коммит")
+    file_change = FileChange(path="file.txt", change_type=FileChangeType.ADDED)
+    diff = Diff(
+        path="file.txt",
+        text=(
+            "diff --git a/file.txt b/file.txt\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/file.txt\n"
+            "@@ -0,0 +1 @@\n"
+            "+content\n"
+        ),
+        base_commit_hash=None,
+    )
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=root.hash),
+        commits=(root,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=root.hash),
+        ),
+        files=(file_change,),
+        diff=diff,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller) as window:
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None,
+        )
+        window.workspace_page.graph_view.commit_selected.emit(root.hash)
+        details = window.workspace_page.details_panel
+        wait_until(qt_app, lambda: len(details.files) == 1)
+
+        metadata = details.metadata_view.toPlainText()
+        assert "Корневой коммит" in metadata
+        assert "пустого дерева" in metadata
+
+        details.files_tree.setCurrentItem(details.files_tree.topLevelItem(0))
+        wait_until(qt_app, lambda: bool(details.diff_view.text))
+
+        assert "пустым деревом" in details.diff_view.base_label.text()
+        assert "+content" in details.diff_view.text
+
+
+def test_diff_view_reports_binary_and_truncated_diff(qt_app) -> None:
+    view = DiffView()
+    view.show_diff(
+        Diff(path="image.png", text="", is_binary=True, base_commit_hash="a" * 40),
+        title="image.png — изменён",
+        base_text="Сравнение с родителем aaaaaaa.",
+    )
+    assert "Бинарный файл" in view.message_text
+    assert view.is_editor_visible is False
+
+    view.show_diff(
+        Diff(
+            path="big.txt",
+            text="+added\n-removed\n context\n",
+            is_truncated=True,
+            base_commit_hash="a" * 40,
+        ),
+        title="big.txt — изменён",
+        base_text="Сравнение с родителем aaaaaaa.",
+    )
+    assert view.is_editor_visible is True
+    assert "+added" in view.text
+    assert "Diff обрезан" in view.notice_text
+
+
+def test_diff_line_kinds_distinguish_added_deleted_and_headers() -> None:
+    assert classify_diff_line("+added") is DiffLineKind.ADDED
+    assert classify_diff_line("-removed") is DiffLineKind.DELETED
+    assert classify_diff_line("@@ -1 +1 @@") is DiffLineKind.HUNK
+    assert classify_diff_line("+++ b/file.txt") is DiffLineKind.HEADER
+    assert classify_diff_line("--- a/file.txt") is DiffLineKind.HEADER
+    assert classify_diff_line("diff --git a/x b/x") is DiffLineKind.HEADER
+    assert classify_diff_line(" context") is DiffLineKind.CONTEXT
+
+
+def test_diff_view_paints_added_and_deleted_lines_differently(qt_app) -> None:
+    view = DiffView()
+    view.show_diff(
+        Diff(
+            path="file.txt",
+            text="@@ -1 +1 @@\n-old\n+new\n context\n",
+            base_commit_hash="a" * 40,
+        ),
+        title="file.txt — изменён",
+        base_text="Сравнение с родителем aaaaaaa.",
+    )
+    qt_app.processEvents()
+    document = view.editor.document()
+
+    def background(block_number: int) -> str:
+        block = document.findBlockByNumber(block_number)
+        formats = block.layout().formats()
+        assert formats
+        return formats[0].format.background().color().name()
+
+    assert background(1) == DELETED_BACKGROUND.name()
+    assert background(2) == ADDED_BACKGROUND.name()
+    assert background(1) != background(2)
+
+
+def test_commit_files_error_is_shown_and_keeps_commit_details(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = make_commit("commit")
+    error = GitCommandError(128, command=("git", "diff-tree"), stderr="fatal")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        files_error=error,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+    shown: list[tuple[str, BaseException]] = []
+
+    with opened_window(controller) as window:
+        monkeypatch.setattr(
+            window, "_show_error", lambda title, exc: shown.append((title, exc))
+        )
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None,
+        )
+        window.workspace_page.graph_view.commit_selected.emit(commit.hash)
+        wait_until(qt_app, lambda: bool(shown))
+
+        details = window.workspace_page.details_panel
+        assert shown[0][0] == "Не удалось загрузить файлы коммита"
+        assert shown[0][1] is error
+        assert details.current_commit is commit
+        assert "Не удалось загрузить список файлов" in details.files_status_label.text()
 
 
 def test_refresh_reloads_history_manually(

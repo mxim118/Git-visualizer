@@ -1,8 +1,9 @@
 """Главное окно: стартовый экран, рабочая область и координация с контроллером.
 
-MainWindow не содержит бизнес-логики: открытие репозитория, проверка Git и загрузка
-истории выполняются Application Services через ``RepositoryController``. Здесь —
-только диалоги, переключение экранов и передача данных виджетам.
+MainWindow не содержит бизнес-логики: открытие репозитория, проверка Git, загрузка
+истории, списка файлов и diff выполняются Application Services через
+``RepositoryController``. Здесь — только диалоги, переключение экранов, фильтрация
+устаревших результатов по выбранному коммиту/файлу и передача данных виджетам.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from git_visualizer.domain.models import Repository
+from git_visualizer.domain.models import Diff, FileChange, Repository
 from git_visualizer.presentation.controllers.repository_controller import (
     RepositoryController,
     WorkspaceData,
@@ -79,7 +80,8 @@ class MainWindow(QMainWindow):
         self.start_screen.open_repository_requested.connect(self._choose_repository)
         self.workspace_page.refresh_requested.connect(self._refresh_history)
         self.workspace_page.close_repository_requested.connect(self._close_repository)
-        self.workspace_page.commit_selected.connect(self.commit_selected.emit)
+        self.workspace_page.commit_selected.connect(self._on_commit_selected)
+        self.workspace_page.file_selected.connect(self._on_file_selected)
 
         self._controller.git_environment_ready.connect(self._on_git_environment_ready)
         self._controller.git_environment_failed.connect(self._on_git_environment_failed)
@@ -90,6 +92,12 @@ class MainWindow(QMainWindow):
         self._controller.repository_loaded.connect(self._on_workspace_loaded)
         self._controller.load_failed.connect(self._on_load_failed)
         self._controller.repository_closed.connect(self._on_repository_closed)
+        self._controller.commit_files_loading.connect(self._on_commit_files_loading)
+        self._controller.commit_files_loaded.connect(self._on_commit_files_loaded)
+        self._controller.commit_files_failed.connect(self._on_commit_files_failed)
+        self._controller.file_diff_loading.connect(self._on_file_diff_loading)
+        self._controller.file_diff_loaded.connect(self._on_file_diff_loaded)
+        self._controller.file_diff_failed.connect(self._on_file_diff_failed)
 
     # --- действия пользователя ---
 
@@ -192,6 +200,64 @@ class MainWindow(QMainWindow):
         self.workspace_page.set_busy(False)
         self.statusBar().showMessage("Не удалось загрузить историю.")
         self._show_error("Не удалось загрузить историю", failure.exception)
+
+    # --- детали выбранного коммита и diff ---
+
+    def _on_commit_selected(self, commit_hash: str) -> None:
+        self.commit_selected.emit(commit_hash)
+        self._controller.load_commit_files(commit_hash)
+
+    def _on_commit_files_loading(self, commit_hash: str) -> None:
+        if self._is_current_commit(commit_hash):
+            self.workspace_page.details_panel.set_files_loading()
+
+    def _on_commit_files_loaded(
+        self, commit_hash: str, files: tuple[FileChange, ...]
+    ) -> None:
+        if self._is_current_commit(commit_hash):
+            self.workspace_page.details_panel.set_files(files)
+
+    def _on_commit_files_failed(self, commit_hash: str, failure: TaskFailure) -> None:
+        if not self._is_current_commit(commit_hash):
+            return
+        self.workspace_page.details_panel.set_files_error(
+            "Не удалось загрузить список файлов."
+        )
+        self._show_error("Не удалось загрузить файлы коммита", failure.exception)
+
+    def _on_file_selected(
+        self, commit_hash: str, file_change: FileChange
+    ) -> None:
+        self._controller.load_file_diff(commit_hash, file_change)
+
+    def _on_file_diff_loading(self, commit_hash: str, path: str) -> None:
+        if self._is_current_file(commit_hash, path):
+            self.workspace_page.details_panel.set_diff_loading()
+
+    def _on_file_diff_loaded(self, commit_hash: str, path: str, diff: Diff) -> None:
+        if self._is_current_file(commit_hash, path):
+            self.workspace_page.details_panel.show_diff(diff)
+
+    def _on_file_diff_failed(
+        self, commit_hash: str, path: str, failure: TaskFailure
+    ) -> None:
+        if not self._is_current_file(commit_hash, path):
+            return
+        self.workspace_page.details_panel.set_diff_error(
+            "Не удалось загрузить diff файла."
+        )
+        self._show_error("Не удалось загрузить diff", failure.exception)
+
+    def _is_current_commit(self, commit_hash: str) -> bool:
+        return self.workspace_page.selected_commit_hash == commit_hash
+
+    def _is_current_file(self, commit_hash: str, path: str) -> bool:
+        file_change = self.workspace_page.selected_file
+        return (
+            self._is_current_commit(commit_hash)
+            and file_change is not None
+            and file_change.path == path
+        )
 
     # --- диалоги ---
 

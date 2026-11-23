@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtWidgets import QFileDialog
 
 from git_visualizer.application.services.branch_service import BranchService
+from git_visualizer.application.services.diff_service import DiffService
 from git_visualizer.application.services.git_environment_service import (
     GitEnvironmentService,
 )
@@ -49,6 +50,7 @@ def build_controller() -> RepositoryController:
         history_service=HistoryService(factory),
         branch_service=BranchService(factory),
         graph_service=GraphService(),
+        diff_service=DiffService(factory),
         git_environment_service=GitEnvironmentService(runner),
     )
 
@@ -107,7 +109,7 @@ def test_main_flow_with_real_repository(
         workspace.graph_view.commit_selected.emit(head_hash)
         assert workspace.selected_commit_hash == head_hash
         assert workspace.details_panel.current_commit is not None
-        assert workspace.details_panel.hash_value.text() == head_hash
+        assert head_hash in workspace.details_panel.metadata_view.toPlainText()
 
         # Ручное обновление истории видит новый коммит.
         (path / "new.txt").write_text("new\n", encoding="utf-8")
@@ -129,6 +131,58 @@ def test_main_flow_with_real_repository(
         assert window.stack.currentWidget() is window.start_screen
         assert controller.repository is None
         assert workspace.graph_view.is_empty
+    finally:
+        window.close()
+
+
+def test_gui_commit_details_and_file_diff_flow(
+    qt_app,
+    make_repo,
+    git,
+    monkeypatch,
+) -> None:
+    path = make_repo("gui-diff", commits=1)
+    (path / "file0.txt").write_text("changed\n", encoding="utf-8")
+    git(path, "add", "--", "file0.txt")
+    git(
+        path,
+        "-c", "user.name=Test",
+        "-c", "user.email=test@example.com",
+        "-c", "commit.gpgsign=false",
+        "commit", "-q", "-m", "change file0",
+    )
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
+    )
+    controller = build_controller()
+    window = MainWindow(controller)
+
+    try:
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None
+            and window.workspace_page.graph_view.commit_count == 2,
+        )
+
+        data = window.workspace_page.workspace_data
+        assert data is not None
+        latest = data.commits[0]
+        assert latest.subject == "change file0"
+        window.workspace_page.graph_view.commit_selected.emit(latest.hash)
+
+        details = window.workspace_page.details_panel
+        wait_until(qt_app, lambda: len(details.files) == 1)
+        assert details.files[0].path == "file0.txt"
+        assert "Изменения относительно родителя" in details.metadata_view.toPlainText()
+
+        details.files_tree.setCurrentItem(details.files_tree.topLevelItem(0))
+        wait_until(qt_app, lambda: bool(details.diff_view.text))
+
+        assert details.selected_file == details.files[0]
+        assert "-0" in details.diff_view.text
+        assert "+changed" in details.diff_view.text
+        assert "Сравнение с родителем" in details.diff_view.base_label.text()
     finally:
         window.close()
 

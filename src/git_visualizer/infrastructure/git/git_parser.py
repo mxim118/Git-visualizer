@@ -5,7 +5,8 @@ import secrets
 from collections.abc import Callable, Sequence
 from datetime import datetime
 
-from git_visualizer.domain.models import Branch, Commit, Remote
+from git_visualizer.domain.enums import FileChangeType
+from git_visualizer.domain.models import Branch, Commit, FileChange, Remote
 from git_visualizer.infrastructure.git.git_errors import GitOutputParseError
 
 _FETCH_SUFFIX = " (fetch)"
@@ -315,3 +316,106 @@ def parse_upstream(upstream: str) -> str | None:
         if upstream.startswith(prefix):
             return upstream.removeprefix(prefix) or None
     return upstream
+
+
+# --- Файлы коммита (``git diff-tree --name-status -z``) ---
+#
+# ``-z`` разделяет все элементы NUL, а не только записи: статус, путь и (для
+# переименования/копирования) второй путь. Это единственный надёжный способ не
+# потерять пути с пробелами, табуляцией, переводами строк и Unicode.
+
+_DIFF_STATUS_TYPES: dict[str, FileChangeType] = {
+    "A": FileChangeType.ADDED,
+    "M": FileChangeType.MODIFIED,
+    "D": FileChangeType.DELETED,
+    "R": FileChangeType.RENAMED,
+    "C": FileChangeType.COPIED,
+    "T": FileChangeType.TYPE_CHANGED,
+}
+_RENAME_OR_COPY = ("R", "C")
+
+
+def parse_name_status(
+    output: str, *, command: Sequence[str] = ()
+) -> tuple[FileChange, ...]:
+    """Разбирает ``git diff-tree --name-status -z`` (или ``git diff --name-status -z``).
+
+    Порядок файлов — как у Git. Для ``R``/``C`` Git сообщает два пути: старый и новый;
+    в ``FileChange.old_path`` попадает старый, в ``path`` — новый. Статус ``T``
+    (изменение типа файла) отображается как ``TYPE_CHANGED``. Пустой вывод — коммит
+    не менял файлов.
+
+    :raises GitOutputParseError: неизвестный статус, не хватает путей или путь пуст.
+    """
+    tokens = output.split("\0")
+    if tokens and tokens[-1] == "":
+        tokens.pop()
+
+    changes: list[FileChange] = []
+    index = 0
+    while index < len(tokens):
+        status = tokens[index]
+        index += 1
+        problem = _diff_status_problem(status)
+        if problem is not None:
+            raise _name_status_error(problem, command)
+
+        code = status[0]
+        change_type = _DIFF_STATUS_TYPES[code]
+
+        if code in _RENAME_OR_COPY:
+            if index + 1 >= len(tokens):
+                raise _name_status_error(
+                    f"missing old/new path for status {status!r}", command
+                )
+            old_path, path = tokens[index], tokens[index + 1]
+            index += 2
+            if not old_path or not path:
+                raise _name_status_error(
+                    f"empty path for status {status!r}", command
+                )
+        else:
+            if index >= len(tokens):
+                raise _name_status_error(
+                    f"missing path for status {status!r}", command
+                )
+            path = tokens[index]
+            index += 1
+            old_path = None
+            if not path:
+                raise _name_status_error(f"empty path for status {status!r}", command)
+
+        changes.append(
+            FileChange(path=path, change_type=change_type, old_path=old_path)
+        )
+
+    return tuple(changes)
+
+
+def _diff_status_problem(status: str) -> str | None:
+    if not status:
+        return "empty status"
+    code = status[0]
+    if code not in _DIFF_STATUS_TYPES:
+        return f"unknown status {status!r}"
+    if code in _RENAME_OR_COPY and len(status) > 1 and not status[1:].isdigit():
+        return f"invalid rename/copy score in status {status!r}"
+    return None
+
+
+def _name_status_error(problem: str, command: Sequence[str]) -> GitOutputParseError:
+    return GitOutputParseError(
+        f"Cannot parse git diff --name-status output: {problem}", command=command
+    )
+
+
+_BINARY_DIFF_PATTERN = re.compile(r"^Binary files .+ and .+ differ\r?$", re.MULTILINE)
+
+
+def is_binary_diff(output: str) -> bool:
+    """``True``, если Git сообщил, что diff файла бинарный.
+
+    Используется вывод ``git diff`` без ``--binary``: для бинарного файла Git печатает
+    строку ``Binary files a/... and b/... differ`` (при ``LC_ALL=C``) вместо hunks.
+    """
+    return _BINARY_DIFF_PATTERN.search(output) is not None

@@ -15,6 +15,7 @@ from functools import partial
 from PySide6.QtCore import QObject, Signal
 
 from git_visualizer.application.services.branch_service import BranchService, build_ref_labels
+from git_visualizer.application.services.diff_service import DiffService
 from git_visualizer.application.services.git_environment_service import (
     GitEnvironmentService,
 )
@@ -24,6 +25,8 @@ from git_visualizer.application.services.repository_service import RepositorySer
 from git_visualizer.domain.models import (
     Branch,
     Commit,
+    Diff,
+    FileChange,
     GraphLayout,
     RefLabel,
     Remote,
@@ -63,6 +66,14 @@ class RepositoryController(QObject):
     repository_loaded = Signal(object)  # WorkspaceData
     load_failed = Signal(object)  # TaskFailure
 
+    commit_files_loading = Signal(str)  # commit hash
+    commit_files_loaded = Signal(str, object)  # commit hash, tuple[FileChange, ...]
+    commit_files_failed = Signal(str, object)  # commit hash, TaskFailure
+
+    file_diff_loading = Signal(str, str)  # commit hash, path
+    file_diff_loaded = Signal(str, str, object)  # commit hash, path, Diff
+    file_diff_failed = Signal(str, str, object)  # commit hash, path, TaskFailure
+
     repository_closed = Signal()
 
     def __init__(
@@ -72,6 +83,7 @@ class RepositoryController(QObject):
         history_service: HistoryService,
         branch_service: BranchService,
         graph_service: GraphService,
+        diff_service: DiffService,
         git_environment_service: GitEnvironmentService,
         task_runner: TaskRunner | None = None,
         parent: QObject | None = None,
@@ -81,6 +93,7 @@ class RepositoryController(QObject):
         self._history_service = history_service
         self._branch_service = branch_service
         self._graph_service = graph_service
+        self._diff_service = diff_service
         self._git_environment_service = git_environment_service
         self._runner = task_runner or TaskRunner(self)
 
@@ -146,6 +159,72 @@ class RepositoryController(QObject):
         self._workspace = None
         self.repository_closed.emit()
 
+    def load_commit_files(self, commit_hash: str) -> bool:
+        """Запускает фоновую загрузку файлов выбранного коммита.
+
+        :return: ``True``, если задача поставлена. ``False`` — коммит не найден,
+            репозиторий закрыт или такая загрузка уже идёт.
+        """
+        repository = self._repository
+        commit = self._find_commit(commit_hash)
+        if repository is None or commit is None:
+            return False
+
+        session = self._session
+        task = self._runner.submit(
+            partial(self._load_commit_files, repository, commit),
+            name="commit-files",
+            key=f"commit-files:{session}:{commit_hash}",
+        )
+        if task is None:
+            return False
+        self.commit_files_loading.emit(commit_hash)
+        task.succeeded.connect(
+            partial(self._handle_commit_files_loaded, session, commit_hash)
+        )
+        task.failed.connect(
+            partial(self._handle_commit_files_failed, session, commit_hash)
+        )
+        return True
+
+    def load_file_diff(self, commit_hash: str, file_change: FileChange) -> bool:
+        """Запускает фоновую загрузку diff выбранного файла.
+
+        :return: ``True``, если задача поставлена; ``False`` — коммит/файл не найден,
+            репозиторий закрыт или diff этого файла уже загружается.
+        """
+        repository = self._repository
+        commit = self._find_commit(commit_hash)
+        if repository is None or commit is None:
+            return False
+
+        session = self._session
+        task = self._runner.submit(
+            partial(self._load_file_diff, repository, commit, file_change),
+            name="file-diff",
+            key=f"file-diff:{session}:{commit_hash}:{file_change.path}",
+        )
+        if task is None:
+            return False
+        self.file_diff_loading.emit(commit_hash, file_change.path)
+        task.succeeded.connect(
+            partial(
+                self._handle_file_diff_loaded,
+                session,
+                commit_hash,
+                file_change.path,
+            )
+        )
+        task.failed.connect(
+            partial(
+                self._handle_file_diff_failed,
+                session,
+                commit_hash,
+                file_change.path,
+            )
+        )
+        return True
+
     def wait_for_done(self, msecs: int = -1) -> bool:
         """Дожидается завершения фоновых задач (используется при закрытии окна)."""
         return self._runner.wait_for_done(msecs)
@@ -208,6 +287,58 @@ class RepositoryController(QObject):
         if session != self._session:
             return
         self.load_failed.emit(failure)
+
+    def _load_commit_files(
+        self, repository: Repository, commit: Commit
+    ) -> tuple[FileChange, ...]:
+        """Worker-функция списка файлов; без обращения к Qt-виджетам."""
+        return self._diff_service.get_commit_files(repository, commit)
+
+    def _load_file_diff(
+        self, repository: Repository, commit: Commit, file_change: FileChange
+    ) -> Diff:
+        """Worker-функция diff одного файла; без обращения к Qt-виджетам."""
+        return self._diff_service.get_file_diff(repository, commit, file_change)
+
+    def _handle_commit_files_loaded(
+        self, session: int, commit_hash: str, files: tuple[FileChange, ...]
+    ) -> None:
+        if session != self._session:
+            return
+        self.commit_files_loaded.emit(commit_hash, files)
+
+    def _handle_commit_files_failed(
+        self, session: int, commit_hash: str, failure: TaskFailure
+    ) -> None:
+        if session != self._session:
+            return
+        self.commit_files_failed.emit(commit_hash, failure)
+
+    def _handle_file_diff_loaded(
+        self, session: int, commit_hash: str, path: str, diff: Diff
+    ) -> None:
+        if session != self._session:
+            return
+        self.file_diff_loaded.emit(commit_hash, path, diff)
+
+    def _handle_file_diff_failed(
+        self, session: int, commit_hash: str, path: str, failure: TaskFailure
+    ) -> None:
+        if session != self._session:
+            return
+        self.file_diff_failed.emit(commit_hash, path, failure)
+
+    def _find_commit(self, commit_hash: str) -> Commit | None:
+        if self._workspace is None:
+            return None
+        return next(
+            (
+                commit
+                for commit in self._workspace.commits
+                if commit.hash == commit_hash
+            ),
+            None,
+        )
 
     def _load_key(self) -> str:
         return f"load:{self._session}"

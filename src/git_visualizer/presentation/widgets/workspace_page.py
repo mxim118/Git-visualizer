@@ -5,7 +5,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QSplitter, QVBoxLayout, QWidget
 
-from git_visualizer.domain.models import Commit, Repository
+from git_visualizer.domain.models import Commit, FileChange, Repository
 from git_visualizer.presentation.controllers.repository_controller import WorkspaceData
 from git_visualizer.presentation.widgets.branches_panel import BranchesPanel
 from git_visualizer.presentation.widgets.changes_panel import ChangesPanel
@@ -18,14 +18,16 @@ class WorkspacePage(QWidget):
     """Основное окно репозитория с изменяемыми по размеру панелями.
 
     Центральная область — ``GraphView``; слева ветки и remote, справа детали
-    коммита, снизу заглушка Changes. Выбор узла сохраняется в
+    коммита с файлами и diff, снизу заглушка Changes. Выбор узла сохраняется в
     ``selected_commit_hash``, обновляет панель деталей и сообщается сигналом
-    ``commit_selected`` — точка расширения для будущих действий с коммитом.
+    ``commit_selected``; выбор файла сохраняется в ``selected_file`` и сообщается
+    сигналом ``file_selected``.
     """
 
     refresh_requested = Signal()
     close_repository_requested = Signal()
     commit_selected = Signal(str)
+    file_selected = Signal(str, object)  # commit hash, FileChange
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -34,6 +36,7 @@ class WorkspacePage(QWidget):
         self._data: WorkspaceData | None = None
         self._commits_by_hash: dict[str, Commit] = {}
         self._selected_commit_hash: str | None = None
+        self._selected_file: FileChange | None = None
 
         self.top_bar = TopBar(self)
         self.graph_view = GraphView(self)
@@ -50,7 +53,7 @@ class WorkspacePage(QWidget):
         self.body_splitter.setStretchFactor(0, 0)
         self.body_splitter.setStretchFactor(1, 1)
         self.body_splitter.setStretchFactor(2, 0)
-        self.body_splitter.setSizes([240, 760, 320])
+        self.body_splitter.setSizes([240, 680, 420])
 
         self.main_splitter = QSplitter(Qt.Orientation.Vertical, self)
         self.main_splitter.setObjectName("main_splitter")
@@ -63,7 +66,7 @@ class WorkspacePage(QWidget):
 
         self.branches_panel.setMinimumWidth(160)
         self.graph_view.setMinimumWidth(280)
-        self.details_panel.setMinimumWidth(200)
+        self.details_panel.setMinimumWidth(280)
         self.changes_panel.setMinimumHeight(90)
 
         layout = QVBoxLayout(self)
@@ -77,6 +80,7 @@ class WorkspacePage(QWidget):
             self.close_repository_requested
         )
         self.graph_view.commit_selected.connect(self._on_commit_selected)
+        self.details_panel.file_selected.connect(self._on_file_selected)
 
         self.clear()
 
@@ -89,6 +93,7 @@ class WorkspacePage(QWidget):
         self._data = data
         self._commits_by_hash = {commit.hash: commit for commit in data.commits}
         self._selected_commit_hash = None
+        self._selected_file = None
 
         self.top_bar.set_repository(data.repository)
         self.graph_view.set_graph(
@@ -111,6 +116,7 @@ class WorkspacePage(QWidget):
         self._data = None
         self._commits_by_hash = {}
         self._selected_commit_hash = None
+        self._selected_file = None
         self.top_bar.clear()
         self.graph_view.clear()
         self.branches_panel.clear()
@@ -122,14 +128,27 @@ class WorkspacePage(QWidget):
         return self._selected_commit_hash
 
     @property
+    def selected_file(self) -> FileChange | None:
+        """Файл, выбранный в списке изменённых файлов."""
+        return self._selected_file
+
+    @property
     def workspace_data(self) -> WorkspaceData | None:
         return self._data
 
     def _on_commit_selected(self, commit_hash: str) -> None:
         self._selected_commit_hash = commit_hash
+        self._selected_file = None
         commit = self._commits_by_hash.get(commit_hash)
         if commit is None:
             self.details_panel.clear()
         else:
             self.details_panel.show_commit(commit)
         self.commit_selected.emit(commit_hash)
+
+    def _on_file_selected(self, file_change: FileChange) -> None:
+        commit_hash = self._selected_commit_hash
+        if commit_hash is None:
+            return
+        self._selected_file = file_change
+        self.file_selected.emit(commit_hash, file_change)

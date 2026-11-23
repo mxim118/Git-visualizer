@@ -4,11 +4,11 @@
 описания, поэтому их можно тестировать с подменой, без запуска Git.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol
 
-from git_visualizer.domain.models import Branch, Commit, Remote
+from git_visualizer.domain.models import Branch, Commit, Diff, FileChange, Remote
 
 
 class GitRepositoryPort(Protocol):
@@ -29,6 +29,20 @@ class GitRepositoryPort(Protocol):
     def get_remotes(self) -> tuple[Remote, ...]: ...
 
     def get_history(self, *, limit: int) -> tuple[Commit, ...]: ...
+
+    def get_commit_files(
+        self, *, commit_hash: str, parent_hash: str | None
+    ) -> tuple[FileChange, ...]: ...
+
+    def get_commit_file_diff(
+        self,
+        *,
+        commit_hash: str,
+        parent_hash: str | None,
+        path: str,
+        old_path: str | None,
+        max_chars: int,
+    ) -> Diff: ...
 
 
 # Создаёт доступ к репозиторию для каталога; связывается с реализацией при сборке приложения.

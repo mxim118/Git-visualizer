@@ -1,23 +1,25 @@
-"""Обёртка над Git CLI для одного репозитория (чтение основных сведений).
+"""Обёртка над Git CLI для одного репозитория.
 
 Скрывает конкретные команды Git от сервисов. Все команды выполняются через ``GitRunner``
-с рабочим каталогом ``path``. Методы получения истории, веток, статуса и diff
-добавляются в следующих итерациях.
+с рабочим каталогом ``path``. Реализованы открытие, история, ветки, remote, список
+изменённых файлов коммита и diff одного файла; статус рабочей директории — далее.
 
 Минимальная версия Git: ``branch --show-current`` требует Git 2.22+.
 """
 
 from pathlib import Path
 
-from git_visualizer.domain.models import Branch, Commit, Remote
+from git_visualizer.domain.models import Branch, Commit, Diff, FileChange, Remote
 from git_visualizer.infrastructure.git.git_errors import GitCommandError
 from git_visualizer.infrastructure.git.git_parser import (
     BRANCH_FORMAT,
     BRANCH_PATTERNS,
     history_log_format,
+    is_binary_diff,
     new_history_separator,
     parse_branches,
     parse_history,
+    parse_name_status,
     parse_remotes,
 )
 from git_visualizer.infrastructure.git.git_runner import GitResult, GitRunner
@@ -63,6 +65,82 @@ def build_history_arguments(*, include_head: bool, limit: int, separator: str) -
         "--",
     ]
     return arguments
+
+
+def build_commit_files_arguments(
+    *, commit_hash: str, parent_hash: str | None
+) -> list[str]:
+    """Аргументы списка файлов коммита.
+
+    Обычный и merge-коммит сравниваются с переданным родителем; ``parent_hash=None``
+    означает root-коммит и ``--root`` (сравнение с пустым деревом). ``-z`` вместе с
+    ``--name-status`` сохраняет пути целиком; ``--find-renames``/``--find-copies``
+    позволяют Git сообщить R/C, если он их обнаружил.
+    """
+    arguments = [
+        "diff-tree",
+        "--no-commit-id",
+        "-r",
+        "--name-status",
+        "-z",
+        "--find-renames",
+        # Без harder Git находит копии только среди изменённых файлов; для списка файлов
+        # одного коммита это допустимая цена, зато статус copied действительно виден.
+        "--find-copies-harder",
+    ]
+    if parent_hash is None:
+        arguments += ["--root", commit_hash]
+    else:
+        arguments += [parent_hash, commit_hash]
+    arguments.append("--")
+    return arguments
+
+
+def build_commit_diff_arguments(
+    *,
+    commit_hash: str,
+    parent_hash: str | None,
+    paths: list[str],
+) -> list[str]:
+    """Аргументы diff одного файла коммита.
+
+    Обычный и merge-коммит: ``git diff <parent> <commit> -- <пути>``. Root-коммит:
+    ``git diff-tree --root -p`` (сравнение с пустым деревом). Для переименования
+    передаются оба пути, иначе Git не увидит связь между старым и новым файлом и
+    покажет новый файл как добавленный. Внешние diff-инструменты и textconv отключены,
+    чтобы вывод был предсказуемым.
+    """
+    if not paths:
+        raise ValueError("At least one path is required for a file diff")
+    # core.quotePath=false: иначе Git печатает не-ASCII пути в заголовках diff
+    # octal-escape-последовательностями, и интерфейс не покажет реальный путь.
+    unicode_paths = ["-c", "core.quotePath=false"]
+    if parent_hash is None:
+        return [
+            *unicode_paths,
+            "diff-tree",
+            "--root",
+            "-p",
+            "--no-commit-id",
+            "-r",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            commit_hash,
+            "--",
+            *paths,
+        ]
+    return [
+        *unicode_paths,
+        "diff",
+        "--no-ext-diff",
+        "--no-color",
+        "--no-textconv",
+        parent_hash,
+        commit_hash,
+        "--",
+        *paths,
+    ]
 
 
 class GitRepository:
@@ -169,5 +247,82 @@ class GitRepository:
         result = self._run(["remote", "-v"])
         return parse_remotes(result.stdout)
 
+    def get_commit_files(
+        self, *, commit_hash: str, parent_hash: str | None
+    ) -> tuple[FileChange, ...]:
+        """Файлы, изменённые коммитом относительно первого родителя.
+
+        ``parent_hash=None`` — root-коммит (сравнение с пустым деревом). Для merge-коммита
+        вызывающий передаёт первого родителя. Пустой кортеж — коммит не менял файлов.
+
+        :raises GitError: команда Git завершилась с ошибкой.
+        :raises GitOutputParseError: неожиданный формат вывода.
+        """
+        result = self._run(
+            build_commit_files_arguments(
+                commit_hash=commit_hash, parent_hash=parent_hash
+            )
+        )
+        return parse_name_status(result.stdout, command=result.command)
+
+    def get_commit_file_diff(
+        self,
+        *,
+        commit_hash: str,
+        parent_hash: str | None,
+        path: str,
+        old_path: str | None = None,
+        max_chars: int,
+    ) -> Diff:
+        """Unified diff одного файла коммита; сравнение с ``parent_hash``.
+
+        Для переименования/копирования передаются оба пути. Для бинарного файла
+        ``Diff.is_binary=True`` и ``text`` пуст. Если вывод длиннее ``max_chars``,
+        текст обрезается по границе строки и ``is_truncated=True``.
+
+        :raises ValueError: ``max_chars`` меньше 1.
+        :raises GitError: команда Git завершилась с ошибкой.
+        """
+        if max_chars < 1:
+            raise ValueError(f"Diff limit must be positive, got {max_chars}")
+        paths = [path] if old_path is None else [old_path, path]
+        result = self._run(
+            build_commit_diff_arguments(
+                commit_hash=commit_hash,
+                parent_hash=parent_hash,
+                paths=paths,
+            )
+        )
+
+        raw = result.stdout
+        if is_binary_diff(raw):
+            return Diff(
+                path=path,
+                text="",
+                old_path=old_path,
+                is_binary=True,
+                base_commit_hash=parent_hash,
+            )
+
+        text, truncated = _truncate_diff(raw, max_chars)
+        return Diff(
+            path=path,
+            text=text,
+            old_path=old_path,
+            is_truncated=truncated,
+            base_commit_hash=parent_hash,
+        )
+
     def _run(self, args: list[str], *, check: bool = True) -> GitResult:
         return self._runner.run(args, cwd=self._path, check=check)
+
+
+def _truncate_diff(text: str, max_chars: int) -> tuple[str, bool]:
+    """Обрезает слишком длинный diff по границе строки; возвращает текст и признак."""
+    if len(text) <= max_chars:
+        return text, False
+    cut = text[:max_chars]
+    newline = cut.rfind("\n")
+    if newline >= 0:
+        cut = cut[: newline + 1]
+    return cut, True
