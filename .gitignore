@@ -29,7 +29,13 @@ dist/
 *.swp
 *.swo
 
+
+
 # --- Файлы ОС ---
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+
+docs/
+AGENTS.md
