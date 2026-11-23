@@ -33,3 +33,18 @@ class GitRepositoryPort(Protocol):
 
 # Создаёт доступ к репозиторию для каталога; связывается с реализацией при сборке приложения.
 GitRepositoryFactory = Callable[[Path], GitRepositoryPort]
+
+
+class GitVersionLike(Protocol):
+    """Версия Git в том виде, в каком её возвращает низкоуровневый провайдер."""
+
+    major: int
+    minor: int
+    patch: int
+    raw: str
+
+
+class GitVersionProvider(Protocol):
+    """Определяет наличие Git и возвращает его версию (``git --version``)."""
+
+    def get_version(self) -> GitVersionLike: ...

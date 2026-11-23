@@ -7,6 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from git_visualizer.application.services.git_environment_service import (
+    GitEnvironmentService,
+)
 from git_visualizer.infrastructure.git.git_runner import GitRunner
 
 
@@ -14,6 +17,19 @@ from git_visualizer.infrastructure.git.git_runner import GitRunner
 def _require_git() -> None:
     if shutil.which("git") is None:
         pytest.skip("Git is not installed")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _require_supported_git() -> None:
+    """Сценарий 24 ТЗ: на Git старее 2.23 integration-тесты не запускаются."""
+    if shutil.which("git") is None:
+        pytest.skip("Git is not installed")
+    environment = GitEnvironmentService(GitRunner()).check()
+    if not environment.is_supported:
+        pytest.skip(
+            f"Git {environment.version_text} is older than the required "
+            f"{environment.minimum_text}"
+        )
 
 
 @pytest.fixture(autouse=True)

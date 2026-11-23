@@ -1,12 +1,555 @@
+"""GUI-тесты основного пользовательского потока: стартовый экран → репозиторий."""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+from PySide6.QtGui import QFontMetrics
+from PySide6.QtWidgets import QFileDialog, QFrame, QLabel
+
+from git_visualizer.application.errors import NotAGitRepositoryError
+from git_visualizer.application.services.git_environment_service import GitEnvironment
+from git_visualizer.application.services.graph_service import GraphService
+from git_visualizer.domain.models import Branch, Commit, Remote, Repository
+from git_visualizer.infrastructure.git.git_errors import (
+    GitCommandError,
+    GitNotFoundError,
+)
 from git_visualizer.main import main
+from git_visualizer.presentation.controllers.repository_controller import (
+    RepositoryController,
+)
+from git_visualizer.presentation.error_texts import user_message
 from git_visualizer.presentation.windows.main_window import MainWindow
 
+NOW = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
 
-def test_main_window_can_be_created(qt_app) -> None:
-    window = MainWindow()
 
-    assert window.windowTitle() == "Git Visualizer"
-    assert window.centralWidget() is not None
+def make_commit(
+    label: str,
+    *,
+    subject: str = "Subject",
+    parents: tuple[str, ...] = (),
+) -> Commit:
+    commit_hash = label.ljust(40, "0")
+    return Commit(
+        hash=commit_hash,
+        short_hash=commit_hash[:7],
+        parent_hashes=parents,
+        author_name="Test Author",
+        author_email="author@example.com",
+        authored_at=NOW,
+        committer_name="Test Author",
+        committer_email="author@example.com",
+        committed_at=NOW,
+        subject=subject,
+        body="",
+    )
+
+
+def make_repository(
+    path: Path,
+    *,
+    head_commit: str | None,
+    name: str = "repo",
+    branch: str | None = "main",
+) -> Repository:
+    return Repository(
+        path=path, name=name, current_branch=branch, head_commit=head_commit
+    )
+
+
+class FakeEnvironmentService:
+    def __init__(
+        self,
+        *,
+        environment: GitEnvironment | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        self._environment = environment or GitEnvironment(
+            version=(2, 54, 0), raw_version="git version 2.54.0.windows.1"
+        )
+        self._error = error
+
+    def check(self) -> GitEnvironment:
+        if self._error is not None:
+            raise self._error
+        return self._environment
+
+
+class FakeRepositoryService:
+    def __init__(
+        self,
+        repository: Repository,
+        *,
+        remotes: tuple[Remote, ...] = (),
+        error: BaseException | None = None,
+    ) -> None:
+        self.repository = repository
+        self.remotes = remotes
+        self.error = error
+
+    def open_repository(self, path: str) -> Repository:
+        if self.error is not None:
+            raise self.error
+        return self.repository
+
+    def get_remotes(self, repository: Repository) -> tuple[Remote, ...]:
+        return self.remotes
+
+
+class FakeHistoryService:
+    def __init__(
+        self, commits: tuple[Commit, ...], *, error: BaseException | None = None
+    ) -> None:
+        self.commits = commits
+        self.error = error
+
+    def get_history(self, repository: Repository) -> tuple[Commit, ...]:
+        if self.error is not None:
+            raise self.error
+        return self.commits
+
+
+class FakeBranchService:
+    def __init__(self, branches: tuple[Branch, ...]) -> None:
+        self.branches = branches
+
+    def get_branches(self, repository: Repository) -> tuple[Branch, ...]:
+        return self.branches
+
+
+def build_controller(
+    *,
+    repository: Repository,
+    commits: tuple[Commit, ...] = (),
+    branches: tuple[Branch, ...] = (),
+    remotes: tuple[Remote, ...] = (),
+    open_error: BaseException | None = None,
+    history_error: BaseException | None = None,
+    environment: GitEnvironment | None = None,
+    environment_error: BaseException | None = None,
+) -> tuple[RepositoryController, FakeHistoryService]:
+    history = FakeHistoryService(commits, error=history_error)
+    controller = RepositoryController(
+        repository_service=FakeRepositoryService(
+            repository, remotes=remotes, error=open_error
+        ),
+        history_service=history,
+        branch_service=FakeBranchService(branches),
+        graph_service=GraphService(),
+        git_environment_service=FakeEnvironmentService(
+            environment=environment, error=environment_error
+        ),
+    )
+    return controller, history
+
+
+def wait_until(
+    qt_app,
+    predicate: Callable[[], bool],
+    *,
+    timeout: float = 5.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("условие не выполнилось за отведённое время")
+        qt_app.processEvents()
+        time.sleep(0.005)
+
+
+@contextmanager
+def opened_window(controller: RepositoryController) -> Iterator[MainWindow]:
+    window = MainWindow(controller)
+    try:
+        yield window
+    finally:
+        window.close()
+
+
+def patch_folder_dialog(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
+    )
+
+
+# --- стартовый экран ---
+
+
+def test_main_window_starts_on_start_screen(qt_app) -> None:
+    commit = make_commit("head")
+    controller, _ = build_controller(
+        repository=make_repository(Path("repo"), head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(
+                name="main",
+                is_remote=False,
+                is_current=True,
+                commit_hash=commit.hash,
+            ),
+        ),
+    )
+
+    with opened_window(controller) as window:
+        assert window.windowTitle() == "Git Visualizer"
+        assert window.stack.currentWidget() is window.start_screen
+        assert window.start_screen.open_button.text() == "Открыть репозиторий"
+        assert window.start_screen.open_button.isEnabled()
+
+
+def test_start_screen_texts_fit_and_do_not_overlap(qt_app) -> None:
+    controller, _ = build_controller(
+        repository=make_repository(Path("repo"), head_commit=None)
+    )
+
+    with opened_window(controller) as window:
+        window.resize(1280, 800)
+        window.show()
+        wait_until(
+            qt_app,
+            lambda: "поддерживается" in window.start_screen.git_status_label.text(),
+        )
+        qt_app.processEvents()
+        screen = window.start_screen
+        card = screen.findChild(QFrame, "start_screen_card")
+        subtitle = screen.findChild(QLabel, "start_screen_subtitle")
+        hint = screen.findChild(QLabel, "start_screen_hint")
+        assert card is not None
+        assert subtitle is not None
+        assert hint is not None
+
+        for label in (subtitle, hint, screen.git_status_label):
+            metrics = QFontMetrics(label.font())
+            for line in label.text().splitlines():
+                assert metrics.horizontalAdvance(line) <= label.width(), label.text()
+            if label.hasHeightForWidth():
+                assert label.height() >= label.heightForWidth(label.width())
+
+        assert subtitle.geometry().bottom() < screen.open_button.geometry().top()
+        assert hint.geometry().top() > screen.open_button.geometry().bottom()
+        assert screen.git_status_label.geometry().top() > hint.geometry().bottom()
+        assert card.height() >= card.layout().sizeHint().height()
+
+
+def test_start_screen_shows_supported_git_version(qt_app) -> None:
+    controller, _ = build_controller(repository=make_repository(Path("repo"), head_commit=None))
+
+    with opened_window(controller) as window:
+        wait_until(
+            qt_app,
+            lambda: "2.54.0" in window.start_screen.git_status_label.text(),
+        )
+        assert "поддерживается" in window.start_screen.git_status_label.text()
+
+
+def test_start_screen_warns_about_old_git_version(qt_app) -> None:
+    controller, _ = build_controller(
+        repository=make_repository(Path("repo"), head_commit=None),
+        environment=GitEnvironment(
+            version=(2, 22, 1), raw_version="git version 2.22.1.windows.1"
+        ),
+    )
+
+    with opened_window(controller) as window:
+        wait_until(
+            qt_app,
+            lambda: "2.22.1" in window.start_screen.git_status_label.text(),
+        )
+        text = window.start_screen.git_status_label.text()
+        assert "2.23" in text
+        assert "Обновите Git" in text
+
+
+def test_start_screen_shows_git_not_found_instruction(qt_app) -> None:
+    controller, _ = build_controller(
+        repository=make_repository(Path("repo"), head_commit=None),
+        environment_error=GitNotFoundError("git"),
+    )
+
+    with opened_window(controller) as window:
+        window.resize(1280, 800)
+        window.show()
+        wait_until(
+            qt_app,
+            lambda: "Git не найден" in window.start_screen.git_status_label.text(),
+        )
+        qt_app.processEvents()
+        label = window.start_screen.git_status_label
+        hint = window.start_screen.findChild(QLabel, "start_screen_hint")
+        card = window.start_screen.findChild(QFrame, "start_screen_card")
+        assert "git-scm.com" in label.text()
+        assert label.height() >= label.heightForWidth(label.width())
+        assert hint is not None
+        assert card is not None
+        assert label.geometry().top() > hint.geometry().bottom()
+        assert card.height() >= card.layout().sizeHint().height()
+
+
+# --- открытие репозитория и загрузка истории ---
+
+
+def test_open_repository_through_folder_dialog_shows_workspace(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = make_commit("old", subject="Первый коммит")
+    new = make_commit("new", subject="Второй коммит", parents=(old.hash,))
+    repo_path = tmp_path / "my-repo"
+    repo_path.mkdir()
+    branches = (
+        Branch(name="main", is_remote=False, is_current=True, commit_hash=new.hash),
+        Branch(name="origin/main", is_remote=True, is_current=False, commit_hash=new.hash),
+    )
+    remotes = (Remote(name="origin", fetch_url="https://example.com/repo.git"),)
+    controller, _ = build_controller(
+        repository=make_repository(repo_path, head_commit=new.hash, name="my-repo"),
+        commits=(new, old),
+        branches=branches,
+        remotes=remotes,
+    )
+    patch_folder_dialog(monkeypatch, repo_path)
+
+    with opened_window(controller) as window:
+        wait_until(
+            qt_app,
+            lambda: "поддерживается" in window.start_screen.git_status_label.text(),
+        )
+        window.start_screen.open_button.click()
+
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None
+            and window.stack.currentWidget() is window.workspace_page,
+        )
+
+        workspace = window.workspace_page
+        assert window.windowTitle() == "Git Visualizer — my-repo"
+        assert workspace.top_bar.repository_name_label.text() == "my-repo"
+        assert workspace.top_bar.branch_label.text() == "Ветка: main"
+        assert workspace.top_bar.refresh_button.isEnabled()
+        assert workspace.top_bar.close_button.isEnabled()
+        assert not workspace.top_bar.fetch_button.isEnabled()
+        assert not workspace.top_bar.pull_button.isEnabled()
+        assert not workspace.top_bar.push_button.isEnabled()
+        assert workspace.graph_view.commit_count == 2
+        assert workspace.main_splitter.count() == 2
+        assert workspace.body_splitter.count() == 3
+        assert workspace.branches_panel.tree.topLevelItemCount() == 3
+        assert workspace.details_panel.current_commit is None
+        assert workspace.details_panel.placeholder_text == "Коммит не выбран"
+        assert workspace.changes_panel.objectName() == "changes_panel"
+
+        data = workspace.workspace_data
+        assert data is not None
+        assert data.commits == (new, old)
+        assert data.branches == branches
+        assert data.remotes == remotes
+        assert data.layout.nodes
+        assert workspace.top_bar.repository_name_label.toolTip() == str(repo_path)
+
+
+def test_selecting_commit_saves_hash_and_updates_details(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = make_commit("old", subject="Первый коммит")
+    new = make_commit("new", subject="Второй коммит", parents=(old.hash,))
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=new.hash),
+        commits=(new, old),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=new.hash),
+        ),
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+    selected: list[str] = []
+
+    with opened_window(controller) as window:
+        window.commit_selected.connect(selected.append)
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None,
+        )
+        assert window.selected_commit_hash is None
+
+        window.workspace_page.graph_view.commit_selected.emit(old.hash)
+
+        assert window.selected_commit_hash == old.hash
+        assert window.workspace_page.details_panel.current_commit is old
+        assert (
+            window.workspace_page.details_panel.hash_value.text() == old.hash
+        )
+        assert "Первый коммит" in window.workspace_page.details_panel.message_value.text()
+        assert selected == [old.hash]
+
+
+def test_refresh_reloads_history_manually(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = make_commit("old", subject="Первый коммит")
+    controller, history = build_controller(
+        repository=make_repository(tmp_path, head_commit=old.hash),
+        commits=(old,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=old.hash),
+        ),
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller) as window:
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.graph_view.commit_count == 1,
+        )
+
+        new = make_commit("new", subject="Новый коммит")
+        history.commits = (new, old)
+        window.workspace_page.top_bar.refresh_button.click()
+
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.graph_view.commit_count == 2,
+        )
+        assert window.workspace_page.top_bar.refresh_button.isEnabled()
+        assert window.selected_commit_hash is None
+
+
+# --- ошибки и пустой репозиторий ---
+
+
+def test_open_failure_shows_russian_error_and_stays_on_start_screen(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = NotAGitRepositoryError(
+        "Path is not inside a Git repository", path=tmp_path
+    )
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=None),
+        open_error=error,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+    shown: list[tuple[str, BaseException]] = []
+
+    with opened_window(controller) as window:
+        monkeypatch.setattr(
+            window,
+            "_show_error",
+            lambda title, exc: shown.append((title, exc)),
+        )
+        window.start_screen.open_button.click()
+        wait_until(qt_app, lambda: bool(shown))
+
+        title, shown_error = shown[0]
+        assert title == "Не удалось открыть репозиторий"
+        assert shown_error is error
+        assert "нет Git-репозитория" in user_message(shown_error)
+        assert window.stack.currentWidget() is window.start_screen
+        assert window.start_screen.open_button.isEnabled()
+
+
+def test_empty_repository_shows_empty_graph_and_explanation(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=None),
+        commits=(),
+        branches=(
+            Branch(
+                name="main",
+                is_remote=False,
+                is_current=True,
+                commit_hash=None,
+            ),
+        ),
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller) as window:
+        wait_until(
+            qt_app,
+            lambda: "поддерживается" in window.start_screen.git_status_label.text(),
+        )
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None,
+        )
+
+        assert window.workspace_page.graph_view.is_empty
+        assert window.workspace_page.details_panel.current_commit is None
+        assert "нет коммитов" in window.workspace_page.details_panel.placeholder_text
+        assert "Ветка: main (коммитов нет)" == (
+            window.workspace_page.top_bar.branch_label.text()
+        )
+        assert "нет коммитов" in window.statusBar().currentMessage()
+
+
+def test_history_failure_is_reported_without_closing_workspace(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = GitCommandError(128, command=("git", "log"), stderr="fatal: bad object")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit="a" * 40),
+        history_error=error,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+    shown: list[tuple[str, BaseException]] = []
+
+    with opened_window(controller) as window:
+        monkeypatch.setattr(
+            window,
+            "_show_error",
+            lambda title, exc: shown.append((title, exc)),
+        )
+        window.start_screen.open_button.click()
+        wait_until(qt_app, lambda: bool(shown))
+
+        assert shown[0][0] == "Не удалось загрузить историю"
+        assert shown[0][1] is error
+        assert window.stack.currentWidget() is window.workspace_page
+        assert window.workspace_page.graph_view.is_empty
+        assert window.workspace_page.top_bar.refresh_button.isEnabled()
+
+
+def test_close_repository_returns_to_start_screen(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = make_commit("only")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller) as window:
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None,
+        )
+        window.workspace_page.graph_view.commit_selected.emit(commit.hash)
+        assert window.selected_commit_hash == commit.hash
+
+        window.workspace_page.top_bar.close_button.click()
+
+        assert window.stack.currentWidget() is window.start_screen
+        assert window.selected_commit_hash is None
+        assert window.workspace_page.graph_view.is_empty
+        assert window.workspace_page.details_panel.current_commit is None
+        assert window.workspace_page.branches_panel.tree.topLevelItemCount() == 0
+        assert window.windowTitle() == "Git Visualizer"
+        assert controller.repository is None
+        assert "Репозиторий закрыт" in window.statusBar().currentMessage()
 
 
 def test_entry_point_is_callable() -> None:

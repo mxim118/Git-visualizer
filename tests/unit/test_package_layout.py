@@ -14,6 +14,7 @@ PACKAGES = [
     "git_visualizer.presentation.windows",
     "git_visualizer.presentation.widgets",
     "git_visualizer.presentation.dialogs",
+    "git_visualizer.presentation.controllers",
     "git_visualizer.presentation.workers",
 ]
 
