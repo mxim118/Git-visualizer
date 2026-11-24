@@ -4,7 +4,8 @@ MainWindow не содержит бизнес-логики: открытие р�
 истории, списка файлов, diff и состояния рабочей директории выполняются Application
 Services через ``RepositoryController``. Здесь — только диалоги, переключение экранов,
 фильтрация устаревших результатов по выбранному коммиту/файлу и передача данных
-виджетам.
+виджетам. Diff файла коммита показывается в большой панели ``DiffOverlay`` поверх
+всего окна.
 """
 
 from __future__ import annotations
@@ -20,12 +21,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from git_visualizer.domain.models import ChangedFile, Diff, FileChange, Repository
+from git_visualizer.domain.models import (
+    ChangedFile,
+    Commit,
+    Diff,
+    FileChange,
+    Repository,
+)
 from git_visualizer.presentation.controllers.repository_controller import (
     RepositoryController,
     WorkspaceData,
 )
 from git_visualizer.presentation.error_texts import technical_details, user_message
+from git_visualizer.presentation.widgets.diff_overlay import DiffOverlay
 from git_visualizer.presentation.widgets.start_screen import StartScreen
 from git_visualizer.presentation.widgets.workspace_page import WorkspacePage
 from git_visualizer.presentation.workers.task_runner import TaskFailure
@@ -58,6 +66,11 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.workspace_page)
         self.setCentralWidget(self.stack)
 
+        self.diff_overlay = DiffOverlay(self)
+        self.diff_overlay.hide()
+        # Какая секция открыла панель: "commit" или "worktree".
+        self._diff_overlay_kind: str | None = None
+
         self._connect_signals()
         self.statusBar().showMessage("Проверка Git…")
         self.stack.setCurrentWidget(self.start_screen)
@@ -77,6 +90,12 @@ class MainWindow(QMainWindow):
         self._controller.wait_for_done()
         super().closeEvent(event)
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().resizeEvent(event)
+        overlay = getattr(self, "diff_overlay", None)
+        if overlay is not None and overlay.isVisible():
+            overlay.setGeometry(self.rect())
+
     def _connect_signals(self) -> None:
         self.start_screen.open_repository_requested.connect(self._choose_repository)
         self.workspace_page.refresh_requested.connect(self._refresh_history)
@@ -87,6 +106,7 @@ class MainWindow(QMainWindow):
             self._on_worktree_file_selected
         )
         self.workspace_page.changes_refresh_requested.connect(self._refresh_changes)
+        self.diff_overlay.close_requested.connect(self._close_file_diff)
 
         self._controller.git_environment_ready.connect(self._on_git_environment_ready)
         self._controller.git_environment_failed.connect(self._on_git_environment_failed)
@@ -175,6 +195,7 @@ class MainWindow(QMainWindow):
     # --- открытие и закрытие репозитория ---
 
     def _on_repository_opening(self, path: str) -> None:
+        self._hide_diff_overlay()
         self.workspace_page.clear()
         self.stack.setCurrentWidget(self.start_screen)
         self.start_screen.set_open_enabled(False)
@@ -194,6 +215,7 @@ class MainWindow(QMainWindow):
         self._show_error("Не удалось открыть репозиторий", failure.exception)
 
     def _on_repository_closed(self) -> None:
+        self._hide_diff_overlay()
         self.workspace_page.clear()
         self.stack.setCurrentWidget(self.start_screen)
         self.start_screen.set_open_enabled(True)
@@ -230,6 +252,8 @@ class MainWindow(QMainWindow):
     # --- детали выбранного коммита и diff ---
 
     def _on_commit_selected(self, commit_hash: str) -> None:
+        self._hide_diff_overlay()
+        self.workspace_page.clear_file_selection()
         self.commit_selected.emit(commit_hash)
         self._controller.load_commit_files(commit_hash)
 
@@ -254,25 +278,76 @@ class MainWindow(QMainWindow):
     def _on_file_selected(
         self, commit_hash: str, file_change: FileChange
     ) -> None:
-        self._controller.load_file_diff(commit_hash, file_change)
+        """Открывает diff файла коммита в панели поверх окна."""
+        if self._find_commit(commit_hash) is None:
+            return
+        if not self._controller.load_file_diff(commit_hash, file_change):
+            self.statusBar().showMessage("Diff этого файла уже загружается…")
 
     def _on_file_diff_loading(self, commit_hash: str, path: str) -> None:
-        if self._is_current_file(commit_hash, path):
-            self.workspace_page.details_panel.set_diff_loading()
+        if not self._is_current_file(commit_hash, path):
+            return
+        context = self._current_file_context(commit_hash)
+        if context is None:
+            return
+        commit, file_change = context
+        self._diff_overlay_kind = "commit"
+        self.diff_overlay.show_commit_loading(commit, file_change)
 
     def _on_file_diff_loaded(self, commit_hash: str, path: str, diff: Diff) -> None:
-        if self._is_current_file(commit_hash, path):
-            self.workspace_page.details_panel.show_diff(diff)
+        if not self._is_current_file(commit_hash, path):
+            return
+        context = self._current_file_context(commit_hash)
+        if context is None:
+            return
+        commit, file_change = context
+        self._diff_overlay_kind = "commit"
+        self.diff_overlay.show_commit_diff(commit, file_change, diff)
 
     def _on_file_diff_failed(
         self, commit_hash: str, path: str, failure: TaskFailure
     ) -> None:
         if not self._is_current_file(commit_hash, path):
             return
-        self.workspace_page.details_panel.set_diff_error(
-            "Не удалось загрузить diff файла."
-        )
+        context = self._current_file_context(commit_hash)
+        if context is not None:
+            commit, file_change = context
+            self._diff_overlay_kind = "commit"
+            self.diff_overlay.show_commit_error(
+                commit, file_change, "Не удалось загрузить diff файла."
+            )
         self._show_error("Не удалось загрузить diff", failure.exception)
+
+    def _close_file_diff(self) -> None:
+        """Закрывает панель diff и снимает выбор, чтобы файл можно было открыть снова."""
+        kind = self._diff_overlay_kind
+        self._hide_diff_overlay()
+        if kind == "worktree":
+            self.workspace_page.changes_panel.clear_selection()
+        else:
+            self.workspace_page.clear_file_selection()
+
+    def _hide_diff_overlay(self) -> None:
+        self._diff_overlay_kind = None
+        self.diff_overlay.hide_overlay()
+
+    def _find_commit(self, commit_hash: str) -> Commit | None:
+        data = self.workspace_page.workspace_data
+        if data is None:
+            return None
+        return next(
+            (commit for commit in data.commits if commit.hash == commit_hash),
+            None,
+        )
+
+    def _current_file_context(
+        self, commit_hash: str
+    ) -> tuple[Commit, FileChange] | None:
+        commit = self._find_commit(commit_hash)
+        file_change = self.workspace_page.selected_file
+        if commit is None or file_change is None:
+            return None
+        return commit, file_change
 
     def _is_current_commit(self, commit_hash: str) -> bool:
         return self.workspace_page.selected_commit_hash == commit_hash
@@ -313,29 +388,43 @@ class MainWindow(QMainWindow):
     def _on_worktree_file_selected(
         self, changed_file: ChangedFile, staged: bool
     ) -> None:
+        self._diff_overlay_kind = "worktree"
         # У неотслеживаемого файла diff нет: Git не знает о нём до `git add`.
         if changed_file.is_untracked:
-            self.workspace_page.changes_panel.show_untracked_notice()
+            self.diff_overlay.show_untracked(changed_file, staged)
             return
         if not self._controller.load_worktree_diff(changed_file, staged=staged):
             self.statusBar().showMessage("Diff этого файла уже загружается…")
 
     def _on_worktree_diff_loading(self, path: str, staged: bool) -> None:
-        if self._is_current_worktree_file(path, staged):
-            self.workspace_page.changes_panel.set_diff_loading()
+        if not self._is_current_worktree_file(path, staged):
+            return
+        changed_file = self.workspace_page.changes_panel.selected_file
+        if changed_file is None:
+            return
+        self._diff_overlay_kind = "worktree"
+        self.diff_overlay.show_worktree_loading(changed_file, staged)
 
     def _on_worktree_diff_loaded(self, path: str, staged: bool, diff: Diff) -> None:
-        if self._is_current_worktree_file(path, staged):
-            self.workspace_page.changes_panel.show_diff(diff)
+        if not self._is_current_worktree_file(path, staged):
+            return
+        changed_file = self.workspace_page.changes_panel.selected_file
+        if changed_file is None:
+            return
+        self._diff_overlay_kind = "worktree"
+        self.diff_overlay.show_worktree_diff(changed_file, staged, diff)
 
     def _on_worktree_diff_failed(
         self, path: str, staged: bool, failure: TaskFailure
     ) -> None:
         if not self._is_current_worktree_file(path, staged):
             return
-        self.workspace_page.changes_panel.set_diff_error(
-            "Не удалось загрузить diff файла."
-        )
+        changed_file = self.workspace_page.changes_panel.selected_file
+        if changed_file is not None:
+            self._diff_overlay_kind = "worktree"
+            self.diff_overlay.show_worktree_error(
+                changed_file, staged, "Не удалось загрузить diff файла."
+            )
         self._show_error("Не удалось загрузить diff", failure.exception)
 
     def _is_current_worktree_file(self, path: str, staged: bool) -> bool:

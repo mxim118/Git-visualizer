@@ -579,14 +579,68 @@ def test_commit_files_and_diffs_are_shown_for_merge_commit(
         assert details.files_tree.topLevelItem(4).text(1) == "скопирован"
 
         details.files_tree.setCurrentItem(details.files_tree.topLevelItem(2))
-        wait_until(qt_app, lambda: bool(details.diff_view.text))
+        wait_until(qt_app, lambda: bool(window.diff_overlay.diff_view.text))
 
         assert details.selected_file == files[2]
         assert window.workspace_page.selected_file == files[2]
-        assert details.diff_view.text == diff.text
-        assert "первым родителем" in details.diff_view.base_label.text()
-        assert first_parent.short_hash in details.diff_view.base_label.text()
-        assert "renamed.txt" in details.diff_view.header_label.text()
+        assert not window.diff_overlay.isHidden()
+        assert window.diff_overlay.diff_view.text == diff.text
+        assert "первым родителем" in window.diff_overlay.diff_view.base_label.text()
+        assert first_parent.short_hash in window.diff_overlay.diff_view.base_label.text()
+        assert "renamed.txt" in window.diff_overlay.diff_view.header_label.text()
+
+
+def test_file_diff_opens_in_window_overlay_and_closes_with_cross(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = make_commit("commit")
+    file_change = FileChange(path="file.txt", change_type=FileChangeType.MODIFIED)
+    diff = Diff(path="file.txt", text="@@ -1 +1 @@\n-old\n+new\n")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        files=(file_change,),
+        diff=diff,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller) as window:
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None,
+        )
+        window.workspace_page.graph_view.commit_selected.emit(commit.hash)
+
+        details = window.workspace_page.details_panel
+        wait_until(qt_app, lambda: len(details.files) == 1)
+        assert window.diff_overlay.isHidden()
+        # Внутреннего diff и его splitter'а в деталях больше нет (исходная жалоба).
+        assert not hasattr(details, "diff_view")
+        assert not hasattr(details, "details_splitter")
+
+        details.files_tree.setCurrentItem(details.files_tree.topLevelItem(0))
+        wait_until(
+            qt_app,
+            lambda: not window.diff_overlay.isHidden()
+            and bool(window.diff_overlay.diff_view.text),
+        )
+        assert "+new" in window.diff_overlay.diff_view.text
+        assert "file.txt" in window.diff_overlay.diff_view.header_label.text()
+
+        window.diff_overlay.close_button.click()
+
+        assert window.diff_overlay.isHidden()
+        assert details.files_tree.currentItem() is None
+        assert details.selected_file is None
+        assert window.workspace_page.selected_file is None
+
+        # После закрытия тот же файл можно открыть повторно.
+        details.files_tree.setCurrentItem(details.files_tree.topLevelItem(0))
+        wait_until(qt_app, lambda: not window.diff_overlay.isHidden())
 
 
 def test_root_commit_uses_empty_tree_comparison(
@@ -632,10 +686,10 @@ def test_root_commit_uses_empty_tree_comparison(
         assert "пустого дерева" in metadata
 
         details.files_tree.setCurrentItem(details.files_tree.topLevelItem(0))
-        wait_until(qt_app, lambda: bool(details.diff_view.text))
+        wait_until(qt_app, lambda: bool(window.diff_overlay.diff_view.text))
 
-        assert "пустым деревом" in details.diff_view.base_label.text()
-        assert "+content" in details.diff_view.text
+        assert "пустым деревом" in window.diff_overlay.diff_view.base_label.text()
+        assert "+content" in window.diff_overlay.diff_view.text
 
 
 def test_diff_view_reports_binary_and_truncated_diff(qt_app) -> None:
@@ -838,21 +892,47 @@ def test_changes_panel_shows_staged_and_unstaged_and_routes_diff(
         assert panel.staged_tree.topLevelItem(1).text(0) == "both.txt"
 
         panel.staged_tree.setCurrentItem(panel.staged_tree.topLevelItem(1))
-        wait_until(qt_app, lambda: bool(panel.diff_view.text))
+        wait_until(
+            qt_app,
+            lambda: not window.diff_overlay.isHidden()
+            and window.diff_overlay.diff_view.is_editor_visible,
+        )
         assert changes_service.diff_requests == [("both.txt", True)]
         assert panel.selected_file == WORKTREE_CHANGES[1]
         assert panel.selected_is_staged is True
-        assert "в индексе" in panel.diff_view.header_label.text()
-        assert "Staged diff" in panel.diff_view.base_label.text()
+        assert "в индексе" in window.diff_overlay.diff_view.header_label.text()
+        assert "Staged diff" in window.diff_overlay.diff_view.base_label.text()
+        assert "+new" in window.diff_overlay.diff_view.text
+        assert window._diff_overlay_kind == "worktree"
         assert panel.unstaged_tree.currentItem() is None
 
         panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
         wait_until(
             qt_app,
-            lambda: changes_service.diff_requests == [("both.txt", True), ("both.txt", False)],
+            lambda: len(changes_service.diff_requests) == 2
+            and "Unstaged diff" in window.diff_overlay.diff_view.base_label.text()
+            and window.diff_overlay.diff_view.is_editor_visible,
         )
+        assert changes_service.diff_requests == [
+            ("both.txt", True),
+            ("both.txt", False),
+        ]
         assert panel.selected_is_staged is False
         assert panel.staged_tree.currentItem() is None
+        assert "вне индекса" in window.diff_overlay.diff_view.header_label.text()
+
+        # Крестик закрывает панель и снимает выбор: файл можно открыть повторно.
+        window.diff_overlay.close_button.click()
+        assert window.diff_overlay.isHidden()
+        assert panel.selected_file is None
+        assert window._diff_overlay_kind is None
+
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        wait_until(
+            qt_app,
+            lambda: len(changes_service.diff_requests) == 3
+            and window.diff_overlay.diff_view.is_editor_visible,
+        )
     finally:
         window.close()
 
@@ -873,8 +953,10 @@ def test_untracked_file_shows_notice_without_git_diff(
         assert changes_service.diff_requests == []
         assert panel.selected_file is not None
         assert panel.selected_file.path == "untracked.txt"
-        assert "не отслеживается" in panel.diff_view.message_text
-        assert "untracked.txt" in panel.diff_view.header_label.text()
+        assert not window.diff_overlay.isHidden()
+        assert "не отслеживается" in window.diff_overlay.diff_view.message_text
+        assert "untracked.txt" in window.diff_overlay.diff_view.header_label.text()
+        assert window._diff_overlay_kind == "worktree"
     finally:
         window.close()
 

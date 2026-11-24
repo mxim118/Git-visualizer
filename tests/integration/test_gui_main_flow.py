@@ -179,12 +179,13 @@ def test_gui_commit_details_and_file_diff_flow(
         assert "Изменения относительно родителя" in details.metadata_view.toPlainText()
 
         details.files_tree.setCurrentItem(details.files_tree.topLevelItem(0))
-        wait_until(qt_app, lambda: bool(details.diff_view.text))
+        wait_until(qt_app, lambda: bool(window.diff_overlay.diff_view.text))
 
         assert details.selected_file == details.files[0]
-        assert "-0" in details.diff_view.text
-        assert "+changed" in details.diff_view.text
-        assert "Сравнение с родителем" in details.diff_view.base_label.text()
+        assert not window.diff_overlay.isHidden()
+        assert "-0" in window.diff_overlay.diff_view.text
+        assert "+changed" in window.diff_overlay.diff_view.text
+        assert "Сравнение с родителем" in window.diff_overlay.diff_view.base_label.text()
     finally:
         window.close()
 
@@ -223,23 +224,34 @@ def test_gui_worktree_changes_flow(
         assert [change.path for change in panel.staged_files] == ["staged.txt"]
 
         panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
-        wait_until(qt_app, lambda: bool(panel.diff_view.text))
-        assert "-0" in panel.diff_view.text
-        assert "+unstaged change" in panel.diff_view.text
-        assert "Unstaged diff" in panel.diff_view.base_label.text()
+        wait_until(
+            qt_app,
+            lambda: not window.diff_overlay.isHidden()
+            and bool(window.diff_overlay.diff_view.text),
+        )
+        assert "-0" in window.diff_overlay.diff_view.text
+        assert "+unstaged change" in window.diff_overlay.diff_view.text
+        assert "Unstaged diff" in window.diff_overlay.diff_view.base_label.text()
+        assert "вне индекса" in window.diff_overlay.diff_view.header_label.text()
 
         panel.staged_tree.setCurrentItem(panel.staged_tree.topLevelItem(0))
         wait_until(
             qt_app,
-            lambda: "new file mode" in panel.diff_view.text,
+            lambda: "new file mode" in window.diff_overlay.diff_view.text,
         )
-        assert "+staged content" in panel.diff_view.text
-        assert "Staged diff" in panel.diff_view.base_label.text()
+        assert "+staged content" in window.diff_overlay.diff_view.text
+        assert "Staged diff" in window.diff_overlay.diff_view.base_label.text()
+        assert "в индексе" in window.diff_overlay.diff_view.header_label.text()
 
         panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(1))
         assert panel.selected_file is not None
         assert panel.selected_file.path == "untracked.txt"
-        assert "не отслеживается" in panel.diff_view.message_text
+        assert "не отслеживается" in window.diff_overlay.diff_view.message_text
+        assert "untracked.txt" in window.diff_overlay.diff_view.header_label.text()
+
+        window.diff_overlay.close_button.click()
+        assert window.diff_overlay.isHidden()
+        assert panel.selected_file is None
 
         (path / "another.txt").write_text("another\n", encoding="utf-8")
         panel.refresh_button.click()

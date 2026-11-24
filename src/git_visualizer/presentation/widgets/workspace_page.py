@@ -18,8 +18,9 @@ class WorkspacePage(QWidget):
     """Основное окно репозитория с изменяемыми по размеру панелями.
 
     Центральная область — ``GraphView``; слева ветки и remote, справа детали
-    коммита с файлами и diff, снизу панель Changes. Выбор узла сохраняется в
-    ``selected_commit_hash``, обновляет панель деталей и сообщается сигналом
+    коммита со списком файлов, снизу панель Changes. Diff выбранного файла коммита
+    открывается большой панелью поверх окна (``DiffOverlay``). Выбор узла сохраняется
+    в ``selected_commit_hash``, обновляет панель деталей и сообщается сигналом
     ``commit_selected``; выбор файла коммита сохраняется в ``selected_file`` и
     сообщается сигналом ``file_selected``. Выбор файла в Changes сообщается
     сигналом ``worktree_file_selected`` вместе с секцией (staged/unstaged).
@@ -141,6 +142,11 @@ class WorkspacePage(QWidget):
     @property
     def workspace_data(self) -> WorkspaceData | None:
         return self._data
+
+    def clear_file_selection(self) -> None:
+        """Снимает выбор файла коммита (закрытие панели diff или смена коммита)."""
+        self._selected_file = None
+        self.details_panel.clear_file_selection()
 
     def _on_commit_selected(self, commit_hash: str) -> None:
         self._selected_commit_hash = commit_hash

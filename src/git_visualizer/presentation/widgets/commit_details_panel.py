@@ -1,8 +1,10 @@
-"""Правая панель: детали коммита, список файлов и diff.
+"""Правая панель: детали коммита и список изменённых файлов.
 
-Виджет не запускает Git: данные (``Commit``, ``FileChange``, ``Diff``) передаёт
-Presentation после фоновой загрузки. Список изменённых файлов и diff обновляются
-по выбору пользователя; diff показывает базу сравнения (родитель/пустое дерево).
+Виджет не запускает Git: данные (``Commit``, ``FileChange``) передаёт
+Presentation после фоновой загрузки. Diff здесь не показывается — выбранный файл
+открывается в большой панели поверх окна (``DiffOverlay``), поэтому маленького
+внутреннего diff и его splitter'а нет: панель целиком занята данными коммита и
+списком файлов.
 """
 
 from __future__ import annotations
@@ -15,7 +17,6 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
-    QSplitter,
     QTextBrowser,
     QTreeWidget,
     QTreeWidgetItem,
@@ -24,8 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from git_visualizer.domain.enums import FileChangeType
-from git_visualizer.domain.models import Commit, Diff, FileChange
-from git_visualizer.presentation.widgets.diff_view import DiffView
+from git_visualizer.domain.models import Commit, FileChange
 
 _FILE_CHANGE_LABELS: dict[FileChangeType, str] = {
     FileChangeType.ADDED: "добавлен",
@@ -39,11 +39,10 @@ _FILE_CHANGE_LABELS: dict[FileChangeType, str] = {
 _PLACEHOLDER_TEXT = "Коммит не выбран"
 _EMPTY_REPOSITORY_TEXT = "В репозитории пока нет коммитов."
 _FILES_NOT_LOADED_TEXT = "Файлы не загружены"
-_CHOOSE_FILE_TEXT = "Выберите файл, чтобы увидеть diff."
 
 
 class CommitDetailsPanel(QWidget):
-    """Сведения о коммите, изменённые файлы и diff выбранного файла."""
+    """Сведения о коммите и изменённые файлы; выбор файла сообщается сигналом."""
 
     file_selected = Signal(object)  # FileChange
 
@@ -63,7 +62,7 @@ class CommitDetailsPanel(QWidget):
         self.metadata_view = QTextBrowser(self)
         self.metadata_view.setObjectName("commit_metadata")
         self.metadata_view.setOpenExternalLinks(False)
-        self.metadata_view.setMinimumHeight(180)
+        self.metadata_view.setMinimumHeight(120)
 
         files_title = QLabel("Изменённые файлы")
         files_title.setObjectName("commit_files_title")
@@ -80,38 +79,20 @@ class CommitDetailsPanel(QWidget):
         self.files_tree.setRootIsDecorated(False)
         self.files_tree.setUniformRowHeights(True)
         self.files_tree.setAlternatingRowColors(True)
+        self.files_tree.setMinimumHeight(80)
         header = self.files_tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.files_tree.currentItemChanged.connect(self._on_current_item_changed)
 
-        top = QWidget()
-        top_layout = QVBoxLayout(top)
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.setSpacing(6)
-        top_layout.addWidget(self.metadata_view, 1)
-        top_layout.addWidget(files_title)
-        top_layout.addWidget(self.files_status_label)
-        top_layout.addWidget(self.files_tree, 1)
-
-        self.diff_view = DiffView(self)
-
-        self.details_splitter = QSplitter(Qt.Orientation.Vertical, self)
-        self.details_splitter.setObjectName("commit_details_splitter")
-        self.details_splitter.setChildrenCollapsible(True)
-        self.details_splitter.addWidget(top)
-        self.details_splitter.addWidget(self.diff_view)
-        self.details_splitter.setStretchFactor(0, 1)
-        self.details_splitter.setStretchFactor(1, 1)
-        self.details_splitter.setSizes([420, 300])
-        top.setMinimumHeight(200)
-        self.diff_view.setMinimumHeight(160)
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         layout.addWidget(title)
-        layout.addWidget(self.details_splitter, 1)
+        layout.addWidget(self.metadata_view, 1)
+        layout.addWidget(files_title)
+        layout.addWidget(self.files_status_label)
+        layout.addWidget(self.files_tree, 2)
 
         self.clear()
 
@@ -129,7 +110,6 @@ class CommitDetailsPanel(QWidget):
         self._selected_file = None
         self._replace_files_placeholder("Загрузка файлов…")
         self.files_status_label.setText("Загрузка файлов…")
-        self.diff_view.clear(_CHOOSE_FILE_TEXT)
 
     def set_files(self, files: Sequence[FileChange]) -> None:
         """Заполняет список файлов; выбор файла сообщается сигналом."""
@@ -151,41 +131,20 @@ class CommitDetailsPanel(QWidget):
             self.files_status_label.setText(f"Файлов: {len(self._files)}")
         else:
             self.files_status_label.setText("В коммите нет изменённых файлов.")
-        self.diff_view.clear(_CHOOSE_FILE_TEXT)
 
     def set_files_error(self, message: str) -> None:
         self._files = ()
         self._selected_file = None
         self._replace_files_placeholder(message)
         self.files_status_label.setText(message)
-        self.diff_view.clear(_CHOOSE_FILE_TEXT)
 
-    def show_diff(self, diff: Diff) -> None:
-        """Показывает diff выбранного файла с явной базой сравнения."""
-        file_change = self._selected_file
-        if file_change is None:
-            self.diff_view.show_message(_CHOOSE_FILE_TEXT)
-            return
-        self.diff_view.show_diff(
-            diff,
-            title=_diff_title(file_change),
-            base_text=self._diff_base_text(diff),
-        )
-
-    def set_diff_loading(self) -> None:
-        file_change = self._selected_file
-        if file_change is None:
-            return
-        self.diff_view.show_message(
-            "Загрузка diff…",
-            title=_diff_title(file_change),
-            base_text=self._diff_base_text(None),
-        )
-
-    def set_diff_error(self, message: str) -> None:
-        file_change = self._selected_file
-        title = _diff_title(file_change) if file_change is not None else ""
-        self.diff_view.show_message(message, title=title, base_text="")
+    def clear_file_selection(self) -> None:
+        """Снимает выбор файла, чтобы его можно было открыть снова."""
+        self.files_tree.blockSignals(True)
+        self.files_tree.clearSelection()
+        self.files_tree.setCurrentItem(None)
+        self.files_tree.blockSignals(False)
+        self._selected_file = None
 
     def show_empty_repository(self) -> None:
         """Пустое состояние для репозитория без коммитов."""
@@ -198,7 +157,6 @@ class CommitDetailsPanel(QWidget):
         )
         self._replace_files_placeholder("Нет коммитов")
         self.files_status_label.setText("Нет коммитов")
-        self.diff_view.clear("Нет выбранного коммита.")
 
     def clear(self) -> None:
         """Сбрасывает панель: коммит не выбран."""
@@ -211,7 +169,6 @@ class CommitDetailsPanel(QWidget):
         )
         self._replace_files_placeholder(_FILES_NOT_LOADED_TEXT)
         self.files_status_label.setText(_FILES_NOT_LOADED_TEXT)
-        self.diff_view.clear()
 
     @property
     def current_commit(self) -> Commit | None:
@@ -249,24 +206,7 @@ class CommitDetailsPanel(QWidget):
         if not isinstance(index, int) or not 0 <= index < len(self._files):
             return
         self._selected_file = self._files[index]
-        self.diff_view.show_message(
-            "Выберите файл, чтобы увидеть diff.",
-            title=_diff_title(self._selected_file),
-            base_text="",
-        )
         self.file_selected.emit(self._selected_file)
-
-    def _diff_base_text(self, diff: Diff | None) -> str:
-        commit = self._current_commit
-        if commit is None:
-            return ""
-        base_hash = diff.base_commit_hash if diff is not None else _first_parent(commit)
-        if base_hash is None:
-            return "Сравнение с пустым деревом (root-коммит)."
-        short = base_hash[:7]
-        if commit.is_merge:
-            return f"Сравнение с первым родителем {short} (merge-коммит)."
-        return f"Сравнение с родителем {short}."
 
 
 def _metadata_html(commit: Commit) -> str:
@@ -325,11 +265,6 @@ def _change_label(file_change: FileChange) -> str:
     return _FILE_CHANGE_LABELS.get(file_change.change_type, file_change.change_type.value)
 
 
-def _diff_title(file_change: FileChange) -> str:
-    path = _file_display_path(file_change)
-    return f"{path} — {_change_label(file_change)}"
-
-
 def _full_message(commit: Commit) -> str:
     if commit.body:
         return f"{commit.subject}\n\n{commit.body}"
@@ -340,7 +275,3 @@ def _format_datetime(value: datetime) -> str:
     if value.tzinfo is None:
         return value.strftime("%d.%m.%Y %H:%M:%S")
     return value.strftime("%d.%m.%Y %H:%M:%S %z")
-
-
-def _first_parent(commit: Commit) -> str | None:
-    return commit.parent_hashes[0] if commit.parent_hashes else None

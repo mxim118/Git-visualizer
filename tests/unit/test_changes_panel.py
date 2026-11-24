@@ -1,11 +1,11 @@
-"""GUI-тесты панели Changes: секции, пустые состояния, diff и обновление."""
+"""GUI-тесты панели Changes: секции, пустые состояния и обновление."""
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
 
 from git_visualizer.domain.enums import FileChangeType
-from git_visualizer.domain.models import ChangedFile, Diff
+from git_visualizer.domain.models import ChangedFile
 from git_visualizer.presentation.widgets.changes_panel import ChangesPanel
 
 CHANGES = (
@@ -73,7 +73,9 @@ def test_sections_are_split_and_statuses_are_visible(qt_app) -> None:
     assert staged_color != unstaged_color
     assert staged_tree.topLevelItem(1).foreground(1).color().name() == staged_color
     assert unstaged_tree.topLevelItem(1).foreground(1).color().name() == unstaged_color
-    assert panel.diff_view.message_text == "Выберите файл, чтобы увидеть diff."
+    # Встроенного diff больше нет: diff открывается панелью поверх окна.
+    assert not hasattr(panel, "diff_view")
+    assert panel.splitter.count() == 2
 
 
 def test_selection_reports_file_and_section_and_clears_other_list(qt_app) -> None:
@@ -88,14 +90,31 @@ def test_selection_reports_file_and_section_and_clears_other_list(qt_app) -> Non
     assert panel.selected_file is CHANGES[2]
     assert panel.selected_is_staged is True
     assert panel.unstaged_tree.currentItem() is None
-    assert "в индексе" in panel.diff_view.header_label.text()
 
     panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(1))
 
     assert selected[-1] == (CHANGES[2], False)
     assert panel.selected_is_staged is False
     assert panel.staged_tree.currentItem() is None
-    assert "вне индекса" in panel.diff_view.header_label.text()
+
+
+def test_clear_selection_allows_selecting_the_same_file_again(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(CHANGES)
+    selected: list[tuple[ChangedFile, bool]] = []
+    panel.file_selected.connect(lambda change, staged: selected.append((change, staged)))
+
+    item = panel.unstaged_tree.topLevelItem(0)
+    panel.unstaged_tree.setCurrentItem(item)
+    assert len(selected) == 1
+
+    panel.clear_selection()
+    assert panel.selected_file is None
+    assert panel.unstaged_tree.currentItem() is None
+
+    panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+    assert len(selected) == 2
+    assert selected[-1] == (CHANGES[1], False)
 
 
 def test_empty_state_is_shown_after_loading_without_changes(qt_app) -> None:
@@ -128,7 +147,6 @@ def test_loading_and_error_states_are_explicit(qt_app) -> None:
     assert panel.unstaged_tree.topLevelItem(0).text(0) == "Загрузка изменений…"
     assert panel.unstaged_group.title() == "Unstaged"
     assert panel.refresh_button.isEnabled() is False
-    assert panel.diff_view.message_text == "Загрузка изменений…"
 
     panel.set_error("Не удалось загрузить изменения.")
 
@@ -149,46 +167,18 @@ def test_clear_returns_to_not_loaded_state(qt_app) -> None:
     assert panel.selected_file is None
 
 
-def test_untracked_selection_shows_notice_instead_of_diff(qt_app) -> None:
+def test_untracked_selection_is_reported_without_diff(qt_app) -> None:
     panel = ChangesPanel()
     panel.set_changes(CHANGES)
     selected: list[tuple[ChangedFile, bool]] = []
     panel.file_selected.connect(lambda change, staged: selected.append((change, staged)))
 
     panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(2))
-    panel.show_untracked_notice()
 
+    # Diff панель не запрашивает: неотслеживаемый файл открывается пояснением
+    # в DiffOverlay, а панель лишь сообщает выбор.
     assert selected == [(CHANGES[4], False)]
-    assert "не отслеживается" in panel.diff_view.message_text
-    assert "untracked.txt" in panel.diff_view.header_label.text()
-
-
-def test_binary_diff_is_marked(qt_app) -> None:
-    panel = ChangesPanel()
-    panel.set_changes(CHANGES)
-    panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
-
-    panel.show_diff(
-        Diff(path="unstaged.txt", text="", is_binary=True)
-    )
-
-    assert "Бинарный файл" in panel.diff_view.message_text
-    assert panel.diff_view.is_editor_visible is False
-    assert "вне индекса" in panel.diff_view.header_label.text()
-
-
-def test_text_diff_is_shown_with_staged_base_text(qt_app) -> None:
-    panel = ChangesPanel()
-    panel.set_changes(CHANGES)
-    panel.staged_tree.setCurrentItem(panel.staged_tree.topLevelItem(0))
-
-    panel.show_diff(
-        Diff(path="staged.txt", text="@@ -0,0 +1 @@\n+staged\n")
-    )
-
-    assert panel.diff_view.is_editor_visible is True
-    assert "+staged" in panel.diff_view.text
-    assert "Staged diff" in panel.diff_view.base_label.text()
+    assert panel.selected_file is CHANGES[4]
 
 
 def test_refresh_button_requests_status_reload(qt_app) -> None:

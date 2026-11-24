@@ -1,9 +1,10 @@
-"""Нижняя панель Changes: раздельные списки Staged/Unstaged и diff рабочей директории.
+"""Нижняя панель Changes: раздельные списки Staged/Unstaged рабочей директории.
 
-Виджет не запускает Git: ``ChangedFile`` и ``Diff`` передаёт Presentation после
-фоновой загрузки через Application Services. Один файл может быть в обоих списках
+Виджет не запускает Git: ``ChangedFile`` передаёт Presentation после фоновой
+загрузки через Application Services. Один файл может быть в обоих списках
 (``MM``/``AM``): выбор строки сообщает не только файл, но и секцию — от неё зависит,
-какой diff запрашивать (``git diff --cached`` или ``git diff``).
+какой diff запрашивать. Сам diff показывается большой панелью поверх окна
+(``DiffOverlay``), поэтому встроенного diff здесь нет.
 
 Stage/Unstage и создание коммита появятся в следующей задаче; сейчас панель только
 показывает состояние.
@@ -30,8 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from git_visualizer.domain.enums import FileChangeType
-from git_visualizer.domain.models import ChangedFile, Diff
-from git_visualizer.presentation.widgets.diff_view import DiffView
+from git_visualizer.domain.models import ChangedFile
 
 _CHANGE_LABELS: dict[FileChangeType, str] = {
     FileChangeType.ADDED: "добавлен",
@@ -51,17 +51,12 @@ _UNTRACKED_COLOR = "#64748b"
 _NOT_LOADED_TEXT = "Изменения не загружены"
 _LOADING_TEXT = "Загрузка изменений…"
 _CLEAN_TEXT = "Изменений нет — рабочая директория чиста."
-_CHOOSE_FILE_TEXT = "Выберите файл, чтобы увидеть diff."
 _STAGED_HINT = "В индексе (staged)"
 _UNSTAGED_HINT = "Ещё не в индексе (unstaged)"
-_UNTRACKED_NOTICE = (
-    "Файл не отслеживается Git: текстовый diff недоступен, пока файл не добавлен "
-    "в индекс."
-)
 
 
 class ChangesPanel(QWidget):
-    """Изменения рабочей директории: списки Unstaged/Staged, diff и обновление.
+    """Изменения рабочей директории: списки Unstaged/Staged и обновление.
 
     Сигнал ``file_selected(ChangedFile, staged)`` сообщает выбор файла вместе с
     секцией; ``refresh_requested()`` — просьбу обновить состояние.
@@ -113,19 +108,14 @@ class ChangesPanel(QWidget):
         )
         self.staged_tree.currentItemChanged.connect(self._on_staged_item_changed)
 
-        self.diff_view = DiffView(self)
-        self.diff_view.setMinimumWidth(240)
-
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.splitter.setObjectName("changes_splitter")
-        self.splitter.setChildrenCollapsible(True)
+        self.splitter.setChildrenCollapsible(False)
         self.splitter.addWidget(self.unstaged_group)
         self.splitter.addWidget(self.staged_group)
-        self.splitter.addWidget(self.diff_view)
-        self.splitter.setStretchFactor(0, 0)
-        self.splitter.setStretchFactor(1, 0)
-        self.splitter.setStretchFactor(2, 1)
-        self.splitter.setSizes([260, 260, 640])
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([1, 1])
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 8)
@@ -138,14 +128,13 @@ class ChangesPanel(QWidget):
     # --- публичный интерфейс ---
 
     def set_loading(self) -> None:
-        """Состояние загрузки: списки и diff заменяются сообщением."""
+        """Состояние загрузки: списки заменяются сообщением."""
         self._reset_files()
         self._replace_tree(self.unstaged_tree, (), staged=False, text=_LOADING_TEXT)
         self._replace_tree(self.staged_tree, (), staged=True, text=_LOADING_TEXT)
         self._update_group_titles(loaded=False)
         self.status_label.setText(_LOADING_TEXT)
         self.refresh_button.setEnabled(False)
-        self.diff_view.clear(_LOADING_TEXT)
 
     def set_changes(self, changes: Sequence[ChangedFile]) -> None:
         """Заполняет списки; при отсутствии изменений показывает пустое состояние."""
@@ -174,7 +163,6 @@ class ChangesPanel(QWidget):
         self._update_group_titles(loaded=True)
         self.status_label.setText(_summary_text(self._unstaged_files, self._staged_files))
         self.refresh_button.setEnabled(True)
-        self.diff_view.clear(_CHOOSE_FILE_TEXT)
 
     def set_error(self, message: str) -> None:
         """Ошибка загрузки статуса: списки очищаются, причина видна в панели."""
@@ -188,51 +176,16 @@ class ChangesPanel(QWidget):
         self._update_group_titles(loaded=False)
         self.status_label.setText(message)
         self.refresh_button.setEnabled(True)
-        self.diff_view.clear(message)
 
-    def set_diff_loading(self) -> None:
-        """Загрузка diff выбранного файла (секция берётся из выбора)."""
-        file = self._selected_file
-        if file is None:
-            return
-        self.diff_view.show_message(
-            "Загрузка diff…",
-            title=_diff_title(file, self._selected_is_staged),
-            base_text=_diff_base_text(file, self._selected_is_staged),
-        )
-
-    def show_diff(self, diff: Diff) -> None:
-        """Показывает готовый diff выбранного файла с явной базой сравнения."""
-        file = self._selected_file
-        if file is None:
-            self.diff_view.show_message(_CHOOSE_FILE_TEXT)
-            return
-        self.diff_view.show_diff(
-            diff,
-            title=_diff_title(file, self._selected_is_staged),
-            base_text=_diff_base_text(file, self._selected_is_staged),
-        )
-
-    def set_diff_error(self, message: str) -> None:
-        file = self._selected_file
-        if file is None:
-            return
-        self.diff_view.show_message(
-            message,
-            title=_diff_title(file, self._selected_is_staged),
-            base_text="",
-        )
-
-    def show_untracked_notice(self) -> None:
-        """Пояснение для неотслеживаемого файла: Git diff по нему не строит."""
-        file = self._selected_file
-        if file is None:
-            return
-        self.diff_view.show_message(
-            _UNTRACKED_NOTICE,
-            title=_diff_title(file, self._selected_is_staged),
-            base_text=_diff_base_text(file, self._selected_is_staged),
-        )
+    def clear_selection(self) -> None:
+        """Снимает выбор в обоих списках (закрытие панели diff)."""
+        self._selected_file = None
+        self._selected_is_staged = False
+        for tree in (self.unstaged_tree, self.staged_tree):
+            tree.blockSignals(True)
+            tree.clearSelection()
+            tree.setCurrentItem(None)
+            tree.blockSignals(False)
 
     def clear(self) -> None:
         """Сбрасывает панель (репозиторий закрыт или ещё не загружен)."""
@@ -244,7 +197,6 @@ class ChangesPanel(QWidget):
         self._update_group_titles(loaded=False)
         self.status_label.setText(_NOT_LOADED_TEXT)
         self.refresh_button.setEnabled(True)
-        self.diff_view.clear()
 
     @property
     def changes(self) -> tuple[ChangedFile, ...]:
@@ -373,7 +325,6 @@ class ChangesPanel(QWidget):
         self._selected_file = files[index]
         self._selected_is_staged = staged
         self._clear_selection(self.staged_tree if not staged else self.unstaged_tree)
-        self.set_diff_loading()
         self.file_selected.emit(self._selected_file, staged)
 
     @staticmethod
@@ -430,16 +381,3 @@ def _status_color(change: ChangedFile, *, staged: bool) -> str:
     if change.is_untracked:
         return _UNTRACKED_COLOR
     return _STAGED_COLOR if staged else _UNSTAGED_COLOR
-
-
-def _diff_title(change: ChangedFile, staged: bool) -> str:
-    section = "в индексе" if staged else "вне индекса"
-    return f"{_display_path(change)} — {section}"
-
-
-def _diff_base_text(change: ChangedFile, staged: bool) -> str:
-    if change.is_conflicted:
-        return "Конфликт (unmerged): показан объединённый diff Git."
-    if staged:
-        return "Staged diff: индекс относительно HEAD."
-    return "Unstaged diff: рабочая директория относительно индекса."
