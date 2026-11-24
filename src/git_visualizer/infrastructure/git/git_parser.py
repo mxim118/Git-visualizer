@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime
 
 from git_visualizer.domain.enums import FileChangeType
-from git_visualizer.domain.models import Branch, Commit, FileChange, Remote
+from git_visualizer.domain.models import Branch, ChangedFile, Commit, FileChange, Remote
 from git_visualizer.infrastructure.git.git_errors import GitOutputParseError
 
 _FETCH_SUFFIX = " (fetch)"
@@ -406,6 +406,170 @@ def _diff_status_problem(status: str) -> str | None:
 def _name_status_error(problem: str, command: Sequence[str]) -> GitOutputParseError:
     return GitOutputParseError(
         f"Cannot parse git diff --name-status output: {problem}", command=command
+    )
+
+
+# --- Статус рабочей директории (``git status --porcelain=v2 -z``) ---
+#
+# Формат v2 (docs/git-status): записи разделены NUL, каждая начинается с типа:
+#   ``1`` — обычное изменение (``1 XY sub mH mI mW hH hI path``);
+#   ``2`` — переименование/копирование; в режиме ``-z`` прежний путь идёт
+#         отдельной NUL-записью сразу после записи (``... Xscore path``);
+#   ``u`` — unmerged (``u XY sub m1 m2 m3 mW h1 h2 h3 path``);
+#   ``?`` — неотслеживаемый файл, ``!`` — игнорируемый (пропускается);
+#   ``#`` — заголовки ``--branch`` (пропускаются).
+# Путь — последнее поле записи, поэтому разбор идёт через ``split(" ", N)``:
+# пробелы внутри пути сохраняются. ``-z`` не экранирует пути, Unicode и переводы
+# строк попадают в вывод как есть.
+
+_STATUS_TYPES: dict[str, FileChangeType] = {
+    "A": FileChangeType.ADDED,
+    "M": FileChangeType.MODIFIED,
+    "D": FileChangeType.DELETED,
+    "R": FileChangeType.RENAMED,
+    "C": FileChangeType.COPIED,
+    "T": FileChangeType.TYPE_CHANGED,
+}
+_UNMERGED_TYPES = frozenset("UAD")
+
+
+def parse_status(
+    output: str, *, command: Sequence[str] = ()
+) -> tuple[ChangedFile, ...]:
+    """Разбирает вывод ``git status --porcelain=v2 -z`` в модели ``ChangedFile``.
+
+    Порядок записей сохраняется как у Git (по пути). Обычная запись описывает
+    индекс (``X``) и рабочую директорию (``Y``) независимо: ``MM`` даёт файл с
+    обоими изменениями, ``.M`` — только unstaged, ``M.`` — только staged.
+    Записи ``u`` дают ``is_conflicted=True`` (оба изменения ``None``): состояния
+    «разрешено/добавлено» для конфликта Git не сообщает. Неотслеживаемые файлы
+    дают ``is_untracked=True``; каталог целиком (``--untracked-files=normal``)
+    приходит путём с завершающим ``/``. Игнорируемые (``!``) и заголовки
+    ``--branch`` (``#``) пропускаются. Пустой вывод — изменений нет.
+
+    :raises GitOutputParseError: неизвестный тип записи, неверный статус XY,
+        отсутствующий прежний путь переименования или пустой путь.
+    """
+    tokens = output.split("\0")
+    if tokens and tokens[-1] == "":
+        tokens.pop()
+
+    files: list[ChangedFile] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        record_type = token[:1]
+
+        if record_type == "#":
+            continue
+        if record_type == "!":
+            continue
+        if record_type == "?":
+            path = _status_path(token, 2, command)
+            files.append(ChangedFile(path=path, is_untracked=True))
+            continue
+        if record_type == "1":
+            fields = token.split(" ", 8)
+            if len(fields) != 9:
+                raise _status_error(
+                    f"expected 9 fields in ordinary entry, got {len(fields)}", command
+                )
+            path = fields[8]
+            staged_change, unstaged_change = _parse_xy(fields[1], command)
+            if not path:
+                raise _status_error("empty path in ordinary entry", command)
+            files.append(
+                ChangedFile(
+                    path=path,
+                    staged_change=staged_change,
+                    unstaged_change=unstaged_change,
+                )
+            )
+            continue
+        if record_type == "2":
+            fields = token.split(" ", 9)
+            if len(fields) != 10:
+                raise _status_error(
+                    f"expected 10 fields in rename/copy entry, got {len(fields)}",
+                    command,
+                )
+            path = fields[9]
+            if index >= len(tokens):
+                raise _status_error(
+                    f"missing original path for rename/copy entry {path!r}", command
+                )
+            old_path = tokens[index]
+            index += 1
+            staged_change, unstaged_change = _parse_xy(fields[1], command)
+            if not path or not old_path:
+                raise _status_error(
+                    f"empty path in rename/copy entry {path!r}", command
+                )
+            files.append(
+                ChangedFile(
+                    path=path,
+                    old_path=old_path,
+                    staged_change=staged_change,
+                    unstaged_change=unstaged_change,
+                )
+            )
+            continue
+        if record_type == "u":
+            fields = token.split(" ", 10)
+            if len(fields) != 11:
+                raise _status_error(
+                    f"expected 11 fields in unmerged entry, got {len(fields)}",
+                    command,
+                )
+            _validate_unmerged_xy(fields[1], command)
+            path = fields[10]
+            if not path:
+                raise _status_error("empty path in unmerged entry", command)
+            files.append(ChangedFile(path=path, is_conflicted=True))
+            continue
+
+        raise _status_error(f"unknown record type {record_type!r}", command)
+
+    return tuple(files)
+
+
+def _status_path(token: str, offset: int, command: Sequence[str]) -> str:
+    path = token[offset:]
+    if not path:
+        raise _status_error(f"empty path in {token[:1]!r} entry", command)
+    return path
+
+
+def _parse_xy(
+    xy: str, command: Sequence[str]
+) -> tuple[FileChangeType | None, FileChangeType | None]:
+    """Разбирает два символа статуса ``XY`` в индексное и рабочее изменение."""
+    if len(xy) != 2:
+        raise _status_error(f"invalid XY status {xy!r}", command)
+    return _parse_status_char(xy[0], command), _parse_status_char(xy[1], command)
+
+
+def _parse_status_char(
+    char: str, command: Sequence[str]
+) -> FileChangeType | None:
+    if char == ".":
+        return None
+    change_type = _STATUS_TYPES.get(char)
+    if change_type is None:
+        raise _status_error(f"unknown status character {char!r}", command)
+    return change_type
+
+
+def _validate_unmerged_xy(xy: str, command: Sequence[str]) -> None:
+    """Проверяет статус unmerged-записи (``DD``, ``AU``, ``UD``, ``UU``, ...)."""
+    if len(xy) != 2 or any(char not in _UNMERGED_TYPES for char in xy):
+        raise _status_error(f"invalid unmerged status {xy!r}", command)
+
+
+def _status_error(problem: str, command: Sequence[str]) -> GitOutputParseError:
+    return GitOutputParseError(
+        f"Cannot parse git status output: {problem}", command=command
     )
 
 

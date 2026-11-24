@@ -27,6 +27,7 @@ MODULES = [
     "git_visualizer.application.services.branch_service",
     "git_visualizer.application.services.graph_service",
     "git_visualizer.application.services.diff_service",
+    "git_visualizer.application.services.changes_service",
     "git_visualizer.application.services.git_environment_service",
     "git_visualizer.infrastructure.git.git_runner",
     "git_visualizer.infrastructure.git.git_errors",

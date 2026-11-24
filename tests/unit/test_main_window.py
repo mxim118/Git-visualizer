@@ -18,6 +18,7 @@ from git_visualizer.application.services.graph_service import GraphService
 from git_visualizer.domain.enums import FileChangeType
 from git_visualizer.domain.models import (
     Branch,
+    ChangedFile,
     Commit,
     Diff,
     FileChange,
@@ -176,6 +177,38 @@ class FakeDiffService:
         return self.diff
 
 
+class FakeChangesService:
+    def __init__(
+        self,
+        changes: tuple[ChangedFile, ...] = (),
+        diff: Diff | None = None,
+        *,
+        changes_error: BaseException | None = None,
+        diff_error: BaseException | None = None,
+    ) -> None:
+        self.changes = changes
+        self.diff = diff
+        self.changes_error = changes_error
+        self.diff_error = diff_error
+        self.status_requests = 0
+        self.diff_requests: list[tuple[str, bool]] = []
+
+    def get_status(self, repository: Repository) -> tuple[ChangedFile, ...]:
+        self.status_requests += 1
+        if self.changes_error is not None:
+            raise self.changes_error
+        return self.changes
+
+    def get_file_diff(
+        self, repository: Repository, changed_file: ChangedFile, *, staged: bool
+    ) -> Diff:
+        self.diff_requests.append((changed_file.path, staged))
+        if self.diff_error is not None:
+            raise self.diff_error
+        assert self.diff is not None
+        return self.diff
+
+
 def build_controller(
     *,
     repository: Repository,
@@ -190,6 +223,7 @@ def build_controller(
     diff_error: BaseException | None = None,
     environment: GitEnvironment | None = None,
     environment_error: BaseException | None = None,
+    changes_service: FakeChangesService | None = None,
 ) -> tuple[RepositoryController, FakeHistoryService]:
     history = FakeHistoryService(commits, error=history_error)
     controller = RepositoryController(
@@ -202,6 +236,7 @@ def build_controller(
         diff_service=FakeDiffService(
             files, diff, files_error=files_error, diff_error=diff_error
         ),
+        changes_service=changes_service or FakeChangesService(),
         git_environment_service=FakeEnvironmentService(
             environment=environment, error=environment_error
         ),
@@ -728,6 +763,195 @@ def test_refresh_reloads_history_manually(
         )
         assert window.workspace_page.top_bar.refresh_button.isEnabled()
         assert window.selected_commit_hash is None
+
+
+# --- панель Changes ---
+
+WORKTREE_CHANGES = (
+    ChangedFile(path="staged.txt", staged_change=FileChangeType.MODIFIED),
+    ChangedFile(
+        path="both.txt",
+        staged_change=FileChangeType.MODIFIED,
+        unstaged_change=FileChangeType.MODIFIED,
+    ),
+    ChangedFile(path="untracked.txt", is_untracked=True),
+    ChangedFile(path="conflict.txt", is_conflicted=True),
+)
+
+
+def open_workspace_with_changes(
+    qt_app,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changes_service: FakeChangesService,
+) -> tuple[MainWindow, FakeChangesService]:
+    commit = make_commit("only")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        changes_service=changes_service,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+    window = MainWindow(controller)
+    window.start_screen.open_button.click()
+    wait_until(
+        qt_app,
+        lambda: window.workspace_page.workspace_data is not None
+        and window.workspace_page.changes_panel.status_label.text() != "Изменения не загружены",
+    )
+    return window, changes_service
+
+
+def test_changes_panel_shows_staged_and_unstaged_and_routes_diff(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    diff = Diff(path="both.txt", text="@@ -1 +1 @@\n-old\n+new\n")
+    changes_service = FakeChangesService(WORKTREE_CHANGES, diff)
+
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == WORKTREE_CHANGES)
+
+        assert [change.path for change in panel.unstaged_files] == [
+            "both.txt",
+            "untracked.txt",
+            "conflict.txt",
+        ]
+        assert [change.path for change in panel.staged_files] == [
+            "staged.txt",
+            "both.txt",
+        ]
+        assert panel.unstaged_group.title() == "Unstaged (3)"
+        assert panel.staged_group.title() == "Staged (2)"
+        assert "Вне индекса: 3" in panel.status_label.text()
+        assert "В индексе: 2" in panel.status_label.text()
+
+        # Файл с обоими изменениями есть в обеих секциях.
+        assert panel.unstaged_tree.topLevelItemCount() == 3
+        assert panel.staged_tree.topLevelItemCount() == 2
+        assert panel.staged_tree.topLevelItem(1).text(0) == "both.txt"
+
+        panel.staged_tree.setCurrentItem(panel.staged_tree.topLevelItem(1))
+        wait_until(qt_app, lambda: bool(panel.diff_view.text))
+        assert changes_service.diff_requests == [("both.txt", True)]
+        assert panel.selected_file == WORKTREE_CHANGES[1]
+        assert panel.selected_is_staged is True
+        assert "в индексе" in panel.diff_view.header_label.text()
+        assert "Staged diff" in panel.diff_view.base_label.text()
+        assert panel.unstaged_tree.currentItem() is None
+
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        wait_until(
+            qt_app,
+            lambda: changes_service.diff_requests == [("both.txt", True), ("both.txt", False)],
+        )
+        assert panel.selected_is_staged is False
+        assert panel.staged_tree.currentItem() is None
+    finally:
+        window.close()
+
+
+def test_untracked_file_shows_notice_without_git_diff(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changes_service = FakeChangesService(WORKTREE_CHANGES)
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == WORKTREE_CHANGES)
+
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(1))
+
+        assert changes_service.diff_requests == []
+        assert panel.selected_file is not None
+        assert panel.selected_file.path == "untracked.txt"
+        assert "не отслеживается" in panel.diff_view.message_text
+        assert "untracked.txt" in panel.diff_view.header_label.text()
+    finally:
+        window.close()
+
+
+def test_changes_empty_state_is_explicit(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changes_service = FakeChangesService(())
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.is_clean)
+        assert panel.status_label.text() == "Изменений нет — рабочая директория чиста."
+        assert panel.unstaged_tree.topLevelItem(0).text(0) == "Нет незакоммиченных изменений"
+        assert panel.staged_tree.topLevelItem(0).text(0) == "Нет файлов в индексе"
+        assert panel.unstaged_group.title() == "Unstaged (0)"
+        assert panel.staged_group.title() == "Staged (0)"
+        assert "Изменений нет" in window.statusBar().currentMessage()
+    finally:
+        window.close()
+
+
+def test_changes_refresh_button_reloads_status(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changes_service = FakeChangesService(())
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.is_clean)
+        requests_before = changes_service.status_requests
+
+        changes_service.changes = (ChangedFile(path="new.txt", is_untracked=True),)
+        panel.refresh_button.click()
+
+        wait_until(qt_app, lambda: panel.changes == changes_service.changes)
+        assert changes_service.status_requests == requests_before + 1
+        assert panel.unstaged_tree.topLevelItem(0).text(0) == "new.txt"
+        assert panel.unstaged_tree.topLevelItem(0).text(1) == "не отслеживается"
+    finally:
+        window.close()
+
+
+def test_changes_failure_is_reported_and_panel_shows_error(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = GitCommandError(128, command=("git", "status"), stderr="fatal")
+    changes_service = FakeChangesService(changes_error=error)
+    commit = make_commit("only")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        changes_service=changes_service,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+    shown: list[tuple[str, BaseException]] = []
+
+    with opened_window(controller) as window:
+        monkeypatch.setattr(
+            window, "_show_error", lambda title, exc: shown.append((title, exc))
+        )
+        window.start_screen.open_button.click()
+        wait_until(qt_app, lambda: bool(shown))
+
+        panel = window.workspace_page.changes_panel
+        assert shown[0][0] == "Не удалось загрузить изменения"
+        assert shown[0][1] is error
+        assert panel.status_label.text() == "Не удалось загрузить изменения."
+        assert panel.changes == ()
+        assert panel.refresh_button.isEnabled()
 
 
 # --- ошибки и пустой репозиторий ---

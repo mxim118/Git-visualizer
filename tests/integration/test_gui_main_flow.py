@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtWidgets import QFileDialog
 
 from git_visualizer.application.services.branch_service import BranchService
+from git_visualizer.application.services.changes_service import ChangesService
 from git_visualizer.application.services.diff_service import DiffService
 from git_visualizer.application.services.git_environment_service import (
     GitEnvironmentService,
@@ -51,6 +52,7 @@ def build_controller() -> RepositoryController:
         branch_service=BranchService(factory),
         graph_service=GraphService(),
         diff_service=DiffService(factory),
+        changes_service=ChangesService(factory),
         git_environment_service=GitEnvironmentService(runner),
     )
 
@@ -183,6 +185,70 @@ def test_gui_commit_details_and_file_diff_flow(
         assert "-0" in details.diff_view.text
         assert "+changed" in details.diff_view.text
         assert "Сравнение с родителем" in details.diff_view.base_label.text()
+    finally:
+        window.close()
+
+
+def test_gui_worktree_changes_flow(
+    qt_app,
+    make_repo,
+    git,
+    monkeypatch,
+) -> None:
+    path = make_repo("gui-changes", commits=1)
+    (path / "file0.txt").write_text("unstaged change\n", encoding="utf-8")
+    (path / "staged.txt").write_text("staged content\n", encoding="utf-8")
+    git(path, "add", "--", "staged.txt")
+    (path / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
+    )
+    controller = build_controller()
+    window = MainWindow(controller)
+
+    try:
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None,
+        )
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: len(panel.changes) == 3)
+        assert "Вне индекса: 2" in panel.status_label.text()
+        assert "В индексе: 1" in panel.status_label.text()
+        assert [change.path for change in panel.unstaged_files] == [
+            "file0.txt",
+            "untracked.txt",
+        ]
+        assert [change.path for change in panel.staged_files] == ["staged.txt"]
+
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        wait_until(qt_app, lambda: bool(panel.diff_view.text))
+        assert "-0" in panel.diff_view.text
+        assert "+unstaged change" in panel.diff_view.text
+        assert "Unstaged diff" in panel.diff_view.base_label.text()
+
+        panel.staged_tree.setCurrentItem(panel.staged_tree.topLevelItem(0))
+        wait_until(
+            qt_app,
+            lambda: "new file mode" in panel.diff_view.text,
+        )
+        assert "+staged content" in panel.diff_view.text
+        assert "Staged diff" in panel.diff_view.base_label.text()
+
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(1))
+        assert panel.selected_file is not None
+        assert panel.selected_file.path == "untracked.txt"
+        assert "не отслеживается" in panel.diff_view.message_text
+
+        (path / "another.txt").write_text("another\n", encoding="utf-8")
+        panel.refresh_button.click()
+        wait_until(qt_app, lambda: len(panel.changes) == 4)
+        assert sorted(change.path for change in panel.unstaged_files) == [
+            "another.txt",
+            "file0.txt",
+            "untracked.txt",
+        ]
     finally:
         window.close()
 

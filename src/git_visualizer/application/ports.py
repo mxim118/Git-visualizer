@@ -8,7 +8,14 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol
 
-from git_visualizer.domain.models import Branch, Commit, Diff, FileChange, Remote
+from git_visualizer.domain.models import (
+    Branch,
+    ChangedFile,
+    Commit,
+    Diff,
+    FileChange,
+    Remote,
+)
 
 
 class GitRepositoryPort(Protocol):
@@ -23,6 +30,17 @@ class GitRepositoryPort(Protocol):
     def get_current_branch(self) -> str | None: ...
 
     def get_head_commit(self) -> str | None: ...
+
+    def get_status(self) -> tuple[ChangedFile, ...]: ...
+
+    def get_worktree_diff(
+        self,
+        *,
+        path: str,
+        old_path: str | None,
+        staged: bool,
+        max_chars: int,
+    ) -> Diff: ...
 
     def get_branches(self) -> tuple[Branch, ...]: ...
 

@@ -53,11 +53,14 @@ def classify_diff_line(line: str) -> DiffLineKind:
     """Определяет вид строки diff по префиксу.
 
     Заголовки файлов (``---``/``+++``) проверяются раньше строк с ``-``/``+``,
-    иначе они выглядели бы удалённой/добавленной строкой.
+    иначе они выглядели бы удалённой/добавленной строкой. ``diff --cc`` и
+    ``diff --combined`` — заголовки объединённого diff конфликтующего файла.
     """
-    if line.startswith(("diff --git ", "index ", "new file ", "deleted file ",
+    if line.startswith("diff --"):
+        return DiffLineKind.HEADER
+    if line.startswith(("index ", "new file ", "deleted file ",
                         "similarity ", "dissimilarity ", "rename ", "copy ",
-                        "old mode ", "new mode ")):
+                        "old mode ", "new mode ", "* Unmerged path ")):
         return DiffLineKind.HEADER
     if line.startswith(("--- ", "+++ ")):
         return DiffLineKind.HEADER

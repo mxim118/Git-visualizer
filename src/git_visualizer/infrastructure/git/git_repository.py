@@ -1,15 +1,23 @@
 """Обёртка над Git CLI для одного репозитория.
 
 Скрывает конкретные команды Git от сервисов. Все команды выполняются через ``GitRunner``
-с рабочим каталогом ``path``. Реализованы открытие, история, ветки, remote, список
-изменённых файлов коммита и diff одного файла; статус рабочей директории — далее.
+с рабочим каталогом ``path``. Реализованы открытие, история, ветки, remote, статус
+рабочей директории, diff рабочей директории, список изменённых файлов коммита и diff
+одного файла коммита.
 
 Минимальная версия Git: ``branch --show-current`` требует Git 2.22+.
 """
 
 from pathlib import Path
 
-from git_visualizer.domain.models import Branch, Commit, Diff, FileChange, Remote
+from git_visualizer.domain.models import (
+    Branch,
+    ChangedFile,
+    Commit,
+    Diff,
+    FileChange,
+    Remote,
+)
 from git_visualizer.infrastructure.git.git_errors import GitCommandError
 from git_visualizer.infrastructure.git.git_parser import (
     BRANCH_FORMAT,
@@ -21,6 +29,7 @@ from git_visualizer.infrastructure.git.git_parser import (
     parse_history,
     parse_name_status,
     parse_remotes,
+    parse_status,
 )
 from git_visualizer.infrastructure.git.git_runner import GitResult, GitRunner
 
@@ -141,6 +150,50 @@ def build_commit_diff_arguments(
         "--",
         *paths,
     ]
+
+
+def build_status_arguments() -> list[str]:
+    """Аргументы статуса рабочей директории (``git --no-optional-locks status``).
+
+    ``--porcelain=v2`` — стабильный формат для разбора: независимые статусы индекса
+    и рабочей директории, отдельные типы записей для переименований и unmerged.
+    ``-z`` разделяет записи NUL и не экранирует пути. ``--untracked-files=normal``
+    (значение по умолчанию) показывает неотслеживаемый каталог одной записью с
+    завершающим ``/`` вместо перечисления всех файлов: дешевле на больших проектах.
+    ``--branch`` добавляет заголовки ``# branch.*`` — их пропускает парсер.
+
+    ``--no-optional-locks`` (глобальная опция Git, ставится **перед** подкомандой)
+    обязательна: по умолчанию ``git status`` обновляет индекс и берёт
+    ``.git/index.lock``. Фоновый статус иначе сталкивался бы с ``git add``/``commit``
+    пользователя (или с нашими собственными операциями) — второй процесс получает
+    «Another git process seems to be running in this repository» и код 128.
+    """
+    return [
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--branch",
+        "--untracked-files=normal",
+    ]
+
+
+def build_worktree_diff_arguments(*, paths: list[str], staged: bool) -> list[str]:
+    """Аргументы diff рабочей директории одного файла.
+
+    ``staged=True`` — ``git diff --cached`` (индекс относительно HEAD), иначе
+    ``git diff`` (рабочая директория относительно индекса). Для переименования
+    передаются оба пути, иначе Git покажет новый файл как добавленный. Внешние
+    diff-инструменты и textconv отключены, чтобы вывод был предсказуемым;
+    ``core.quotePath=false`` сохраняет не-ASCII пути в заголовках.
+    """
+    if not paths:
+        raise ValueError("At least one path is required for a worktree diff")
+    arguments = ["-c", "core.quotePath=false", "diff"]
+    if staged:
+        arguments.append("--cached")
+    arguments += ["--no-ext-diff", "--no-color", "--no-textconv", "--", *paths]
+    return arguments
 
 
 class GitRepository:
@@ -311,6 +364,53 @@ class GitRepository:
             old_path=old_path,
             is_truncated=truncated,
             base_commit_hash=parent_hash,
+        )
+
+    def get_status(self) -> tuple[ChangedFile, ...]:
+        """Состояние индекса и рабочей директории (``git status --porcelain=v2 -z``).
+
+        Пустой кортеж — изменений нет. У одной записи могут быть заполнены оба
+        изменения: ``MM``/``AM`` означают, что файл изменён ещё раз после ``git add``.
+
+        :raises GitError: команда Git завершилась с ошибкой.
+        :raises GitOutputParseError: вывод Git не соответствует формату v2.
+        """
+        result = self._run(build_status_arguments())
+        return parse_status(result.stdout, command=result.command)
+
+    def get_worktree_diff(
+        self,
+        *,
+        path: str,
+        old_path: str | None = None,
+        staged: bool,
+        max_chars: int,
+    ) -> Diff:
+        """Unified diff одного файла рабочей директории или индекса.
+
+        ``staged=True`` сравнивает индекс с HEAD (``git diff --cached``), иначе —
+        рабочую директорию с индексом (``git diff``). ``Diff.base_commit_hash``
+        остаётся ``None``: сравнение не привязано к коммиту. Для бинарного файла
+        ``is_binary=True`` и пустой ``text``; длинный текст обрезается по границе
+        строки с ``is_truncated=True``.
+
+        :raises ValueError: ``max_chars`` меньше 1.
+        :raises GitError: команда Git завершилась с ошибкой.
+        """
+        if max_chars < 1:
+            raise ValueError(f"Diff limit must be positive, got {max_chars}")
+        paths = [path] if old_path is None else [old_path, path]
+        result = self._run(
+            build_worktree_diff_arguments(paths=paths, staged=staged)
+        )
+
+        raw = result.stdout
+        if is_binary_diff(raw):
+            return Diff(path=path, text="", old_path=old_path, is_binary=True)
+
+        text, truncated = _truncate_diff(raw, max_chars)
+        return Diff(
+            path=path, text=text, old_path=old_path, is_truncated=truncated
         )
 
     def _run(self, args: list[str], *, check: bool = True) -> GitResult:

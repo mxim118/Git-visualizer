@@ -18,16 +18,19 @@ class WorkspacePage(QWidget):
     """Основное окно репозитория с изменяемыми по размеру панелями.
 
     Центральная область — ``GraphView``; слева ветки и remote, справа детали
-    коммита с файлами и diff, снизу заглушка Changes. Выбор узла сохраняется в
+    коммита с файлами и diff, снизу панель Changes. Выбор узла сохраняется в
     ``selected_commit_hash``, обновляет панель деталей и сообщается сигналом
-    ``commit_selected``; выбор файла сохраняется в ``selected_file`` и сообщается
-    сигналом ``file_selected``.
+    ``commit_selected``; выбор файла коммита сохраняется в ``selected_file`` и
+    сообщается сигналом ``file_selected``. Выбор файла в Changes сообщается
+    сигналом ``worktree_file_selected`` вместе с секцией (staged/unstaged).
     """
 
     refresh_requested = Signal()
     close_repository_requested = Signal()
     commit_selected = Signal(str)
     file_selected = Signal(str, object)  # commit hash, FileChange
+    worktree_file_selected = Signal(object, bool)  # ChangedFile, staged
+    changes_refresh_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -81,6 +84,8 @@ class WorkspacePage(QWidget):
         )
         self.graph_view.commit_selected.connect(self._on_commit_selected)
         self.details_panel.file_selected.connect(self._on_file_selected)
+        self.changes_panel.file_selected.connect(self.worktree_file_selected)
+        self.changes_panel.refresh_requested.connect(self.changes_refresh_requested)
 
         self.clear()
 
@@ -121,6 +126,7 @@ class WorkspacePage(QWidget):
         self.graph_view.clear()
         self.branches_panel.clear()
         self.details_panel.clear()
+        self.changes_panel.clear()
 
     @property
     def selected_commit_hash(self) -> str | None:

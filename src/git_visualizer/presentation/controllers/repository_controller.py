@@ -1,9 +1,9 @@
 """Координация Application Services для главного окна.
 
-Контроллер выполняет открытие репозитория, проверку Git и загрузку данных истории
-в фоновых задачах ``TaskRunner``. Он не знает о виджетах: результат сообщается
-сигналами, которые MainWindow связывает с интерфейсом. Бизнес-логика остаётся
-в Application Services.
+Контроллер выполняет открытие репозитория, проверку Git, загрузку данных истории,
+состояния рабочей директории и diff файла в фоновых задачах ``TaskRunner``. Он не
+знает о виджетах: результат сообщается сигналами, которые MainWindow связывает с
+интерфейсом. Бизнес-логика остаётся в Application Services.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from functools import partial
 from PySide6.QtCore import QObject, Signal
 
 from git_visualizer.application.services.branch_service import BranchService, build_ref_labels
+from git_visualizer.application.services.changes_service import ChangesService
 from git_visualizer.application.services.diff_service import DiffService
 from git_visualizer.application.services.git_environment_service import (
     GitEnvironmentService,
@@ -24,6 +25,7 @@ from git_visualizer.application.services.history_service import HistoryService
 from git_visualizer.application.services.repository_service import RepositoryService
 from git_visualizer.domain.models import (
     Branch,
+    ChangedFile,
     Commit,
     Diff,
     FileChange,
@@ -74,6 +76,14 @@ class RepositoryController(QObject):
     file_diff_loaded = Signal(str, str, object)  # commit hash, path, Diff
     file_diff_failed = Signal(str, str, object)  # commit hash, path, TaskFailure
 
+    changes_loading = Signal()
+    changes_loaded = Signal(object)  # tuple[ChangedFile, ...]
+    changes_failed = Signal(object)  # TaskFailure
+
+    worktree_diff_loading = Signal(str, bool)  # path, staged
+    worktree_diff_loaded = Signal(str, bool, object)  # path, staged, Diff
+    worktree_diff_failed = Signal(str, bool, object)  # path, staged, TaskFailure
+
     repository_closed = Signal()
 
     def __init__(
@@ -84,6 +94,7 @@ class RepositoryController(QObject):
         branch_service: BranchService,
         graph_service: GraphService,
         diff_service: DiffService,
+        changes_service: ChangesService,
         git_environment_service: GitEnvironmentService,
         task_runner: TaskRunner | None = None,
         parent: QObject | None = None,
@@ -94,12 +105,14 @@ class RepositoryController(QObject):
         self._branch_service = branch_service
         self._graph_service = graph_service
         self._diff_service = diff_service
+        self._changes_service = changes_service
         self._git_environment_service = git_environment_service
         self._runner = task_runner or TaskRunner(self)
 
         self._session = 0
         self._repository: Repository | None = None
         self._workspace: WorkspaceData | None = None
+        self._changes: tuple[ChangedFile, ...] = ()
 
     @property
     def repository(self) -> Repository | None:
@@ -108,6 +121,11 @@ class RepositoryController(QObject):
     @property
     def workspace(self) -> WorkspaceData | None:
         return self._workspace
+
+    @property
+    def changes(self) -> tuple[ChangedFile, ...]:
+        """Последний загруженный статус рабочей директории."""
+        return self._changes
 
     @property
     def is_loading(self) -> bool:
@@ -132,6 +150,7 @@ class RepositoryController(QObject):
         session = self._session
         self._repository = None
         self._workspace = None
+        self._changes = ()
         self.repository_opening.emit(path)
 
         task = self._runner.submit(
@@ -157,6 +176,7 @@ class RepositoryController(QObject):
         self._session += 1
         self._repository = None
         self._workspace = None
+        self._changes = ()
         self.repository_closed.emit()
 
     def load_commit_files(self, commit_hash: str) -> bool:
@@ -228,6 +248,75 @@ class RepositoryController(QObject):
     def wait_for_done(self, msecs: int = -1) -> bool:
         """Дожидается завершения фоновых задач (используется при закрытии окна)."""
         return self._runner.wait_for_done(msecs)
+
+    def load_changes(self) -> bool:
+        """Запускает фоновое обновление состояния рабочей директории.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или статус уже загружается.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+
+        session = self._session
+        task = self._runner.submit(
+            partial(self._changes_service.get_status, repository),
+            name="changes",
+            key=f"changes:{session}",
+        )
+        if task is None:
+            return False
+        self.changes_loading.emit()
+        task.succeeded.connect(partial(self._handle_changes_loaded, session))
+        task.failed.connect(partial(self._handle_changes_failed, session))
+        return True
+
+    def load_worktree_diff(
+        self, changed_file: ChangedFile, *, staged: bool
+    ) -> bool:
+        """Запускает фоновую загрузку diff файла рабочей директории или индекса.
+
+        :param staged: ``True`` — diff индекса (``git diff --cached``), ``False`` —
+            diff рабочей директории (``git diff``).
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или diff этого файла в этой секции уже загружается.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+
+        session = self._session
+        task = self._runner.submit(
+            partial(
+                self._changes_service.get_file_diff,
+                repository,
+                changed_file,
+                staged=staged,
+            ),
+            name="worktree-diff",
+            key=f"worktree-diff:{session}:{staged}:{changed_file.path}",
+        )
+        if task is None:
+            return False
+        self.worktree_diff_loading.emit(changed_file.path, staged)
+        task.succeeded.connect(
+            partial(
+                self._handle_worktree_diff_loaded,
+                session,
+                changed_file.path,
+                staged,
+            )
+        )
+        task.failed.connect(
+            partial(
+                self._handle_worktree_diff_failed,
+                session,
+                changed_file.path,
+                staged,
+            )
+        )
+        return True
 
     def _load_workspace(self) -> bool:
         repository = self._repository
@@ -327,6 +416,33 @@ class RepositoryController(QObject):
         if session != self._session:
             return
         self.file_diff_failed.emit(commit_hash, path, failure)
+
+    def _handle_changes_loaded(
+        self, session: int, changes: tuple[ChangedFile, ...]
+    ) -> None:
+        if session != self._session:
+            return
+        self._changes = changes
+        self.changes_loaded.emit(changes)
+
+    def _handle_changes_failed(self, session: int, failure: TaskFailure) -> None:
+        if session != self._session:
+            return
+        self.changes_failed.emit(failure)
+
+    def _handle_worktree_diff_loaded(
+        self, session: int, path: str, staged: bool, diff: Diff
+    ) -> None:
+        if session != self._session:
+            return
+        self.worktree_diff_loaded.emit(path, staged, diff)
+
+    def _handle_worktree_diff_failed(
+        self, session: int, path: str, staged: bool, failure: TaskFailure
+    ) -> None:
+        if session != self._session:
+            return
+        self.worktree_diff_failed.emit(path, staged, failure)
 
     def _find_commit(self, commit_hash: str) -> Commit | None:
         if self._workspace is None:

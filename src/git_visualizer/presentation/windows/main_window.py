@@ -1,9 +1,10 @@
 """Главное окно: стартовый экран, рабочая область и координация с контроллером.
 
 MainWindow не содержит бизнес-логики: открытие репозитория, проверка Git, загрузка
-истории, списка файлов и diff выполняются Application Services через
-``RepositoryController``. Здесь — только диалоги, переключение экранов, фильтрация
-устаревших результатов по выбранному коммиту/файлу и передача данных виджетам.
+истории, списка файлов, diff и состояния рабочей директории выполняются Application
+Services через ``RepositoryController``. Здесь — только диалоги, переключение экранов,
+фильтрация устаревших результатов по выбранному коммиту/файлу и передача данных
+виджетам.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from git_visualizer.domain.models import Diff, FileChange, Repository
+from git_visualizer.domain.models import ChangedFile, Diff, FileChange, Repository
 from git_visualizer.presentation.controllers.repository_controller import (
     RepositoryController,
     WorkspaceData,
@@ -82,6 +83,10 @@ class MainWindow(QMainWindow):
         self.workspace_page.close_repository_requested.connect(self._close_repository)
         self.workspace_page.commit_selected.connect(self._on_commit_selected)
         self.workspace_page.file_selected.connect(self._on_file_selected)
+        self.workspace_page.worktree_file_selected.connect(
+            self._on_worktree_file_selected
+        )
+        self.workspace_page.changes_refresh_requested.connect(self._refresh_changes)
 
         self._controller.git_environment_ready.connect(self._on_git_environment_ready)
         self._controller.git_environment_failed.connect(self._on_git_environment_failed)
@@ -98,6 +103,18 @@ class MainWindow(QMainWindow):
         self._controller.file_diff_loading.connect(self._on_file_diff_loading)
         self._controller.file_diff_loaded.connect(self._on_file_diff_loaded)
         self._controller.file_diff_failed.connect(self._on_file_diff_failed)
+        self._controller.changes_loading.connect(self._on_changes_loading)
+        self._controller.changes_loaded.connect(self._on_changes_loaded)
+        self._controller.changes_failed.connect(self._on_changes_failed)
+        self._controller.worktree_diff_loading.connect(
+            self._on_worktree_diff_loading
+        )
+        self._controller.worktree_diff_loaded.connect(
+            self._on_worktree_diff_loaded
+        )
+        self._controller.worktree_diff_failed.connect(
+            self._on_worktree_diff_failed
+        )
 
     # --- действия пользователя ---
 
@@ -118,6 +135,13 @@ class MainWindow(QMainWindow):
 
     def _close_repository(self) -> None:
         self._controller.close_repository()
+
+    def _refresh_changes(self) -> None:
+        """Ручное обновление состояния рабочей директории (кнопка панели Changes)."""
+        if self._controller.repository is None:
+            return
+        if not self._controller.load_changes():
+            self.statusBar().showMessage("Изменения уже загружаются…")
 
     # --- состояние окружения Git ---
 
@@ -185,6 +209,8 @@ class MainWindow(QMainWindow):
     def _on_workspace_loaded(self, data: WorkspaceData) -> None:
         self.workspace_page.set_workspace_data(data)
         self.workspace_page.set_busy(False)
+        # Статус рабочей директории — отдельный запрос: он меняется независимо от HEAD.
+        self._controller.load_changes()
         if data.commits:
             self.statusBar().showMessage(
                 f"Коммитов загружено: {len(data.commits)}. "
@@ -257,6 +283,68 @@ class MainWindow(QMainWindow):
             self._is_current_commit(commit_hash)
             and file_change is not None
             and file_change.path == path
+        )
+
+    # --- Changes: состояние рабочей директории и diff ---
+
+    def _on_changes_loading(self) -> None:
+        self.workspace_page.changes_panel.set_loading()
+        self.statusBar().showMessage("Загрузка изменений…")
+
+    def _on_changes_loaded(self, changes: tuple[ChangedFile, ...]) -> None:
+        self.workspace_page.changes_panel.set_changes(changes)
+        if changes:
+            self.statusBar().showMessage(f"Изменений: {len(changes)}.")
+        else:
+            workspace = self.workspace_page.workspace_data
+            # У пустого репозитория важнее сообщение об отсутствии коммитов.
+            if workspace is not None and workspace.commits:
+                self.statusBar().showMessage(
+                    "Изменений нет — рабочая директория чиста."
+                )
+
+    def _on_changes_failed(self, failure: TaskFailure) -> None:
+        self.workspace_page.changes_panel.set_error(
+            "Не удалось загрузить изменения."
+        )
+        self.statusBar().showMessage("Не удалось загрузить изменения.")
+        self._show_error("Не удалось загрузить изменения", failure.exception)
+
+    def _on_worktree_file_selected(
+        self, changed_file: ChangedFile, staged: bool
+    ) -> None:
+        # У неотслеживаемого файла diff нет: Git не знает о нём до `git add`.
+        if changed_file.is_untracked:
+            self.workspace_page.changes_panel.show_untracked_notice()
+            return
+        if not self._controller.load_worktree_diff(changed_file, staged=staged):
+            self.statusBar().showMessage("Diff этого файла уже загружается…")
+
+    def _on_worktree_diff_loading(self, path: str, staged: bool) -> None:
+        if self._is_current_worktree_file(path, staged):
+            self.workspace_page.changes_panel.set_diff_loading()
+
+    def _on_worktree_diff_loaded(self, path: str, staged: bool, diff: Diff) -> None:
+        if self._is_current_worktree_file(path, staged):
+            self.workspace_page.changes_panel.show_diff(diff)
+
+    def _on_worktree_diff_failed(
+        self, path: str, staged: bool, failure: TaskFailure
+    ) -> None:
+        if not self._is_current_worktree_file(path, staged):
+            return
+        self.workspace_page.changes_panel.set_diff_error(
+            "Не удалось загрузить diff файла."
+        )
+        self._show_error("Не удалось загрузить diff", failure.exception)
+
+    def _is_current_worktree_file(self, path: str, staged: bool) -> bool:
+        panel = self.workspace_page.changes_panel
+        selected = panel.selected_file
+        return (
+            selected is not None
+            and selected.path == path
+            and panel.selected_is_staged == staged
         )
 
     # --- диалоги ---

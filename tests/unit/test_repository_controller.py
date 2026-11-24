@@ -14,6 +14,7 @@ from git_visualizer.application.services.graph_service import GraphService
 from git_visualizer.domain.enums import FileChangeType
 from git_visualizer.domain.models import (
     Branch,
+    ChangedFile,
     Commit,
     Diff,
     FileChange,
@@ -175,6 +176,38 @@ class FakeDiffService:
         return self.diff
 
 
+class FakeChangesService:
+    def __init__(
+        self,
+        changes: tuple[ChangedFile, ...] = (),
+        diff: Diff | None = None,
+        *,
+        changes_error: BaseException | None = None,
+        diff_error: BaseException | None = None,
+    ) -> None:
+        self.changes = changes
+        self.diff = diff
+        self.changes_error = changes_error
+        self.diff_error = diff_error
+        self.status_requests = 0
+        self.diff_requests: list[tuple[str, bool]] = []
+
+    def get_status(self, repository: Repository) -> tuple[ChangedFile, ...]:
+        self.status_requests += 1
+        if self.changes_error is not None:
+            raise self.changes_error
+        return self.changes
+
+    def get_file_diff(
+        self, repository: Repository, changed_file: ChangedFile, *, staged: bool
+    ) -> Diff:
+        self.diff_requests.append((changed_file.path, staged))
+        if self.diff_error is not None:
+            raise self.diff_error
+        assert self.diff is not None
+        return self.diff
+
+
 def build_controller(
     *,
     repository: Repository,
@@ -189,6 +222,7 @@ def build_controller(
     diff_error: BaseException | None = None,
     environment: GitEnvironment | None = None,
     environment_error: BaseException | None = None,
+    changes_service: FakeChangesService | None = None,
 ) -> tuple[
     RepositoryController,
     FakeRepositoryService,
@@ -208,6 +242,7 @@ def build_controller(
         branch_service=FakeBranchService(branches),
         graph_service=GraphService(),
         diff_service=diff_service,
+        changes_service=changes_service or FakeChangesService(),
         git_environment_service=FakeEnvironmentService(
             environment=environment, error=environment_error
         ),
@@ -543,3 +578,95 @@ def test_close_repository_ignores_late_background_result(qt_app, tmp_path: Path)
 
     assert loaded == []
     assert controller.workspace is None
+
+
+def test_changes_and_worktree_diff_are_loaded_in_background(
+    qt_app, tmp_path: Path
+) -> None:
+    commit = make_commit("only")
+    changed = (
+        ChangedFile(
+            path="both.txt",
+            staged_change=FileChangeType.MODIFIED,
+            unstaged_change=FileChangeType.MODIFIED,
+        ),
+        ChangedFile(path="new.txt", is_untracked=True),
+    )
+    diff = Diff(path="both.txt", text="@@ -1 +1 @@\n-old\n+new\n")
+    changes_service = FakeChangesService(changed, diff)
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        changes_service=changes_service,
+    )
+    changes_loaded: list[tuple[ChangedFile, ...]] = []
+    diffs_loaded: list[tuple[str, bool, Diff]] = []
+    controller.changes_loaded.connect(changes_loaded.append)
+    controller.worktree_diff_loaded.connect(
+        lambda path, staged, diff: diffs_loaded.append((path, staged, diff))
+    )
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+
+    assert controller.load_changes() is True
+    assert controller.load_changes() is False  # статус уже загружается
+    wait_until(qt_app, lambda: bool(changes_loaded))
+    assert changes_loaded[0] == changed
+    assert controller.changes == changed
+    assert changes_service.status_requests == 1
+
+    assert controller.load_worktree_diff(changed[0], staged=True) is True
+    wait_until(qt_app, lambda: bool(diffs_loaded))
+    assert diffs_loaded[0] == ("both.txt", True, diff)
+    assert changes_service.diff_requests == [("both.txt", True)]
+
+    assert controller.load_worktree_diff(changed[0], staged=False) is True
+    wait_until(qt_app, lambda: len(diffs_loaded) == 2)
+    assert changes_service.diff_requests[-1] == ("both.txt", False)
+    controller.wait_for_done()
+
+
+def test_changes_failure_is_reported_as_task_failure(qt_app, tmp_path: Path) -> None:
+    error = GitCommandError(128, command=("git", "status"), stderr="fatal")
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        changes_service=FakeChangesService(changes_error=error),
+    )
+    failed: list[TaskFailure] = []
+    loaded: list[tuple[ChangedFile, ...]] = []
+    controller.changes_failed.connect(failed.append)
+    controller.changes_loaded.connect(loaded.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    controller.load_changes()
+
+    wait_until(qt_app, lambda: bool(failed))
+    assert failed[0].exception is error
+    assert loaded == []
+    assert controller.changes == ()
+    controller.wait_for_done()
+
+
+def test_changes_require_open_repository(qt_app) -> None:
+    controller, _, _, _ = build_controller(
+        repository=make_repository(Path("repo"), head_commit=None)
+    )
+
+    assert controller.load_changes() is False
+    assert (
+        controller.load_worktree_diff(
+            ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED),
+            staged=False,
+        )
+        is False
+    )
