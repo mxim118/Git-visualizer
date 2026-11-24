@@ -1,9 +1,10 @@
 """Главное окно: стартовый экран, рабочая область и координация с контроллером.
 
 MainWindow не содержит бизнес-логики: открытие репозитория, проверка Git, загрузка
-истории, списка файлов, diff и состояния рабочей директории выполняются Application
-Services через ``RepositoryController``. Здесь — только диалоги, переключение экранов,
-фильтрация устаревших результатов по выбранному коммиту/файлу и передача данных
+истории, списка файлов, diff, состояния рабочей директории и операции stage/unstage
+выполняются Application Services через ``RepositoryController``. Здесь — только
+диалоги, переключение экранов, фильтрация устаревших результатов по выбранному
+коммиту/файлу, подтверждение области действия массовой операции и передача данных
 виджетам. Diff файла коммита показывается в большой панели ``DiffOverlay`` поверх
 всего окна.
 """
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from git_visualizer.application.services.changes_service import ChangesService
 from git_visualizer.domain.models import (
     ChangedFile,
     Commit,
@@ -33,12 +35,29 @@ from git_visualizer.presentation.controllers.repository_controller import (
     WorkspaceData,
 )
 from git_visualizer.presentation.error_texts import technical_details, user_message
+from git_visualizer.presentation.widgets.changes_panel import (
+    scope_details,
+    scope_summary,
+)
 from git_visualizer.presentation.widgets.diff_overlay import DiffOverlay
 from git_visualizer.presentation.widgets.start_screen import StartScreen
 from git_visualizer.presentation.widgets.workspace_page import WorkspacePage
 from git_visualizer.presentation.workers.task_runner import TaskFailure
 
 _WINDOW_TITLE = "Git Visualizer"
+
+_OPERATION_PROGRESS: dict[str, str] = {
+    "stage-file": "Добавление файла в индекс…",
+    "unstage-file": "Удаление файла из индекса…",
+    "stage-all": "Добавление всех изменений в индекс…",
+    "unstage-all": "Удаление всех изменений из индекса…",
+}
+_OPERATION_ERROR_TITLES: dict[str, str] = {
+    "stage-file": "Не удалось добавить файл в индекс",
+    "unstage-file": "Не удалось убрать файл из индекса",
+    "stage-all": "Не удалось добавить изменения в индекс",
+    "unstage-all": "Не удалось убрать изменения из индекса",
+}
 
 
 class MainWindow(QMainWindow):
@@ -70,6 +89,11 @@ class MainWindow(QMainWindow):
         self.diff_overlay.hide()
         # Какая секция открыла панель: "commit" или "worktree".
         self._diff_overlay_kind: str | None = None
+        # Текущая операция с индексом: "stage-file"/"unstage-file"/"stage-all"/
+        # "unstage-all". Нужна для заголовка ошибки и статусной строки.
+        self._changes_operation: str | None = None
+        # Diff какого файла обновить после операции: (путь, секция после операции).
+        self._pending_worktree_diff_refresh: tuple[str, bool] | None = None
 
         self._connect_signals()
         self.statusBar().showMessage("Проверка Git…")
@@ -105,7 +129,22 @@ class MainWindow(QMainWindow):
         self.workspace_page.worktree_file_selected.connect(
             self._on_worktree_file_selected
         )
+        self.workspace_page.worktree_diff_requested.connect(
+            self._on_worktree_diff_requested
+        )
         self.workspace_page.changes_refresh_requested.connect(self._refresh_changes)
+        self.workspace_page.changes_stage_requested.connect(
+            self._on_stage_requested
+        )
+        self.workspace_page.changes_unstage_requested.connect(
+            self._on_unstage_requested
+        )
+        self.workspace_page.changes_stage_all_requested.connect(
+            self._on_stage_all_requested
+        )
+        self.workspace_page.changes_unstage_all_requested.connect(
+            self._on_unstage_all_requested
+        )
         self.diff_overlay.close_requested.connect(self._close_file_diff)
 
         self._controller.git_environment_ready.connect(self._on_git_environment_ready)
@@ -126,6 +165,15 @@ class MainWindow(QMainWindow):
         self._controller.changes_loading.connect(self._on_changes_loading)
         self._controller.changes_loaded.connect(self._on_changes_loaded)
         self._controller.changes_failed.connect(self._on_changes_failed)
+        self._controller.changes_operation_started.connect(
+            self._on_changes_operation_started
+        )
+        self._controller.changes_operation_succeeded.connect(
+            self._on_changes_operation_succeeded
+        )
+        self._controller.changes_operation_failed.connect(
+            self._on_changes_operation_failed
+        )
         self._controller.worktree_diff_loading.connect(
             self._on_worktree_diff_loading
         )
@@ -196,6 +244,8 @@ class MainWindow(QMainWindow):
 
     def _on_repository_opening(self, path: str) -> None:
         self._hide_diff_overlay()
+        self._pending_worktree_diff_refresh = None
+        self._changes_operation = None
         self.workspace_page.clear()
         self.stack.setCurrentWidget(self.start_screen)
         self.start_screen.set_open_enabled(False)
@@ -216,6 +266,8 @@ class MainWindow(QMainWindow):
 
     def _on_repository_closed(self) -> None:
         self._hide_diff_overlay()
+        self._pending_worktree_diff_refresh = None
+        self._changes_operation = None
         self.workspace_page.clear()
         self.stack.setCurrentWidget(self.start_screen)
         self.start_screen.set_open_enabled(True)
@@ -319,12 +371,14 @@ class MainWindow(QMainWindow):
         self._show_error("Не удалось загрузить diff", failure.exception)
 
     def _close_file_diff(self) -> None:
-        """Закрывает панель diff и снимает выбор, чтобы файл можно было открыть снова."""
+        """Закрывает панель diff; выбор файла Changes сохраняется.
+
+        С отдельной кнопкой ``Diff`` выбор больше не мешает открыть тот же файл
+        снова, зато после закрытия панели Stage/Unstage остаются доступны сразу.
+        """
         kind = self._diff_overlay_kind
         self._hide_diff_overlay()
-        if kind == "worktree":
-            self.workspace_page.changes_panel.clear_selection()
-        else:
+        if kind != "worktree":
             self.workspace_page.clear_file_selection()
 
     def _hide_diff_overlay(self) -> None:
@@ -367,7 +421,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Загрузка изменений…")
 
     def _on_changes_loaded(self, changes: tuple[ChangedFile, ...]) -> None:
-        self.workspace_page.changes_panel.set_changes(changes)
+        panel = self.workspace_page.changes_panel
+        panel.set_changes(changes)
+        self._apply_pending_diff_refresh()
         if changes:
             self.statusBar().showMessage(f"Изменений: {len(changes)}.")
         else:
@@ -379,15 +435,189 @@ class MainWindow(QMainWindow):
                 )
 
     def _on_changes_failed(self, failure: TaskFailure) -> None:
+        self._pending_worktree_diff_refresh = None
+        self._hide_diff_overlay()
         self.workspace_page.changes_panel.set_error(
             "Не удалось загрузить изменения."
         )
         self.statusBar().showMessage("Не удалось загрузить изменения.")
         self._show_error("Не удалось загрузить изменения", failure.exception)
 
+    # --- stage/unstage: действия пользователя ---
+
+    def _on_stage_requested(self, changed_file: ChangedFile) -> None:
+        self._start_file_operation("stage", changed_file)
+
+    def _on_unstage_requested(self, changed_file: ChangedFile) -> None:
+        self._start_file_operation("unstage", changed_file)
+
+    def _start_file_operation(
+        self, operation: str, changed_file: ChangedFile
+    ) -> None:
+        """Запускает Application-операцию с одним файлом и запоминает refresh diff."""
+        # После stage открытый unstaged-diff станет staged-diff (и наоборот):
+        # ту же строку ищем в противоположной секции, когда придёт новый статус.
+        target_staged = operation == "stage"
+        current_staged = not target_staged
+        pending: tuple[str, bool] | None = None
+        if self._diff_overlay_kind == "worktree" and self._is_current_worktree_file(
+            changed_file.path, current_staged
+        ):
+            pending = (changed_file.path, target_staged)
+        self._pending_worktree_diff_refresh = pending
+        self._changes_operation = f"{operation}-file"
+
+        submit = (
+            self._controller.stage_file
+            if operation == "stage"
+            else self._controller.unstage_file
+        )
+        if not submit(changed_file):
+            self._changes_operation = None
+            self._pending_worktree_diff_refresh = None
+            self.statusBar().showMessage(
+                "Другая операция с индексом уже выполняется…"
+            )
+
+    def _on_stage_all_requested(self) -> None:
+        self._start_bulk_operation("stage")
+
+    def _on_unstage_all_requested(self) -> None:
+        self._start_bulk_operation("unstage")
+
+    def _start_bulk_operation(self, operation: str) -> None:
+        """Подтверждает область действия массовой операции и запускает её."""
+        panel = self.workspace_page.changes_panel
+        changes = panel.changes
+        files = (
+            ChangesService.stageable(changes)
+            if operation == "stage"
+            else ChangesService.staged(changes)
+        )
+        if not files:
+            return
+        conflicts = tuple(
+            change for change in changes if change.is_conflicted
+        )
+        if not self._confirm_bulk_operation(operation, files, conflicts):
+            return
+
+        # Выбор строки после массовой операции непредсказуем: старый diff закрываем.
+        self._hide_diff_overlay()
+        panel.clear_selection()
+        self._pending_worktree_diff_refresh = None
+        self._changes_operation = f"{operation}-all"
+
+        submit = (
+            self._controller.stage_all
+            if operation == "stage"
+            else self._controller.unstage_all
+        )
+        if not submit():
+            self._changes_operation = None
+            self.statusBar().showMessage(
+                "Другая операция с индексом уже выполняется…"
+            )
+
+    def _confirm_bulk_operation(
+        self,
+        operation: str,
+        files: tuple[ChangedFile, ...],
+        conflicts: tuple[ChangedFile, ...],
+    ) -> bool:
+        """Показывает файлы и категории, которые затронет массовое действие."""
+        is_stage = operation == "stage"
+        title = "Stage All" if is_stage else "Unstage All"
+        if is_stage:
+            question = "Добавить в индекс все изменения рабочей директории?"
+        else:
+            question = (
+                "Убрать все изменения из индекса? Содержимое рабочей "
+                "директории не изменится."
+            )
+
+        informative = scope_summary(files, staged=not is_stage)
+        # Короткий предпросмотр: какие именно файлы затронет действие. Полный
+        # список — в «Подробнее», чтобы диалог не разрастался на больших наборах.
+        details = scope_details(files, staged=not is_stage)
+        preview = details.splitlines()[:8]
+        if preview:
+            informative += "\n\n" + "\n".join(preview)
+            if len(files) > len(preview):
+                informative += f"\n…и ещё {len(files) - len(preview)}"
+        if conflicts:
+            informative += (
+                f"\n\nКонфликтующие файлы ({len(conflicts)}) не затрагиваются: "
+                "разрешение конфликтов не входит в MVP."
+            )
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(title)
+        box.setText(question)
+        box.setInformativeText(informative)
+        box.setDetailedText(details)
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _on_changes_operation_started(self) -> None:
+        self.workspace_page.changes_panel.set_busy(True)
+        message = _OPERATION_PROGRESS.get(self._changes_operation)
+        if message:
+            self.statusBar().showMessage(message)
+
+    def _on_changes_operation_succeeded(self) -> None:
+        # Статус обновит контроллер; diff переключится в _on_changes_loaded.
+        self._changes_operation = None
+
+    def _on_changes_operation_failed(self, failure: TaskFailure) -> None:
+        operation = self._changes_operation
+        self._changes_operation = None
+        self._pending_worktree_diff_refresh = None
+        self.workspace_page.changes_panel.set_busy(False)
+        # Панель diff показывала состояние до операции: не оставляем устаревший diff.
+        self._hide_diff_overlay()
+        title = _OPERATION_ERROR_TITLES.get(
+            operation, "Не удалось изменить индекс"
+        )
+        self._show_error(title, failure.exception)
+
+    def _apply_pending_diff_refresh(self) -> None:
+        """После операции выбирает файл в новой секции и перезагружает его diff."""
+        pending = self._pending_worktree_diff_refresh
+        self._pending_worktree_diff_refresh = None
+        if pending is None:
+            return
+        path, staged = pending
+        if not self.workspace_page.changes_panel.select_file(path, staged=staged):
+            self._hide_diff_overlay()
+            return
+        # select_file испускает file_selected, который закрывает прежний diff:
+        # открываем diff заново уже для новой секции выбранного файла.
+        changed_file = self.workspace_page.changes_panel.selected_file
+        if changed_file is None:
+            self._hide_diff_overlay()
+            return
+        self._on_worktree_diff_requested(changed_file, staged)
+
     def _on_worktree_file_selected(
         self, changed_file: ChangedFile, staged: bool
     ) -> None:
+        """Клик по файлу только выбирает его: diff открывается кнопкой ``Diff``."""
+        # Открытый diff относился к прежнему выбору; новый файл не должен
+        # оставаться за устаревшей панелью. Невыполненное обновление diff после
+        # операции тоже отменяется — пользователь выбрал другой файл.
+        self._pending_worktree_diff_refresh = None
+        if self._diff_overlay_kind == "worktree":
+            self._hide_diff_overlay()
+
+    def _on_worktree_diff_requested(
+        self, changed_file: ChangedFile, staged: bool
+    ) -> None:
+        """Открывает diff выбранного файла по отдельной кнопке."""
         self._diff_overlay_kind = "worktree"
         # У неотслеживаемого файла diff нет: Git не знает о нём до `git add`.
         if changed_file.is_untracked:

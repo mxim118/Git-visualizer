@@ -185,13 +185,23 @@ class FakeChangesService:
         *,
         changes_error: BaseException | None = None,
         diff_error: BaseException | None = None,
+        operation_error: BaseException | None = None,
     ) -> None:
         self.changes = changes
         self.diff = diff
         self.changes_error = changes_error
         self.diff_error = diff_error
+        self.operation_error = operation_error
+        self.after_stage: tuple[ChangedFile, ...] | None = None
+        self.after_unstage: tuple[ChangedFile, ...] | None = None
+        self.after_stage_all: tuple[ChangedFile, ...] | None = None
+        self.after_unstage_all: tuple[ChangedFile, ...] | None = None
         self.status_requests = 0
         self.diff_requests: list[tuple[str, bool]] = []
+        self.stage_requests: list[ChangedFile] = []
+        self.unstage_requests: list[ChangedFile] = []
+        self.stage_all_requests = 0
+        self.unstage_all_requests = 0
 
     def get_status(self, repository: Repository) -> tuple[ChangedFile, ...]:
         self.status_requests += 1
@@ -207,6 +217,38 @@ class FakeChangesService:
             raise self.diff_error
         assert self.diff is not None
         return self.diff
+
+    def _raise_operation_error(self) -> None:
+        if self.operation_error is not None:
+            raise self.operation_error
+
+    def stage_file(
+        self, repository: Repository, changed_file: ChangedFile
+    ) -> None:
+        self.stage_requests.append(changed_file)
+        self._raise_operation_error()
+        if self.after_stage is not None:
+            self.changes = self.after_stage
+
+    def unstage_file(
+        self, repository: Repository, changed_file: ChangedFile
+    ) -> None:
+        self.unstage_requests.append(changed_file)
+        self._raise_operation_error()
+        if self.after_unstage is not None:
+            self.changes = self.after_unstage
+
+    def stage_all(self, repository: Repository) -> None:
+        self.stage_all_requests += 1
+        self._raise_operation_error()
+        if self.after_stage_all is not None:
+            self.changes = self.after_stage_all
+
+    def unstage_all(self, repository: Repository) -> None:
+        self.unstage_all_requests += 1
+        self._raise_operation_error()
+        if self.after_unstage_all is not None:
+            self.changes = self.after_unstage_all
 
 
 def build_controller(
@@ -891,22 +933,35 @@ def test_changes_panel_shows_staged_and_unstaged_and_routes_diff(
         assert panel.staged_tree.topLevelItemCount() == 2
         assert panel.staged_tree.topLevelItem(1).text(0) == "both.txt"
 
+        # Клик по файлу только выбирает его и не открывает diff.
         panel.staged_tree.setCurrentItem(panel.staged_tree.topLevelItem(1))
+        assert window.diff_overlay.isHidden()
+        assert changes_service.diff_requests == []
+        assert panel.selected_file == WORKTREE_CHANGES[1]
+        assert panel.selected_is_staged is True
+        assert panel.unstaged_tree.currentItem() is None
+
+        # Diff открывается отдельной кнопкой.
+        panel.diff_button.click()
         wait_until(
             qt_app,
             lambda: not window.diff_overlay.isHidden()
             and window.diff_overlay.diff_view.is_editor_visible,
         )
         assert changes_service.diff_requests == [("both.txt", True)]
-        assert panel.selected_file == WORKTREE_CHANGES[1]
-        assert panel.selected_is_staged is True
         assert "в индексе" in window.diff_overlay.diff_view.header_label.text()
         assert "Staged diff" in window.diff_overlay.diff_view.base_label.text()
         assert "+new" in window.diff_overlay.diff_view.text
         assert window._diff_overlay_kind == "worktree"
-        assert panel.unstaged_tree.currentItem() is None
 
+        # Смена выбора закрывает прежний diff; новый открывается кнопкой.
         panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        assert window.diff_overlay.isHidden()
+        assert changes_service.diff_requests == [("both.txt", True)]
+        assert panel.selected_is_staged is False
+        assert panel.staged_tree.currentItem() is None
+
+        panel.diff_button.click()
         wait_until(
             qt_app,
             lambda: len(changes_service.diff_requests) == 2
@@ -917,17 +972,17 @@ def test_changes_panel_shows_staged_and_unstaged_and_routes_diff(
             ("both.txt", True),
             ("both.txt", False),
         ]
-        assert panel.selected_is_staged is False
-        assert panel.staged_tree.currentItem() is None
         assert "вне индекса" in window.diff_overlay.diff_view.header_label.text()
 
-        # Крестик закрывает панель и снимает выбор: файл можно открыть повторно.
+        # Крестик закрывает панель, но сохраняет выбор Changes: Stage/Unstage
+        # доступны сразу, а тот же diff можно открыть кнопкой повторно.
         window.diff_overlay.close_button.click()
         assert window.diff_overlay.isHidden()
-        assert panel.selected_file is None
+        assert panel.selected_file == WORKTREE_CHANGES[1]
+        assert panel.diff_button.isEnabled()
         assert window._diff_overlay_kind is None
 
-        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        panel.diff_button.click()
         wait_until(
             qt_app,
             lambda: len(changes_service.diff_requests) == 3
@@ -950,9 +1005,13 @@ def test_untracked_file_shows_notice_without_git_diff(
 
         panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(1))
 
+        assert window.diff_overlay.isHidden()
         assert changes_service.diff_requests == []
         assert panel.selected_file is not None
         assert panel.selected_file.path == "untracked.txt"
+
+        panel.diff_button.click()
+
         assert not window.diff_overlay.isHidden()
         assert "не отслеживается" in window.diff_overlay.diff_view.message_text
         assert "untracked.txt" in window.diff_overlay.diff_view.header_label.text()
@@ -1034,6 +1093,236 @@ def test_changes_failure_is_reported_and_panel_shows_error(
         assert panel.status_label.text() == "Не удалось загрузить изменения."
         assert panel.changes == ()
         assert panel.refresh_button.isEnabled()
+
+
+# --- Stage/Unstage через главное окно ---
+
+
+def test_stage_selected_file_works_without_opening_diff(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unstaged = (
+        ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED),
+    )
+    staged = (
+        ChangedFile(path="file.txt", staged_change=FileChangeType.MODIFIED),
+    )
+    changes_service = FakeChangesService(unstaged)
+    changes_service.after_stage = staged
+
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == unstaged)
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+
+        # Клик по файлу только выбирает его: diff не запрашивается.
+        assert window.diff_overlay.isHidden()
+        assert changes_service.diff_requests == []
+
+        panel.stage_button.click()
+
+        wait_until(qt_app, lambda: panel.changes == staged)
+        assert changes_service.stage_requests == [unstaged[0]]
+        assert changes_service.diff_requests == []
+        assert window.diff_overlay.isHidden()
+    finally:
+        window.close()
+
+
+def test_stage_selected_file_refreshes_status_and_shows_staged_diff(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unstaged = (
+        ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED),
+    )
+    staged = (
+        ChangedFile(path="file.txt", staged_change=FileChangeType.MODIFIED),
+    )
+    diff = Diff(path="file.txt", text="@@ -1 +1 @@\n-old\n+new\n")
+    changes_service = FakeChangesService(unstaged, diff)
+    changes_service.after_stage = staged
+
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == unstaged)
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        # Diff открываем только явно, чтобы проверить его переключение после stage.
+        assert window.diff_overlay.isHidden()
+        panel.diff_button.click()
+        wait_until(
+            qt_app,
+            lambda: not window.diff_overlay.isHidden()
+            and changes_service.diff_requests == [("file.txt", False)],
+        )
+
+        panel.stage_button.click()
+
+        wait_until(qt_app, lambda: panel.changes == staged)
+        wait_until(
+            qt_app,
+            lambda: changes_service.diff_requests[-1:] == [("file.txt", True)]
+            and "Staged diff" in window.diff_overlay.diff_view.base_label.text(),
+        )
+        assert changes_service.stage_requests == [unstaged[0]]
+        assert panel.staged_files == staged
+        assert panel.unstaged_files == ()
+        assert window._changes_operation is None
+    finally:
+        window.close()
+
+
+def test_unstage_selected_file_keeps_worktree_changes_and_shows_unstaged_diff(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged = (
+        ChangedFile(path="file.txt", staged_change=FileChangeType.MODIFIED),
+    )
+    unstaged = (
+        ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED),
+    )
+    diff = Diff(path="file.txt", text="@@ -1 +1 @@\n-old\n+new\n")
+    changes_service = FakeChangesService(staged, diff)
+    changes_service.after_unstage = unstaged
+
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == staged)
+        panel.staged_tree.setCurrentItem(panel.staged_tree.topLevelItem(0))
+        assert window.diff_overlay.isHidden()
+        panel.diff_button.click()
+        wait_until(
+            qt_app,
+            lambda: not window.diff_overlay.isHidden()
+            and changes_service.diff_requests == [("file.txt", True)],
+        )
+
+        panel.unstage_button.click()
+
+        wait_until(qt_app, lambda: panel.changes == unstaged)
+        wait_until(
+            qt_app,
+            lambda: changes_service.diff_requests[-1:] == [("file.txt", False)]
+            and "Unstaged diff" in window.diff_overlay.diff_view.base_label.text(),
+        )
+        assert changes_service.unstage_requests == [staged[0]]
+        assert panel.unstaged_files == unstaged
+        assert panel.staged_files == ()
+    finally:
+        window.close()
+
+
+def test_stage_all_confirmation_shows_scope_and_skips_conflicts(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changes = (
+        ChangedFile(path="modified.txt", unstaged_change=FileChangeType.MODIFIED),
+        ChangedFile(path="новый файл.txt", is_untracked=True),
+        ChangedFile(path="conflict.txt", is_conflicted=True),
+    )
+    staged = (
+        ChangedFile(path="modified.txt", staged_change=FileChangeType.MODIFIED),
+        ChangedFile(path="новый файл.txt", staged_change=FileChangeType.ADDED),
+        ChangedFile(path="conflict.txt", is_conflicted=True),
+    )
+    changes_service = FakeChangesService(changes)
+    changes_service.after_stage_all = staged
+
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == changes)
+        confirmations: list[tuple[str, tuple[ChangedFile, ...], tuple[ChangedFile, ...]]] = []
+
+        def confirm(operation, files, conflicts):
+            confirmations.append((operation, files, conflicts))
+            return True
+
+        monkeypatch.setattr(window, "_confirm_bulk_operation", confirm)
+
+        panel.stage_all_button.click()
+
+        wait_until(qt_app, lambda: panel.changes == staged)
+        assert len(confirmations) == 1
+        operation, files, conflicts = confirmations[0]
+        assert operation == "stage"
+        assert {change.path for change in files} == {
+            "modified.txt",
+            "новый файл.txt",
+        }
+        assert [change.path for change in conflicts] == ["conflict.txt"]
+        assert changes_service.stage_all_requests == 1
+        # Добавлять больше нечего: остались только staged-файлы и конфликт.
+        assert not panel.stage_all_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_unstage_all_cancel_does_not_run_git(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changes = (
+        ChangedFile(path="staged.txt", staged_change=FileChangeType.ADDED),
+    )
+    changes_service = FakeChangesService(changes)
+
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == changes)
+        monkeypatch.setattr(
+            window, "_confirm_bulk_operation", lambda *args: False
+        )
+
+        panel.unstage_all_button.click()
+
+        assert changes_service.unstage_all_requests == 0
+        assert panel.changes == changes
+    finally:
+        window.close()
+
+
+def test_stage_operation_failure_is_reported_and_status_is_refreshed(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changed = ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED)
+    error = GitCommandError(128, command=("git", "add"), stderr="fatal")
+    changes_service = FakeChangesService((changed,), operation_error=error)
+
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    shown: list[tuple[str, BaseException]] = []
+    try:
+        panel = window.workspace_page.changes_panel
+        monkeypatch.setattr(
+            window, "_show_error", lambda title, exc: shown.append((title, exc))
+        )
+        wait_until(qt_app, lambda: panel.changes == (changed,))
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        assert window.diff_overlay.isHidden()
+
+        panel.stage_button.click()
+
+        wait_until(qt_app, lambda: bool(shown))
+        assert shown[0][0] == "Не удалось добавить файл в индекс"
+        assert shown[0][1] is error
+        assert window.diff_overlay.isHidden()
+        assert not panel.is_busy
+    finally:
+        window.close()
 
 
 # --- ошибки и пустой репозиторий ---

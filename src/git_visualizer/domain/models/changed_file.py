@@ -39,6 +39,17 @@ class ChangedFile:
     def is_unstaged(self) -> bool:
         return self.unstaged_change is not None
 
+    @property
+    def can_stage(self) -> bool:
+        """Файл можно добавить в индекс: есть рабочее изменение или он не отслеживается.
+
+        Конфликтующий файл добавить в индекс нельзя: ``git add`` снял бы конфликт,
+        записав в индекс текущее содержимое рабочей директории (возможно, с маркерами
+        конфликта). Разрешение конфликтов не входит в MVP, поэтому такой файл остаётся
+        только для отображения.
+        """
+        return not self.is_conflicted and (self.is_unstaged or self.is_untracked)
+
 
 @dataclass(frozen=True, kw_only=True)
 class FileChange:

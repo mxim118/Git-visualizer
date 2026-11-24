@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import partial
 
@@ -79,6 +79,10 @@ class RepositoryController(QObject):
     changes_loading = Signal()
     changes_loaded = Signal(object)  # tuple[ChangedFile, ...]
     changes_failed = Signal(object)  # TaskFailure
+
+    changes_operation_started = Signal()
+    changes_operation_succeeded = Signal()
+    changes_operation_failed = Signal(object)  # TaskFailure
 
     worktree_diff_loading = Signal(str, bool)  # path, staged
     worktree_diff_loaded = Signal(str, bool, object)  # path, staged, Diff
@@ -272,6 +276,69 @@ class RepositoryController(QObject):
         task.failed.connect(partial(self._handle_changes_failed, session))
         return True
 
+    def stage_file(self, changed_file: ChangedFile) -> bool:
+        """Добавляет выбранный файл в индекс в фоновой задаче.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или другая операция с индексом уже выполняется.
+        """
+        return self._submit_changes_operation(
+            "stage-file",
+            self._changes_service.stage_file,
+            changed_file,
+        )
+
+    def unstage_file(self, changed_file: ChangedFile) -> bool:
+        """Убирает выбранный файл из индекса в фоновой задаче."""
+        return self._submit_changes_operation(
+            "unstage-file",
+            self._changes_service.unstage_file,
+            changed_file,
+        )
+
+    def stage_all(self) -> bool:
+        """Добавляет в индекс все изменения в фоновой задаче."""
+        return self._submit_changes_operation(
+            "stage-all", self._changes_service.stage_all
+        )
+
+    def unstage_all(self) -> bool:
+        """Убирает из индекса все файлы в фоновой задаче."""
+        return self._submit_changes_operation(
+            "unstage-all", self._changes_service.unstage_all
+        )
+
+    def _submit_changes_operation(
+        self, name: str, operation: Callable[..., object], *args
+    ) -> bool:
+        """Запускает операцию с индексом; статус обновляется при любом исходе.
+
+        Операции stage/unstage не параллелятся: две одновременные правки индекса
+        дали бы непредсказуемое состояние. После успеха или ошибки статус
+        запрашивается заново — панель показывает фактическое состояние.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+
+        session = self._session
+        key = f"changes-operation:{session}"
+        task = self._runner.submit(
+            partial(operation, repository, *args),
+            name=name,
+            key=key,
+        )
+        if task is None:
+            return False
+        self.changes_operation_started.emit()
+        task.succeeded.connect(
+            partial(self._handle_changes_operation_succeeded, session)
+        )
+        task.failed.connect(
+            partial(self._handle_changes_operation_failed, session)
+        )
+        return True
+
     def load_worktree_diff(
         self, changed_file: ChangedFile, *, staged: bool
     ) -> bool:
@@ -429,6 +496,26 @@ class RepositoryController(QObject):
         if session != self._session:
             return
         self.changes_failed.emit(failure)
+
+    def _handle_changes_operation_succeeded(
+        self, session: int, _result: object = None
+    ) -> None:
+        if session != self._session:
+            return
+        self.changes_operation_succeeded.emit()
+        # Даже если Git ничего не изменил, показываем фактическое состояние:
+        # файл могли изменить снаружи между status и операцией.
+        self.load_changes()
+
+    def _handle_changes_operation_failed(
+        self, session: int, failure: TaskFailure
+    ) -> None:
+        if session != self._session:
+            return
+        self.changes_operation_failed.emit(failure)
+        # Частичный отказ Git или устаревший список: обновляем статус, чтобы
+        # пользователь видел фактическое состояние перед повтором.
+        self.load_changes()
 
     def _handle_worktree_diff_loaded(
         self, session: int, path: str, staged: bool, diff: Diff

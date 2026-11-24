@@ -2,12 +2,13 @@
 
 Скрывает конкретные команды Git от сервисов. Все команды выполняются через ``GitRunner``
 с рабочим каталогом ``path``. Реализованы открытие, история, ветки, remote, статус
-рабочей директории, diff рабочей директории, список изменённых файлов коммита и diff
-одного файла коммита.
+рабочей директории, stage/unstage (в том числе массовые), diff рабочей директории,
+список изменённых файлов коммита и diff одного файла коммита.
 
 Минимальная версия Git: ``branch --show-current`` требует Git 2.22+.
 """
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from git_visualizer.domain.models import (
@@ -194,6 +195,61 @@ def build_worktree_diff_arguments(*, paths: list[str], staged: bool) -> list[str
         arguments.append("--cached")
     arguments += ["--no-ext-diff", "--no-color", "--no-textconv", "--", *paths]
     return arguments
+
+
+def build_stage_arguments(paths: Sequence[str]) -> list[str]:
+    """Аргументы добавления в индекс выбранных путей.
+
+    ``--`` отделяет пути от опций: имя файла, начинающееся с ``-``, не будет
+    воспринято как ключ Git. ``--literal-pathspecs`` (глобальная опция, поэтому
+    стоит перед подкомандой) отключает wildcard/magic-разбор: иначе файл
+    ``[ab].txt`` из ``git status`` добавил бы ``a.txt`` и ``b.txt``. ``git add``
+    без ``-A`` записывает и удаления файлов (поведение Git 2.0+); рекурсивно
+    добавлять каталог ему не нужно — путь неотслеживаемого каталога из
+    ``git status`` уже заканчивается ``/``.
+    """
+    if not paths:
+        raise ValueError("At least one path is required to stage files")
+    return ["--literal-pathspecs", "add", "--", *paths]
+
+
+def build_stage_all_arguments() -> list[str]:
+    """Аргументы массового добавления в индекс.
+
+    ``git add -A`` добавляет изменения, удаления и неотслеживаемые файлы всего
+    дерева. Завершающий ``--`` отделяет пути от опций; без пути Git по-прежнему
+    обрабатывает всё дерево (начиная с Git 2.0), а не только текущий каталог.
+    """
+    return ["add", "-A", "--"]
+
+
+def build_unstage_arguments(*, paths: Sequence[str], has_head: bool) -> list[str]:
+    """Аргументы удаления выбранных путей из индекса без изменения рабочей директории.
+
+    При наличии ``HEAD`` — ``git restore --staged`` (Git 2.23+); без коммитов
+    ``restore`` завершается ошибкой, поэтому используется
+    ``git rm --cached --force -q``. ``--force`` нужен, когда проиндексированное
+    содержимое отличается и от ``HEAD``, и от рабочего файла; вместе с ``--cached``
+    он не трогает рабочую директорию. ``--`` отделяет пути от опций, а
+    ``--literal-pathspecs`` не даёт трактовать имя файла как wildcard/magic.
+    """
+    if not paths:
+        raise ValueError("At least one path is required to unstage files")
+    if has_head:
+        return ["--literal-pathspecs", "restore", "--staged", "--", *paths]
+    return ["--literal-pathspecs", "rm", "--cached", "--force", "-q", "--", *paths]
+
+
+def build_unstage_all_arguments(*, has_head: bool) -> list[str]:
+    """Аргументы массового удаления из индекса без изменения рабочей директории.
+
+    ``:/`` — magic pathspec корня репозитория: команда очищает весь индекс, даже
+    если она запущена из вложенного каталога. Без ``HEAD`` нужен ``git rm -r``
+    (в индексе могут быть целые каталоги) с ``--cached`` и ``--force``.
+    """
+    if has_head:
+        return ["restore", "--staged", "--", ":/"]
+    return ["rm", "-r", "--cached", "--force", "-q", "--", ":/"]
 
 
 class GitRepository:
@@ -412,6 +468,51 @@ class GitRepository:
         return Diff(
             path=path, text=text, old_path=old_path, is_truncated=truncated
         )
+
+    def stage_files(self, paths: Sequence[str]) -> None:
+        """Добавляет выбранные пути в индекс (``git add -- <пути>``).
+
+        Рабочая директория не меняется. Для переименования/копирования вызывающий
+        передаёт оба пути — иначе Git не свяжет старый и новый файл.
+
+        :raises ValueError: список путей пуст.
+        :raises GitError: команда Git завершилась с ошибкой (например, файл исчез
+            после загрузки статуса).
+        """
+        self._run(build_stage_arguments(paths))
+
+    def stage_all(self) -> None:
+        """Добавляет в индекс все изменения, удаления и неотслеживаемые файлы.
+
+        Конфликтующие файлы не исключаются на этом уровне: политику массовой
+        операции (пропуск конфликтов) задаёт ``ChangesService``. ``git add -A``
+        на конфликтующем файле снял бы конфликт, поэтому Application вызывает этот
+        метод только когда конфликтов нет.
+
+        :raises GitError: команда Git завершилась с ошибкой.
+        """
+        self._run(build_stage_all_arguments())
+
+    def unstage_files(self, paths: Sequence[str]) -> None:
+        """Убирает выбранные пути из индекса, не затрагивая рабочую директорию.
+
+        Команда выбирается по наличию ``HEAD`` (см. ``build_unstage_arguments``).
+
+        :raises ValueError: список путей пуст.
+        :raises GitError: команда Git завершилась с ошибкой.
+        """
+        self._run(
+            build_unstage_arguments(paths=paths, has_head=self.has_head())
+        )
+
+    def unstage_all(self) -> None:
+        """Очищает индекс, сохраняя содержимое рабочей директории.
+
+        Команда выбирается по наличию ``HEAD`` (см. ``build_unstage_all_arguments``).
+
+        :raises GitError: команда Git завершилась с ошибкой.
+        """
+        self._run(build_unstage_all_arguments(has_head=self.has_head()))
 
     def _run(self, args: list[str], *, check: bool = True) -> GitResult:
         return self._runner.run(args, cwd=self._path, check=check)

@@ -6,7 +6,11 @@ from PySide6.QtCore import Qt
 
 from git_visualizer.domain.enums import FileChangeType
 from git_visualizer.domain.models import ChangedFile
-from git_visualizer.presentation.widgets.changes_panel import ChangesPanel
+from git_visualizer.presentation.widgets.changes_panel import (
+    ChangesPanel,
+    scope_details,
+    scope_summary,
+)
 
 CHANGES = (
     ChangedFile(path="staged.txt", staged_change=FileChangeType.ADDED),
@@ -189,3 +193,166 @@ def test_refresh_button_requests_status_reload(qt_app) -> None:
     panel.refresh_button.click()
 
     assert requests == [True]
+
+
+# --- Stage/Unstage: доступность кнопок и сигналы ---
+
+
+def test_actions_are_disabled_until_changes_are_loaded(qt_app) -> None:
+    panel = ChangesPanel()
+
+    for button in (
+        panel.diff_button,
+        panel.stage_button,
+        panel.unstage_button,
+        panel.stage_all_button,
+        panel.unstage_all_button,
+    ):
+        assert not button.isEnabled()
+
+
+def test_diff_button_requires_selection_and_emits_request(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(CHANGES)
+    requests: list[tuple[ChangedFile, bool]] = []
+    panel.diff_requested.connect(
+        lambda change, staged: requests.append((change, staged))
+    )
+
+    assert not panel.diff_button.isEnabled()
+    panel.diff_button.click()
+    assert requests == []
+
+    panel.staged_tree.setCurrentItem(panel.staged_tree.topLevelItem(0))
+    assert panel.diff_button.isEnabled()
+    panel.diff_button.click()
+
+    assert requests == [(CHANGES[0], True)]
+
+
+def test_selected_unstaged_file_can_be_staged(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(CHANGES)
+    stage_requests: list[ChangedFile] = []
+    panel.stage_requested.connect(stage_requests.append)
+
+    panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+
+    assert panel.stage_button.isEnabled()
+    assert not panel.unstage_button.isEnabled()
+    panel.stage_button.click()
+
+    assert stage_requests == [CHANGES[1]]
+
+
+def test_selected_staged_file_can_be_unstaged(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(CHANGES)
+    unstage_requests: list[ChangedFile] = []
+    panel.unstage_requested.connect(unstage_requests.append)
+
+    panel.staged_tree.setCurrentItem(panel.staged_tree.topLevelItem(0))
+
+    assert panel.unstage_button.isEnabled()
+    assert not panel.stage_button.isEnabled()
+    panel.unstage_button.click()
+
+    assert unstage_requests == [CHANGES[0]]
+
+
+def test_conflicted_and_untracked_files_have_expected_stage_availability(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(CHANGES)
+
+    # Индексы в списке Unstaged: unstaged.txt, both.txt, untracked.txt, conflict.txt.
+    panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(1))
+    assert panel.selected_file is CHANGES[2]
+    assert panel.stage_button.isEnabled()
+
+    panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(2))
+    assert panel.selected_file is CHANGES[4]
+    assert panel.stage_button.isEnabled()
+
+    panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(3))
+    assert panel.selected_file is CHANGES[5]
+    assert not panel.stage_button.isEnabled()
+    # Stage All доступен: другие файлы добавить можно, конфликт будет пропущен.
+    assert panel.stage_all_button.isEnabled()
+
+
+def test_stage_all_and_unstage_all_emit_requests(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(CHANGES)
+    requests: list[str] = []
+    panel.stage_all_requested.connect(lambda: requests.append("stage"))
+    panel.unstage_all_requested.connect(lambda: requests.append("unstage"))
+
+    assert panel.stage_all_button.isEnabled()
+    assert panel.unstage_all_button.isEnabled()
+    panel.stage_all_button.click()
+    panel.unstage_all_button.click()
+
+    assert requests == ["stage", "unstage"]
+
+
+def test_bulk_actions_are_disabled_without_matching_files(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes((ChangedFile(path="conflict.txt", is_conflicted=True),))
+
+    assert not panel.stage_all_button.isEnabled()
+    assert not panel.unstage_all_button.isEnabled()
+
+
+def test_busy_state_disables_all_actions(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(CHANGES)
+    panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+    assert panel.stage_button.isEnabled()
+
+    panel.set_busy(True)
+
+    assert not panel.diff_button.isEnabled()
+    assert not panel.stage_button.isEnabled()
+    assert not panel.stage_all_button.isEnabled()
+    assert not panel.unstage_all_button.isEnabled()
+
+    panel.set_busy(False)
+
+    assert panel.diff_button.isEnabled()
+    assert panel.stage_button.isEnabled()
+    assert panel.stage_all_button.isEnabled()
+
+
+def test_select_file_switches_section_and_reports_selection(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(CHANGES)
+    selected: list[tuple[ChangedFile, bool]] = []
+    panel.file_selected.connect(lambda change, staged: selected.append((change, staged)))
+
+    assert panel.select_file("both.txt", staged=True) is True
+    assert selected == [(CHANGES[2], True)]
+    assert panel.selected_is_staged is True
+
+    assert panel.select_file("пропавший.txt", staged=False) is False
+
+
+def test_scope_summary_and_details_show_categories_and_paths() -> None:
+    files = (
+        ChangedFile(path="изменённый файл.txt", unstaged_change=FileChangeType.MODIFIED),
+        ChangedFile(path="удалённый.txt", unstaged_change=FileChangeType.DELETED),
+        ChangedFile(path="новый.txt", is_untracked=True),
+    )
+
+    summary = scope_summary(files, staged=False)
+
+    assert "Всего файлов: 3" in summary
+    assert "изменённые: 1" in summary
+    assert "удалённые: 1" in summary
+    assert "не отслеживаются: 1" in summary
+    details = scope_details(files, staged=False)
+    assert "изменён: изменённый файл.txt" in details
+    assert "не отслеживается: новый.txt" in details
+
+    staged_summary = scope_summary(CHANGES[3:4], staged=True)
+    assert "добавленные: 0" not in staged_summary
+    assert "переименованные: 1" in staged_summary

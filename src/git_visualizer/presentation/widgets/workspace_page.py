@@ -46,7 +46,8 @@ class WorkspacePage(QWidget):
     в ``selected_commit_hash``, обновляет панель деталей и сообщается сигналом
     ``commit_selected``; выбор файла коммита сохраняется в ``selected_file`` и
     сообщается сигналом ``file_selected``. Выбор файла в Changes сообщается
-    сигналом ``worktree_file_selected`` вместе с секцией (staged/unstaged).
+    сигналом ``worktree_file_selected`` вместе с секцией (staged/unstaged), а
+    запросы Stage/Unstage и массовых действий пересылаются из панели Changes.
 
     Ручку ``main_splitter`` можно утянуть до края: верхняя область (граф с боковыми
     панелями) или нижняя панель Changes исчезают. Тогда на месте исчезнувшей панели
@@ -59,7 +60,12 @@ class WorkspacePage(QWidget):
     commit_selected = Signal(str)
     file_selected = Signal(str, object)  # commit hash, FileChange
     worktree_file_selected = Signal(object, bool)  # ChangedFile, staged
+    worktree_diff_requested = Signal(object, bool)  # ChangedFile, staged
     changes_refresh_requested = Signal()
+    changes_stage_requested = Signal(object)  # ChangedFile
+    changes_unstage_requested = Signal(object)  # ChangedFile
+    changes_stage_all_requested = Signal()
+    changes_unstage_all_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -134,7 +140,16 @@ class WorkspacePage(QWidget):
         self.graph_view.commit_selected.connect(self._on_commit_selected)
         self.details_panel.file_selected.connect(self._on_file_selected)
         self.changes_panel.file_selected.connect(self.worktree_file_selected)
+        self.changes_panel.diff_requested.connect(self.worktree_diff_requested)
         self.changes_panel.refresh_requested.connect(self.changes_refresh_requested)
+        self.changes_panel.stage_requested.connect(self.changes_stage_requested)
+        self.changes_panel.unstage_requested.connect(self.changes_unstage_requested)
+        self.changes_panel.stage_all_requested.connect(
+            self.changes_stage_all_requested
+        )
+        self.changes_panel.unstage_all_requested.connect(
+            self.changes_unstage_all_requested
+        )
         # Сворачивание меняет размеры панелей: при перетаскивании ручки, при
         # изменении размеров окна и программном setSizes. Уведомителем служит
         # resize любого из трех виджетов, поэтому свернутая в ноль панель тоже

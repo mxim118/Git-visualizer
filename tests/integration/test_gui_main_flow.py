@@ -224,6 +224,8 @@ def test_gui_worktree_changes_flow(
         assert [change.path for change in panel.staged_files] == ["staged.txt"]
 
         panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        assert window.diff_overlay.isHidden()
+        panel.diff_button.click()
         wait_until(
             qt_app,
             lambda: not window.diff_overlay.isHidden()
@@ -235,6 +237,8 @@ def test_gui_worktree_changes_flow(
         assert "вне индекса" in window.diff_overlay.diff_view.header_label.text()
 
         panel.staged_tree.setCurrentItem(panel.staged_tree.topLevelItem(0))
+        assert window.diff_overlay.isHidden()
+        panel.diff_button.click()
         wait_until(
             qt_app,
             lambda: "new file mode" in window.diff_overlay.diff_view.text,
@@ -246,12 +250,16 @@ def test_gui_worktree_changes_flow(
         panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(1))
         assert panel.selected_file is not None
         assert panel.selected_file.path == "untracked.txt"
+        assert window.diff_overlay.isHidden()
+        panel.diff_button.click()
         assert "не отслеживается" in window.diff_overlay.diff_view.message_text
         assert "untracked.txt" in window.diff_overlay.diff_view.header_label.text()
 
         window.diff_overlay.close_button.click()
         assert window.diff_overlay.isHidden()
-        assert panel.selected_file is None
+        # Выбор Changes сохраняется: Stage/Unstage доступны сразу после закрытия.
+        assert panel.selected_file is not None
+        assert panel.selected_file.path == "untracked.txt"
 
         (path / "another.txt").write_text("another\n", encoding="utf-8")
         panel.refresh_button.click()
@@ -261,6 +269,73 @@ def test_gui_worktree_changes_flow(
             "file0.txt",
             "untracked.txt",
         ]
+    finally:
+        window.close()
+
+
+def test_gui_stage_and_unstage_flow(
+    qt_app,
+    make_repo,
+    git,
+    monkeypatch,
+) -> None:
+    path = make_repo("gui-stage", commits=1)
+    file = path / "file0.txt"
+    file.write_text("changed\n", encoding="utf-8")
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
+    )
+    controller = build_controller()
+    window = MainWindow(controller)
+
+    try:
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None,
+        )
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: len(panel.changes) == 1)
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        # Клик по файлу только выбирает его; diff открывается отдельной кнопкой.
+        assert window.diff_overlay.isHidden()
+        panel.diff_button.click()
+        wait_until(
+            qt_app,
+            lambda: not window.diff_overlay.isHidden()
+            and "Unstaged diff" in window.diff_overlay.diff_view.base_label.text(),
+        )
+
+        panel.stage_button.click()
+
+        wait_until(
+            qt_app,
+            lambda: len(panel.staged_files) == 1 and not panel.unstaged_files,
+        )
+        wait_until(
+            qt_app,
+            lambda: "Staged diff"
+            in window.diff_overlay.diff_view.base_label.text(),
+        )
+        assert panel.staged_files[0].path == "file0.txt"
+        assert "+changed" in window.diff_overlay.diff_view.text
+        assert git(path, "status", "--porcelain") == "M  file0.txt\n"
+
+        panel.unstage_button.click()
+
+        wait_until(
+            qt_app,
+            lambda: len(panel.unstaged_files) == 1 and not panel.staged_files,
+        )
+        wait_until(
+            qt_app,
+            lambda: "Unstaged diff"
+            in window.diff_overlay.diff_view.base_label.text(),
+        )
+        assert panel.unstaged_files[0].path == "file0.txt"
+        # Unstage не отменяет изменение в рабочей директории.
+        assert file.read_text(encoding="utf-8") == "changed\n"
+        assert git(path, "status", "--porcelain") == " M file0.txt\n"
     finally:
         window.close()
 

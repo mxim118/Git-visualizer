@@ -263,6 +263,25 @@ def test_renamed_file_keeps_old_path() -> None:
     assert file.staged_change is FileChangeType.RENAMED
 
 
+def test_can_stage_depends_on_worktree_change_or_untracked_state() -> None:
+    assert ChangedFile(
+        path="modified.txt", unstaged_change=FileChangeType.MODIFIED
+    ).can_stage
+    assert ChangedFile(path="new.txt", is_untracked=True).can_stage
+    assert ChangedFile(
+        path="both.txt",
+        staged_change=FileChangeType.ADDED,
+        unstaged_change=FileChangeType.MODIFIED,
+    ).can_stage
+    # Уже в индексе и без рабочего изменения — добавлять нечего.
+    assert not ChangedFile(
+        path="staged.txt", staged_change=FileChangeType.MODIFIED
+    ).can_stage
+    # Конфликт не разрешается добавлением в индекс (MVP только отображает его).
+    assert not ChangedFile(path="conflict.txt", is_conflicted=True).can_stage
+    assert not ChangedFile(path="clean.txt").can_stage
+
+
 def test_changed_file_defaults() -> None:
     file = ChangedFile(path="a.py")
 

@@ -184,13 +184,19 @@ class FakeChangesService:
         *,
         changes_error: BaseException | None = None,
         diff_error: BaseException | None = None,
+        operation_error: BaseException | None = None,
     ) -> None:
         self.changes = changes
         self.diff = diff
         self.changes_error = changes_error
         self.diff_error = diff_error
+        self.operation_error = operation_error
         self.status_requests = 0
         self.diff_requests: list[tuple[str, bool]] = []
+        self.stage_requests: list[ChangedFile] = []
+        self.unstage_requests: list[ChangedFile] = []
+        self.stage_all_requests = 0
+        self.unstage_all_requests = 0
 
     def get_status(self, repository: Repository) -> tuple[ChangedFile, ...]:
         self.status_requests += 1
@@ -206,6 +212,30 @@ class FakeChangesService:
             raise self.diff_error
         assert self.diff is not None
         return self.diff
+
+    def _raise_operation_error(self) -> None:
+        if self.operation_error is not None:
+            raise self.operation_error
+
+    def stage_file(
+        self, repository: Repository, changed_file: ChangedFile
+    ) -> None:
+        self.stage_requests.append(changed_file)
+        self._raise_operation_error()
+
+    def unstage_file(
+        self, repository: Repository, changed_file: ChangedFile
+    ) -> None:
+        self.unstage_requests.append(changed_file)
+        self._raise_operation_error()
+
+    def stage_all(self, repository: Repository) -> None:
+        self.stage_all_requests += 1
+        self._raise_operation_error()
+
+    def unstage_all(self, repository: Repository) -> None:
+        self.unstage_all_requests += 1
+        self._raise_operation_error()
 
 
 def build_controller(
@@ -670,3 +700,109 @@ def test_changes_require_open_repository(qt_app) -> None:
         )
         is False
     )
+
+
+# --- stage/unstage через контроллер ---
+
+
+def test_stage_file_runs_in_background_and_refreshes_status(
+    qt_app, tmp_path: Path
+) -> None:
+    changed = ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED)
+    changes_service = FakeChangesService((changed,))
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        changes_service=changes_service,
+    )
+    started: list[bool] = []
+    succeeded: list[bool] = []
+    failed: list[TaskFailure] = []
+    controller.changes_operation_started.connect(lambda: started.append(True))
+    controller.changes_operation_succeeded.connect(lambda: succeeded.append(True))
+    controller.changes_operation_failed.connect(failed.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert controller.stage_file(changed) is True
+
+    wait_until(qt_app, lambda: bool(succeeded))
+    wait_until(qt_app, lambda: controller.changes == (changed,))
+    assert started == [True]
+    assert failed == []
+    assert changes_service.stage_requests == [changed]
+    assert changes_service.status_requests == 1
+    controller.wait_for_done()
+
+
+def test_unstage_and_bulk_operations_are_submitted(
+    qt_app, tmp_path: Path
+) -> None:
+    changed = ChangedFile(path="file.txt", staged_change=FileChangeType.MODIFIED)
+    changes_service = FakeChangesService((changed,))
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        changes_service=changes_service,
+    )
+    succeeded: list[bool] = []
+    controller.changes_operation_succeeded.connect(lambda: succeeded.append(True))
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+
+    assert controller.unstage_file(changed) is True
+    wait_until(qt_app, lambda: len(succeeded) == 1)
+    assert changes_service.unstage_requests == [changed]
+
+    assert controller.stage_all() is True
+    wait_until(qt_app, lambda: len(succeeded) == 2)
+    assert changes_service.stage_all_requests == 1
+
+    assert controller.unstage_all() is True
+    wait_until(qt_app, lambda: len(succeeded) == 3)
+    wait_until(qt_app, lambda: changes_service.status_requests == 3)
+    assert changes_service.unstage_all_requests == 1
+    controller.wait_for_done()
+
+
+def test_changes_operation_failure_is_reported_and_status_is_reloaded(
+    qt_app, tmp_path: Path
+) -> None:
+    changed = ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED)
+    error = GitCommandError(128, command=("git", "add"), stderr="fatal")
+    changes_service = FakeChangesService((changed,), operation_error=error)
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        changes_service=changes_service,
+    )
+    failed: list[TaskFailure] = []
+    succeeded: list[bool] = []
+    controller.changes_operation_failed.connect(failed.append)
+    controller.changes_operation_succeeded.connect(lambda: succeeded.append(True))
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert controller.stage_file(changed) is True
+
+    wait_until(qt_app, lambda: bool(failed))
+    wait_until(qt_app, lambda: changes_service.status_requests == 1)
+    assert succeeded == []
+    assert failed[0].exception is error
+    controller.wait_for_done()
+
+
+def test_changes_operations_require_open_repository(qt_app) -> None:
+    controller, _, _, _ = build_controller(
+        repository=make_repository(Path("repo"), head_commit=None)
+    )
+    changed = ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED)
+
+    assert controller.stage_file(changed) is False
+    assert controller.unstage_file(changed) is False
+    assert controller.stage_all() is False
+    assert controller.unstage_all() is False
