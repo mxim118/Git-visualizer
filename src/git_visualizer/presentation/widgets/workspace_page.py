@@ -67,7 +67,7 @@ class WorkspacePage(QWidget):
     changes_unstage_requested = Signal(object)  # ChangedFile
     changes_stage_all_requested = Signal()
     changes_unstage_all_requested = Signal()
-    changes_commit_requested = Signal(str)  # сообщение коммита
+    changes_commit_requested = Signal()  # открыть окно сообщения коммита
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)

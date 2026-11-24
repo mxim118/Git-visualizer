@@ -1375,15 +1375,20 @@ def test_commit_success_clears_message_and_reloads_history_and_changes(
         panel = window.workspace_page.changes_panel
         wait_until(qt_app, lambda: panel.changes == staged)
 
-        panel.commit_message_edit.setPlainText("Новый коммит")
+        panel.commit_button.click()
+        wait_until(qt_app, lambda: not window.commit_overlay.isHidden())
+        assert "Введите сообщение" in window.commit_overlay.hint_label.text()
+        window.commit_overlay.message_edit.setPlainText("Новый коммит")
+        assert "Staged (1)" in window.commit_overlay.hint_label.text()
         # После коммита индекс чист: новый статус придёт при повторной загрузке.
         changes_service.changes = ()
         requests_before = changes_service.status_requests
         history_before = history.requests
-        panel.commit_button.click()
+        window.commit_overlay.commit_button.click()
 
         wait_until(qt_app, lambda: commit_service.requests == ["Новый коммит"])
-        wait_until(qt_app, lambda: panel.commit_message == "")
+        wait_until(qt_app, lambda: window.commit_overlay.isHidden())
+        wait_until(qt_app, lambda: window.commit_overlay.message == "")
         wait_until(qt_app, lambda: panel.changes == ())
         wait_until(qt_app, lambda: history.requests == history_before + 1)
         wait_until(
@@ -1434,10 +1439,12 @@ def test_commit_failure_shows_error_details_and_keeps_message(
         window.start_screen.open_button.click()
         panel = window.workspace_page.changes_panel
         wait_until(qt_app, lambda: panel.changes == staged)
-        panel.commit_message_edit.setPlainText("Останется в поле")
+        panel.commit_button.click()
+        wait_until(qt_app, lambda: not window.commit_overlay.isHidden())
+        window.commit_overlay.message_edit.setPlainText("Останется в окне")
         history_before = history.requests
 
-        panel.commit_button.click()
+        window.commit_overlay.commit_button.click()
 
         wait_until(qt_app, lambda: bool(shown))
         wait_until(qt_app, lambda: panel.staged_files == staged)
@@ -1446,10 +1453,50 @@ def test_commit_failure_shows_error_details_and_keeps_message(
         assert title == "Не удалось создать коммит"
         assert shown_error is error
         assert "user.name" in kwargs["message"]
-        # Поле не очищается при ошибке: пользователь может исправить и повторить.
-        assert panel.commit_message == "Останется в поле"
+        # Окно не закрывается при ошибке: сообщение можно исправить и повторить.
+        assert not window.commit_overlay.isHidden()
+        assert window.commit_overlay.message == "Останется в окне"
+        assert window.commit_overlay.commit_button.isEnabled()
         assert panel.staged_files == staged
         assert history.requests == history_before
+    finally:
+        window.close()
+
+
+def test_cancel_commit_overlay_does_not_start_commit(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged = (
+        ChangedFile(path="staged.txt", staged_change=FileChangeType.ADDED),
+    )
+    changes_service = FakeChangesService(staged)
+    commit_service = FakeCommitService()
+    commit = make_commit("only")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        changes_service=changes_service,
+        commit_service=commit_service,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+    window = MainWindow(controller)
+    try:
+        window.start_screen.open_button.click()
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == staged)
+        panel.commit_button.click()
+        wait_until(qt_app, lambda: not window.commit_overlay.isHidden())
+        window.commit_overlay.message_edit.setPlainText("Не отправлять")
+
+        window.commit_overlay.cancel_button.click()
+
+        assert window.commit_overlay.isHidden()
+        assert window.commit_overlay.message == ""
+        assert commit_service.requests == []
+        assert panel.changes == staged
     finally:
         window.close()
 

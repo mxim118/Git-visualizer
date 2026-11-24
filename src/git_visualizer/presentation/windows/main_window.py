@@ -43,6 +43,7 @@ from git_visualizer.presentation.widgets.changes_panel import (
     scope_details,
     scope_summary,
 )
+from git_visualizer.presentation.widgets.commit_overlay import CommitOverlay
 from git_visualizer.presentation.widgets.diff_overlay import DiffOverlay
 from git_visualizer.presentation.widgets.start_screen import StartScreen
 from git_visualizer.presentation.widgets.workspace_page import WorkspacePage
@@ -91,6 +92,8 @@ class MainWindow(QMainWindow):
 
         self.diff_overlay = DiffOverlay(self)
         self.diff_overlay.hide()
+        self.commit_overlay = CommitOverlay(self)
+        self.commit_overlay.hide()
         # Какая секция открыла панель: "commit" или "worktree".
         self._diff_overlay_kind: str | None = None
         # Текущая операция с индексом: "stage-file"/"unstage-file"/"stage-all"/
@@ -120,9 +123,10 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
         super().resizeEvent(event)
-        overlay = getattr(self, "diff_overlay", None)
-        if overlay is not None and overlay.isVisible():
-            overlay.setGeometry(self.rect())
+        for name in ("diff_overlay", "commit_overlay"):
+            overlay = getattr(self, name, None)
+            if overlay is not None and overlay.isVisible():
+                overlay.setGeometry(self.rect())
 
     def _connect_signals(self) -> None:
         self.start_screen.open_repository_requested.connect(self._choose_repository)
@@ -150,8 +154,9 @@ class MainWindow(QMainWindow):
             self._on_unstage_all_requested
         )
         self.workspace_page.changes_commit_requested.connect(
-            self._on_commit_requested
+            self._open_commit_overlay
         )
+        self.commit_overlay.submitted.connect(self._on_commit_submitted)
         self.diff_overlay.close_requested.connect(self._close_file_diff)
 
         self._controller.git_environment_ready.connect(self._on_git_environment_ready)
@@ -254,6 +259,7 @@ class MainWindow(QMainWindow):
 
     def _on_repository_opening(self, path: str) -> None:
         self._hide_diff_overlay()
+        self.commit_overlay.hide_overlay()
         self._pending_worktree_diff_refresh = None
         self._changes_operation = None
         self.workspace_page.clear()
@@ -276,6 +282,7 @@ class MainWindow(QMainWindow):
 
     def _on_repository_closed(self) -> None:
         self._hide_diff_overlay()
+        self.commit_overlay.hide_overlay()
         self._pending_worktree_diff_refresh = None
         self._changes_operation = None
         self.workspace_page.clear()
@@ -433,6 +440,7 @@ class MainWindow(QMainWindow):
     def _on_changes_loaded(self, changes: tuple[ChangedFile, ...]) -> None:
         panel = self.workspace_page.changes_panel
         panel.set_changes(changes)
+        self.commit_overlay.update_staged_count(len(panel.staged_files))
         self._apply_pending_diff_refresh()
         if changes:
             self.statusBar().showMessage(f"Изменений: {len(changes)}.")
@@ -597,31 +605,46 @@ class MainWindow(QMainWindow):
 
     # --- создание коммита ---
 
-    def _on_commit_requested(self, message: str) -> None:
-        """Запускает коммит staged changes в фоне."""
+    def _open_commit_overlay(self) -> None:
+        """Открывает окно ввода сообщения, если в индексе есть изменения."""
         if self._controller.repository is None:
+            return
+        panel = self.workspace_page.changes_panel
+        if not panel.staged_files:
             return
         # Коммит меняет индекс и HEAD: открытый diff рабочей директории устареет.
         self._hide_diff_overlay()
         self._pending_worktree_diff_refresh = None
+        self.commit_overlay.show_overlay(staged_count=len(panel.staged_files))
+
+    def _on_commit_submitted(self, message: str) -> None:
+        """Запускает коммит staged changes в фоне."""
+        if self._controller.repository is None:
+            self.commit_overlay.hide_overlay()
+            return
+        self._hide_diff_overlay()
         if not self._controller.commit(message):
+            self.commit_overlay.set_busy(False)
             self.statusBar().showMessage(
                 "Другая операция с индексом уже выполняется…"
             )
 
     def _on_commit_started(self) -> None:
         self.workspace_page.changes_panel.set_busy(True)
+        self.commit_overlay.set_busy(True)
         self.statusBar().showMessage("Создание коммита…")
 
     def _on_commit_succeeded(self) -> None:
         # Сообщение больше не нужно; контроллер сразу переоткрывает репозиторий
         # и заново загружает историю, граф, refs и Changes.
-        self.workspace_page.changes_panel.clear_commit_message()
+        self.commit_overlay.hide_overlay()
         self.statusBar().showMessage("Коммит создан. Обновление данных…")
 
     def _on_commit_failed(self, failure: TaskFailure) -> None:
         panel = self.workspace_page.changes_panel
         panel.set_busy(False)
+        # Окно не закрываем: сообщение сохраняется, чтобы можно было повторить.
+        self.commit_overlay.set_busy(False)
         self.statusBar().showMessage("Не удалось создать коммит.")
         self._show_error(
             "Не удалось создать коммит",

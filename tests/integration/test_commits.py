@@ -291,10 +291,14 @@ def test_gui_commit_updates_history_graph_refs_and_changes(
             lambda: len(panel.staged_files) == 1
             and [change.path for change in panel.unstaged_files] == ["file0.txt"],
         )
-        panel.commit_message_edit.setPlainText("Коммит из GUI")
-        assert panel.commit_button.isEnabled()
-
         panel.commit_button.click()
+        wait_until(qt_app, lambda: not window.commit_overlay.isHidden())
+        assert "Введите сообщение" in window.commit_overlay.hint_label.text()
+        window.commit_overlay.message_edit.setPlainText("Коммит из GUI")
+        assert "Staged (1)" in window.commit_overlay.hint_label.text()
+        assert window.commit_overlay.commit_button.isEnabled()
+
+        window.commit_overlay.commit_button.click()
 
         wait_until(
             qt_app,
@@ -304,13 +308,14 @@ def test_gui_commit_updates_history_graph_refs_and_changes(
         )
         wait_until(
             qt_app,
-            lambda: panel.commit_message == ""
+            lambda: window.commit_overlay.isHidden()
+            and window.commit_overlay.message == ""
             and not panel.staged_files
             and [change.path for change in panel.unstaged_files] == ["file0.txt"],
         )
         assert shown == []
         assert not panel.is_busy
-        assert "Нет staged-изменений" in panel.commit_hint_label.text()
+        assert "Нет staged-изменений" in panel.commit_button.toolTip()
 
         data = window.workspace_page.workspace_data
         head = git(path, "rev-parse", "HEAD").strip()
@@ -357,9 +362,11 @@ def test_gui_commit_error_without_author_keeps_application_alive(
         )
         panel = window.workspace_page.changes_panel
         wait_until(qt_app, lambda: len(panel.staged_files) == 1)
-        panel.commit_message_edit.setPlainText("Не пройдёт")
-
         panel.commit_button.click()
+        wait_until(qt_app, lambda: not window.commit_overlay.isHidden())
+        window.commit_overlay.message_edit.setPlainText("Не пройдёт")
+
+        window.commit_overlay.commit_button.click()
 
         wait_until(qt_app, lambda: bool(shown))
         wait_until(qt_app, lambda: len(panel.staged_files) == 1)
@@ -373,7 +380,8 @@ def test_gui_commit_error_without_author_keeps_application_alive(
         assert window.stack.currentWidget() is window.workspace_page
         assert window.workspace_page.workspace_data is not None
         assert window.workspace_page.workspace_data.commits[0].subject == "commit 0"
-        assert panel.commit_message == "Не пройдёт"
+        assert not window.commit_overlay.isHidden()
+        assert window.commit_overlay.message == "Не пройдёт"
         assert len(panel.staged_files) == 1
         assert git(path, "log", "-1", "--format=%s").strip() == "commit 0"
     finally:
