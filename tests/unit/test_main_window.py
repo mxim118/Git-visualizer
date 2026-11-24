@@ -132,8 +132,10 @@ class FakeHistoryService:
     ) -> None:
         self.commits = commits
         self.error = error
+        self.requests = 0
 
     def get_history(self, repository: Repository) -> tuple[Commit, ...]:
+        self.requests += 1
         if self.error is not None:
             raise self.error
         return self.commits
@@ -251,6 +253,17 @@ class FakeChangesService:
             self.changes = self.after_unstage_all
 
 
+class FakeCommitService:
+    def __init__(self, *, error: BaseException | None = None) -> None:
+        self.error = error
+        self.requests: list[str] = []
+
+    def commit(self, repository: Repository, message: str) -> None:
+        self.requests.append(message)
+        if self.error is not None:
+            raise self.error
+
+
 def build_controller(
     *,
     repository: Repository,
@@ -266,6 +279,7 @@ def build_controller(
     environment: GitEnvironment | None = None,
     environment_error: BaseException | None = None,
     changes_service: FakeChangesService | None = None,
+    commit_service: FakeCommitService | None = None,
 ) -> tuple[RepositoryController, FakeHistoryService]:
     history = FakeHistoryService(commits, error=history_error)
     controller = RepositoryController(
@@ -279,6 +293,7 @@ def build_controller(
             files, diff, files_error=files_error, diff_error=diff_error
         ),
         changes_service=changes_service or FakeChangesService(),
+        commit_service=commit_service or FakeCommitService(),
         git_environment_service=FakeEnvironmentService(
             environment=environment, error=environment_error
         ),
@@ -880,6 +895,8 @@ def open_workspace_with_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     changes_service: FakeChangesService,
+    *,
+    commit_service: FakeCommitService | None = None,
 ) -> tuple[MainWindow, FakeChangesService]:
     commit = make_commit("only")
     controller, _ = build_controller(
@@ -889,6 +906,7 @@ def open_workspace_with_changes(
             Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
         ),
         changes_service=changes_service,
+        commit_service=commit_service,
     )
     patch_folder_dialog(monkeypatch, tmp_path)
     window = MainWindow(controller)
@@ -1321,6 +1339,117 @@ def test_stage_operation_failure_is_reported_and_status_is_refreshed(
         assert shown[0][1] is error
         assert window.diff_overlay.isHidden()
         assert not panel.is_busy
+    finally:
+        window.close()
+
+
+# --- создание коммита через главное окно ---
+
+
+def test_commit_success_clears_message_and_reloads_history_and_changes(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged = (
+        ChangedFile(path="staged.txt", staged_change=FileChangeType.ADDED),
+    )
+    changes_service = FakeChangesService(staged)
+    commit_service = FakeCommitService()
+    commit = make_commit("only")
+    controller, history = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        changes_service=changes_service,
+        commit_service=commit_service,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+    window = MainWindow(controller)
+    shown: list[tuple[str, BaseException]] = []
+    try:
+        monkeypatch.setattr(
+            window, "_show_error", lambda title, exc, **kwargs: shown.append((title, exc))
+        )
+        window.start_screen.open_button.click()
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == staged)
+
+        panel.commit_message_edit.setPlainText("Новый коммит")
+        # После коммита индекс чист: новый статус придёт при повторной загрузке.
+        changes_service.changes = ()
+        requests_before = changes_service.status_requests
+        history_before = history.requests
+        panel.commit_button.click()
+
+        wait_until(qt_app, lambda: commit_service.requests == ["Новый коммит"])
+        wait_until(qt_app, lambda: panel.commit_message == "")
+        wait_until(qt_app, lambda: panel.changes == ())
+        wait_until(qt_app, lambda: history.requests == history_before + 1)
+        wait_until(
+            qt_app, lambda: changes_service.status_requests > requests_before
+        )
+        wait_until(qt_app, lambda: panel.is_clean)
+
+        assert shown == []
+        assert panel.commit_button.isEnabled() is False
+        assert not panel.is_busy
+        assert panel.is_clean
+    finally:
+        window.close()
+
+
+def test_commit_failure_shows_error_details_and_keeps_message(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged = (
+        ChangedFile(path="staged.txt", staged_change=FileChangeType.ADDED),
+    )
+    error = GitCommandError(
+        128,
+        command=("git", "commit", "-F", "-"),
+        stderr="Author identity unknown\nfatal: unable to auto-detect email address\n",
+    )
+    changes_service = FakeChangesService(staged)
+    commit_service = FakeCommitService(error=error)
+    commit = make_commit("only")
+    controller, history = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        changes_service=changes_service,
+        commit_service=commit_service,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+    window = MainWindow(controller)
+    shown: list[tuple[str, BaseException, dict[str, object]]] = []
+    try:
+        monkeypatch.setattr(
+            window,
+            "_show_error",
+            lambda title, exc, **kwargs: shown.append((title, exc, kwargs)),
+        )
+        window.start_screen.open_button.click()
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == staged)
+        panel.commit_message_edit.setPlainText("Останется в поле")
+        history_before = history.requests
+
+        panel.commit_button.click()
+
+        wait_until(qt_app, lambda: bool(shown))
+        wait_until(qt_app, lambda: panel.staged_files == staged)
+        wait_until(qt_app, lambda: not panel.is_busy)
+        title, shown_error, kwargs = shown[0]
+        assert title == "Не удалось создать коммит"
+        assert shown_error is error
+        assert "user.name" in kwargs["message"]
+        # Поле не очищается при ошибке: пользователь может исправить и повторить.
+        assert panel.commit_message == "Останется в поле"
+        assert panel.staged_files == staged
+        assert history.requests == history_before
     finally:
         window.close()
 

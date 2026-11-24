@@ -238,6 +238,29 @@ class FakeChangesService:
         self._raise_operation_error()
 
 
+class FakeCommitService:
+    def __init__(
+        self,
+        *,
+        error: BaseException | None = None,
+        gate: threading.Event | None = None,
+        started: threading.Event | None = None,
+    ) -> None:
+        self.error = error
+        self._gate = gate
+        self._started = started
+        self.requests: list[str] = []
+
+    def commit(self, repository: Repository, message: str) -> None:
+        self.requests.append(message)
+        if self._started is not None:
+            self._started.set()
+        if self._gate is not None:
+            assert self._gate.wait(5.0)
+        if self.error is not None:
+            raise self.error
+
+
 def build_controller(
     *,
     repository: Repository,
@@ -253,6 +276,7 @@ def build_controller(
     environment: GitEnvironment | None = None,
     environment_error: BaseException | None = None,
     changes_service: FakeChangesService | None = None,
+    commit_service: FakeCommitService | None = None,
 ) -> tuple[
     RepositoryController,
     FakeRepositoryService,
@@ -273,6 +297,7 @@ def build_controller(
         graph_service=GraphService(),
         diff_service=diff_service,
         changes_service=changes_service or FakeChangesService(),
+        commit_service=commit_service or FakeCommitService(),
         git_environment_service=FakeEnvironmentService(
             environment=environment, error=environment_error
         ),
@@ -806,3 +831,127 @@ def test_changes_operations_require_open_repository(qt_app) -> None:
     assert controller.unstage_file(changed) is False
     assert controller.stage_all() is False
     assert controller.unstage_all() is False
+
+
+# --- создание коммита через контроллер ---
+
+
+def test_commit_runs_in_background_and_reloads_workspace(
+    qt_app, tmp_path: Path
+) -> None:
+    started = threading.Event()
+    gate = threading.Event()
+    commit_service = FakeCommitService(gate=gate, started=started)
+    commit = make_commit("only")
+    controller, _, history, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        commit_service=commit_service,
+    )
+    loaded: list[WorkspaceData] = []
+    succeeded: list[bool] = []
+    failed: list[TaskFailure] = []
+    controller.repository_loaded.connect(loaded.append)
+    controller.commit_succeeded.connect(lambda: succeeded.append(True))
+    controller.commit_failed.connect(failed.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert len(loaded) == 1
+
+    # Возврат из commit не ждёт Git: задача выполняется в фоне.
+    assert controller.commit("Коммит из теста") is True
+    wait_until(qt_app, started.is_set)
+    assert commit_service.requests == ["Коммит из теста"]
+    assert succeeded == []
+    assert loaded == [controller.workspace]
+
+    gate.set()
+    wait_until(qt_app, lambda: bool(succeeded))
+    wait_until(qt_app, lambda: len(loaded) == 2)
+    assert failed == []
+    # После успеха репозиторий переоткрыт, история запрошена заново.
+    assert controller.repository is not None
+    assert history.commits == (commit,)
+    controller.wait_for_done()
+
+
+def test_commit_failure_is_reported_and_status_is_reloaded(
+    qt_app, tmp_path: Path
+) -> None:
+    error = GitCommandError(
+        128,
+        command=("git", "commit", "-F", "-"),
+        stderr="Author identity unknown",
+    )
+    commit_service = FakeCommitService(error=error)
+    changes_service = FakeChangesService()
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        changes_service=changes_service,
+        commit_service=commit_service,
+    )
+    failed: list[TaskFailure] = []
+    succeeded: list[bool] = []
+    controller.commit_failed.connect(failed.append)
+    controller.commit_succeeded.connect(lambda: succeeded.append(True))
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert controller.commit("message") is True
+
+    wait_until(qt_app, lambda: bool(failed))
+    wait_until(qt_app, lambda: changes_service.status_requests == 1)
+    assert failed[0].exception is error
+    assert succeeded == []
+    assert commit_service.requests == ["message"]
+    controller.wait_for_done()
+
+
+def test_commit_requires_open_repository(qt_app) -> None:
+    controller, _, _, _ = build_controller(
+        repository=make_repository(Path("repo"), head_commit=None)
+    )
+
+    assert controller.commit("message") is False
+
+
+def test_commit_is_blocked_while_another_index_operation_runs(
+    qt_app, tmp_path: Path
+) -> None:
+    started = threading.Event()
+    gate = threading.Event()
+    commit_service = FakeCommitService(gate=gate, started=started)
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        commit_service=commit_service,
+    )
+    succeeded: list[bool] = []
+    controller.commit_succeeded.connect(lambda: succeeded.append(True))
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert controller.commit("message") is True
+    wait_until(qt_app, started.is_set)
+
+    changed = ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED)
+    # Коммит и stage/unstage делят ключ: индекс нельзя менять параллельно.
+    assert controller.stage_file(changed) is False
+    assert controller.commit("second") is False
+
+    gate.set()
+    wait_until(qt_app, lambda: bool(succeeded))
+    controller.wait_for_done()

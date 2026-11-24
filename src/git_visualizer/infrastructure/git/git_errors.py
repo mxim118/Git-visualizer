@@ -20,12 +20,22 @@ class GitErrorKind(Enum):
     UNKNOWN = "unknown"
     NOT_A_REPOSITORY = "not_a_repository"  # папка не является репозиторием
     UNSAFE_REPOSITORY = "unsafe_repository"  # «dubious ownership»: чужой владелец каталога
+    MISSING_AUTHOR = "missing_author"  # не настроены user.name / user.email
+    UNMERGED_FILES = "unmerged_files"  # коммит при неразрешённых конфликтах
 
 
 # (вид ошибки, фрагмент stderr в нижнем регистре); побеждает первое совпадение.
 _STDERR_RULES: tuple[tuple[GitErrorKind, str], ...] = (
     (GitErrorKind.UNSAFE_REPOSITORY, "detected dubious ownership"),
     (GitErrorKind.NOT_A_REPOSITORY, "not a git repository"),
+    (GitErrorKind.MISSING_AUTHOR, "author identity unknown"),
+    (GitErrorKind.MISSING_AUTHOR, "unable to auto-detect email address"),
+    (GitErrorKind.MISSING_AUTHOR, "please tell me who you are"),
+    (
+        GitErrorKind.UNMERGED_FILES,
+        "committing is not possible because you have unmerged files",
+    ),
+    (GitErrorKind.UNMERGED_FILES, "exiting because of an unresolved conflict"),
 )
 
 

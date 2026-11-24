@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QFileDialog
 
 from git_visualizer.application.services.branch_service import BranchService
 from git_visualizer.application.services.changes_service import ChangesService
+from git_visualizer.application.services.commit_service import CommitService
 from git_visualizer.application.services.diff_service import DiffService
 from git_visualizer.application.services.git_environment_service import (
     GitEnvironmentService,
@@ -53,6 +54,7 @@ def build_controller() -> RepositoryController:
         graph_service=GraphService(),
         diff_service=DiffService(factory),
         changes_service=ChangesService(factory),
+        commit_service=CommitService(factory),
         git_environment_service=GitEnvironmentService(runner),
     )
 
@@ -315,7 +317,8 @@ def test_gui_stage_and_unstage_flow(
         wait_until(
             qt_app,
             lambda: "Staged diff"
-            in window.diff_overlay.diff_view.base_label.text(),
+            in window.diff_overlay.diff_view.base_label.text()
+            and "+changed" in window.diff_overlay.diff_view.text,
         )
         assert panel.staged_files[0].path == "file0.txt"
         assert "+changed" in window.diff_overlay.diff_view.text
@@ -330,7 +333,8 @@ def test_gui_stage_and_unstage_flow(
         wait_until(
             qt_app,
             lambda: "Unstaged diff"
-            in window.diff_overlay.diff_view.base_label.text(),
+            in window.diff_overlay.diff_view.base_label.text()
+            and "+changed" in window.diff_overlay.diff_view.text,
         )
         assert panel.unstaged_files[0].path == "file0.txt"
         # Unstage не отменяет изменение в рабочей директории.

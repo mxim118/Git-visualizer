@@ -41,6 +41,8 @@ class GitRepositoryPort(Protocol):
 
     def unstage_all(self) -> None: ...
 
+    def commit(self, message: str) -> None: ...
+
     def get_worktree_diff(
         self,
         *,

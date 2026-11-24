@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QTreeWidget,
@@ -69,6 +70,8 @@ _LOADING_TEXT = "Загрузка изменений…"
 _CLEAN_TEXT = "Изменений нет — рабочая директория чиста."
 _STAGED_HINT = "В индексе (staged)"
 _UNSTAGED_HINT = "Ещё не в индексе (unstaged)"
+_COMMIT_INFO_COLOR = "#64748b"
+_COMMIT_REASON_COLOR = "#b45309"
 
 
 class ChangesPanel(QWidget):
@@ -79,7 +82,10 @@ class ChangesPanel(QWidget):
     ``diff_requested(ChangedFile, staged)`` — открыть diff выбранного файла;
     ``stage_requested(ChangedFile)``/``unstage_requested(ChangedFile)`` — действия с
     выбранным файлом; ``stage_all_requested()``/``unstage_all_requested()`` —
-    массовые действия. Git отсюда не запускается.
+    массовые действия; ``commit_requested(str)`` — создать коммит с введённым
+    сообщением. Поле сообщения и кнопка Commit относятся только к staged changes:
+    без файлов в индексе кнопка неактивна и панель показывает причину. Git отсюда
+    не запускается.
     """
 
     file_selected = Signal(object, bool)  # ChangedFile, staged
@@ -89,6 +95,7 @@ class ChangesPanel(QWidget):
     unstage_requested = Signal(object)  # ChangedFile
     stage_all_requested = Signal()
     unstage_all_requested = Signal()
+    commit_requested = Signal(str)  # сообщение коммита
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -188,11 +195,38 @@ class ChangesPanel(QWidget):
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([1, 1])
 
+        # Коммит создаётся только из индекса: поле сообщения и кнопка находятся
+        # рядом с секцией Staged, а подсказка объясняет, почему кнопка недоступна.
+        self.commit_message_edit = QPlainTextEdit(self)
+        self.commit_message_edit.setObjectName("commit_message_edit")
+        self.commit_message_edit.setPlaceholderText("Сообщение коммита")
+        self.commit_message_edit.setAccessibleName("Сообщение коммита")
+        self.commit_message_edit.setFixedHeight(58)
+        self.commit_message_edit.setTabChangesFocus(True)
+        self.commit_message_edit.textChanged.connect(self._update_commit_state)
+
+        self.commit_button = QPushButton("Commit", self)
+        self.commit_button.setObjectName("commit_button")
+        self.commit_button.clicked.connect(self._request_commit)
+
+        self.commit_hint_label = QLabel(self)
+        self.commit_hint_label.setObjectName("commit_hint")
+        self.commit_hint_label.setWordWrap(True)
+        self.commit_hint_label.setStyleSheet(f"color: {_COMMIT_INFO_COLOR};")
+
+        commit_footer = QHBoxLayout()
+        commit_footer.setContentsMargins(0, 0, 0, 0)
+        commit_footer.setSpacing(8)
+        commit_footer.addWidget(self.commit_hint_label, 1)
+        commit_footer.addWidget(self.commit_button)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 8)
         layout.setSpacing(6)
         layout.addLayout(header)
         layout.addWidget(self.splitter, 1)
+        layout.addWidget(self.commit_message_edit)
+        layout.addLayout(commit_footer)
 
         self.clear()
 
@@ -287,11 +321,18 @@ class ChangesPanel(QWidget):
             tree.blockSignals(False)
         self._update_action_buttons()
 
+    def clear_commit_message(self) -> None:
+        """Очищает поле сообщения (после успешного коммита)."""
+        if self.commit_message_edit.toPlainText():
+            self.commit_message_edit.clear()
+        self._update_commit_state()
+
     def clear(self) -> None:
         """Сбрасывает панель (репозиторий закрыт или ещё не загружен)."""
         self._reset_files()
         self._loaded = False
         self._busy = False
+        self.commit_message_edit.clear()
         self._replace_tree(
             self.unstaged_tree, (), staged=False, text=_NOT_LOADED_TEXT
         )
@@ -304,6 +345,10 @@ class ChangesPanel(QWidget):
     @property
     def changes(self) -> tuple[ChangedFile, ...]:
         return self._changes
+
+    @property
+    def commit_message(self) -> str:
+        return self.commit_message_edit.toPlainText()
 
     @property
     def unstaged_files(self) -> tuple[ChangedFile, ...]:
@@ -464,6 +509,48 @@ class ChangesPanel(QWidget):
         self.unstage_all_button.setEnabled(
             available and any(change.is_staged for change in self._changes)
         )
+        self._update_commit_state()
+
+    def _update_commit_state(self) -> None:
+        """Доступность Commit: загруженные изменения, staged-файлы и сообщение."""
+        available = self._loaded and not self._busy
+        has_staged = bool(self._staged_files)
+        has_message = bool(self.commit_message_edit.toPlainText().strip())
+        enabled = available and has_staged and has_message
+
+        self.commit_button.setEnabled(enabled)
+        self.commit_message_edit.setEnabled(available)
+        hint = self._commit_hint_text(
+            has_staged=has_staged, has_message=has_message
+        )
+        self.commit_hint_label.setText(hint)
+        self.commit_hint_label.setStyleSheet(
+            f"color: {_COMMIT_INFO_COLOR if enabled else _COMMIT_REASON_COLOR};"
+        )
+        self.commit_button.setToolTip(
+            "Создать коммит только из файлов в Staged"
+            if enabled
+            else hint
+        )
+
+    def _commit_hint_text(
+        self, *, has_staged: bool, has_message: bool
+    ) -> str:
+        """Понятная причина, почему Commit недоступен, или что попадёт в коммит."""
+        if not self._loaded:
+            return "Коммит недоступен: изменения не загружены."
+        if self._busy:
+            return "Выполняется операция с индексом…"
+        if not has_staged:
+            return "Нет staged-изменений: добавьте файлы в индекс."
+        if not has_message:
+            return "Введите сообщение коммита."
+        return f"В коммит войдут только файлы из Staged ({len(self._staged_files)})."
+
+    def _request_commit(self) -> None:
+        if not self.commit_button.isEnabled():
+            return
+        self.commit_requested.emit(self.commit_message_edit.toPlainText())
 
     def _on_unstaged_item_changed(
         self, current: QTreeWidgetItem | None, previous: QTreeWidgetItem | None

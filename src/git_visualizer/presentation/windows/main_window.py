@@ -1,9 +1,9 @@
 """Главное окно: стартовый экран, рабочая область и координация с контроллером.
 
 MainWindow не содержит бизнес-логики: открытие репозитория, проверка Git, загрузка
-истории, списка файлов, diff, состояния рабочей директории и операции stage/unstage
-выполняются Application Services через ``RepositoryController``. Здесь — только
-диалоги, переключение экранов, фильтрация устаревших результатов по выбранному
+истории, списка файлов, diff, состояния рабочей директории, операции stage/unstage и
+создание коммита выполняются Application Services через ``RepositoryController``. Здесь —
+только диалоги, переключение экранов, фильтрация устаревших результатов по выбранному
 коммиту/файлу, подтверждение области действия массовой операции и передача данных
 виджетам. Diff файла коммита показывается в большой панели ``DiffOverlay`` поверх
 всего окна.
@@ -34,7 +34,11 @@ from git_visualizer.presentation.controllers.repository_controller import (
     RepositoryController,
     WorkspaceData,
 )
-from git_visualizer.presentation.error_texts import technical_details, user_message
+from git_visualizer.presentation.error_texts import (
+    commit_user_message,
+    technical_details,
+    user_message,
+)
 from git_visualizer.presentation.widgets.changes_panel import (
     scope_details,
     scope_summary,
@@ -145,6 +149,9 @@ class MainWindow(QMainWindow):
         self.workspace_page.changes_unstage_all_requested.connect(
             self._on_unstage_all_requested
         )
+        self.workspace_page.changes_commit_requested.connect(
+            self._on_commit_requested
+        )
         self.diff_overlay.close_requested.connect(self._close_file_diff)
 
         self._controller.git_environment_ready.connect(self._on_git_environment_ready)
@@ -174,6 +181,9 @@ class MainWindow(QMainWindow):
         self._controller.changes_operation_failed.connect(
             self._on_changes_operation_failed
         )
+        self._controller.commit_started.connect(self._on_commit_started)
+        self._controller.commit_succeeded.connect(self._on_commit_succeeded)
+        self._controller.commit_failed.connect(self._on_commit_failed)
         self._controller.worktree_diff_loading.connect(
             self._on_worktree_diff_loading
         )
@@ -585,6 +595,40 @@ class MainWindow(QMainWindow):
         )
         self._show_error(title, failure.exception)
 
+    # --- создание коммита ---
+
+    def _on_commit_requested(self, message: str) -> None:
+        """Запускает коммит staged changes в фоне."""
+        if self._controller.repository is None:
+            return
+        # Коммит меняет индекс и HEAD: открытый diff рабочей директории устареет.
+        self._hide_diff_overlay()
+        self._pending_worktree_diff_refresh = None
+        if not self._controller.commit(message):
+            self.statusBar().showMessage(
+                "Другая операция с индексом уже выполняется…"
+            )
+
+    def _on_commit_started(self) -> None:
+        self.workspace_page.changes_panel.set_busy(True)
+        self.statusBar().showMessage("Создание коммита…")
+
+    def _on_commit_succeeded(self) -> None:
+        # Сообщение больше не нужно; контроллер сразу переоткрывает репозиторий
+        # и заново загружает историю, граф, refs и Changes.
+        self.workspace_page.changes_panel.clear_commit_message()
+        self.statusBar().showMessage("Коммит создан. Обновление данных…")
+
+    def _on_commit_failed(self, failure: TaskFailure) -> None:
+        panel = self.workspace_page.changes_panel
+        panel.set_busy(False)
+        self.statusBar().showMessage("Не удалось создать коммит.")
+        self._show_error(
+            "Не удалось создать коммит",
+            failure.exception,
+            message=commit_user_message(failure.exception),
+        )
+
     def _apply_pending_diff_refresh(self) -> None:
         """После операции выбирает файл в новой секции и перезагружает его diff."""
         pending = self._pending_worktree_diff_refresh
@@ -668,11 +712,17 @@ class MainWindow(QMainWindow):
 
     # --- диалоги ---
 
-    def _show_error(self, title: str, error: BaseException) -> None:
+    def _show_error(
+        self,
+        title: str,
+        error: BaseException,
+        *,
+        message: str | None = None,
+    ) -> None:
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Critical)
         box.setWindowTitle(title)
-        box.setText(user_message(error))
+        box.setText(user_message(error) if message is None else message)
         box.setDetailedText(technical_details(error))
         box.setStandardButtons(QMessageBox.StandardButton.Ok)
         box.exec()

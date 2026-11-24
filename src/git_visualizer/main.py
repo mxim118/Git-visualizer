@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 from git_visualizer.application.ports import GitRepositoryFactory
 from git_visualizer.application.services.branch_service import BranchService
 from git_visualizer.application.services.changes_service import ChangesService
+from git_visualizer.application.services.commit_service import CommitService
 from git_visualizer.application.services.diff_service import DiffService
 from git_visualizer.application.services.git_environment_service import (
     GitEnvironmentService,
@@ -42,6 +43,7 @@ def build_repository_controller() -> RepositoryController:
         graph_service=GraphService(),
         diff_service=DiffService(git_repository_factory),
         changes_service=ChangesService(git_repository_factory),
+        commit_service=CommitService(git_repository_factory),
         git_environment_service=GitEnvironmentService(runner),
     )
 

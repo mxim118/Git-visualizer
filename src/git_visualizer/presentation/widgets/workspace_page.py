@@ -47,7 +47,8 @@ class WorkspacePage(QWidget):
     ``commit_selected``; выбор файла коммита сохраняется в ``selected_file`` и
     сообщается сигналом ``file_selected``. Выбор файла в Changes сообщается
     сигналом ``worktree_file_selected`` вместе с секцией (staged/unstaged), а
-    запросы Stage/Unstage и массовых действий пересылаются из панели Changes.
+    запросы Stage/Unstage, массовых действий и коммита пересылаются из панели
+    Changes.
 
     Ручку ``main_splitter`` можно утянуть до края: верхняя область (граф с боковыми
     панелями) или нижняя панель Changes исчезают. Тогда на месте исчезнувшей панели
@@ -66,6 +67,7 @@ class WorkspacePage(QWidget):
     changes_unstage_requested = Signal(object)  # ChangedFile
     changes_stage_all_requested = Signal()
     changes_unstage_all_requested = Signal()
+    changes_commit_requested = Signal(str)  # сообщение коммита
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -149,6 +151,9 @@ class WorkspacePage(QWidget):
         )
         self.changes_panel.unstage_all_requested.connect(
             self.changes_unstage_all_requested
+        )
+        self.changes_panel.commit_requested.connect(
+            self.changes_commit_requested
         )
         # Сворачивание меняет размеры панелей: при перетаскивании ручки, при
         # изменении размеров окна и программном setSizes. Уведомителем служит

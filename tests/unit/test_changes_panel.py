@@ -207,8 +207,10 @@ def test_actions_are_disabled_until_changes_are_loaded(qt_app) -> None:
         panel.unstage_button,
         panel.stage_all_button,
         panel.unstage_all_button,
+        panel.commit_button,
     ):
         assert not button.isEnabled()
+    assert not panel.commit_message_edit.isEnabled()
 
 
 def test_diff_button_requires_selection_and_emits_request(qt_app) -> None:
@@ -307,7 +309,9 @@ def test_busy_state_disables_all_actions(qt_app) -> None:
     panel = ChangesPanel()
     panel.set_changes(CHANGES)
     panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+    panel.commit_message_edit.setPlainText("Message")
     assert panel.stage_button.isEnabled()
+    assert panel.commit_button.isEnabled()
 
     panel.set_busy(True)
 
@@ -315,12 +319,17 @@ def test_busy_state_disables_all_actions(qt_app) -> None:
     assert not panel.stage_button.isEnabled()
     assert not panel.stage_all_button.isEnabled()
     assert not panel.unstage_all_button.isEnabled()
+    assert not panel.commit_button.isEnabled()
+    assert not panel.commit_message_edit.isEnabled()
+    assert "операция" in panel.commit_hint_label.text()
 
     panel.set_busy(False)
 
     assert panel.diff_button.isEnabled()
     assert panel.stage_button.isEnabled()
     assert panel.stage_all_button.isEnabled()
+    assert panel.commit_button.isEnabled()
+    assert panel.commit_message_edit.isEnabled()
 
 
 def test_select_file_switches_section_and_reports_selection(qt_app) -> None:
@@ -356,3 +365,101 @@ def test_scope_summary_and_details_show_categories_and_paths() -> None:
     staged_summary = scope_summary(CHANGES[3:4], staged=True)
     assert "добавленные: 0" not in staged_summary
     assert "переименованные: 1" in staged_summary
+
+
+# --- поле сообщения и кнопка Commit ---
+
+
+def test_commit_button_requires_staged_changes_and_non_blank_message(qt_app) -> None:
+    panel = ChangesPanel()
+
+    assert not panel.commit_button.isEnabled()
+    assert "не загружены" in panel.commit_hint_label.text()
+
+    panel.set_changes(
+        (ChangedFile(path="unstaged.txt", unstaged_change=FileChangeType.MODIFIED),)
+    )
+
+    # Только unstaged-файлов недостаточно: коммит создаётся только из индекса.
+    assert not panel.commit_button.isEnabled()
+    assert "Нет staged-изменений" in panel.commit_hint_label.text()
+    assert "добавьте файлы в индекс" in panel.commit_hint_label.text()
+
+    panel.set_changes(
+        (ChangedFile(path="staged.txt", staged_change=FileChangeType.ADDED),)
+    )
+    assert not panel.commit_button.isEnabled()
+    assert "Введите сообщение" in panel.commit_hint_label.text()
+
+    panel.commit_message_edit.setPlainText("   \n\t ")
+    assert not panel.commit_button.isEnabled()
+    assert "Введите сообщение" in panel.commit_hint_label.text()
+
+    panel.commit_message_edit.setPlainText("Осмысленное сообщение")
+    assert panel.commit_button.isEnabled()
+    assert "только файлы из Staged (1)" in panel.commit_hint_label.text()
+
+
+def test_commit_click_emits_message_and_blank_message_is_not_sent(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(
+        (ChangedFile(path="staged.txt", staged_change=FileChangeType.ADDED),)
+    )
+    requests: list[str] = []
+    panel.commit_requested.connect(requests.append)
+
+    panel.commit_button.click()
+    assert requests == []
+
+    panel.commit_message_edit.setPlainText("  Subject with spaces  ")
+    panel.commit_button.click()
+
+    # Сообщение передаётся как введено: очистку выполняет Git при коммите.
+    assert requests == ["  Subject with spaces  "]
+
+
+def test_commit_message_survives_status_refresh_and_can_be_cleared(qt_app) -> None:
+    staged = (ChangedFile(path="staged.txt", staged_change=FileChangeType.ADDED),)
+    panel = ChangesPanel()
+    panel.set_changes(staged)
+    panel.commit_message_edit.setPlainText("Message")
+
+    panel.set_changes(staged)
+
+    assert panel.commit_message == "Message"
+    assert panel.commit_button.isEnabled()
+
+    panel.clear_commit_message()
+
+    assert panel.commit_message == ""
+    assert not panel.commit_button.isEnabled()
+
+
+def test_commit_becomes_unavailable_when_staged_files_disappear(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(
+        (ChangedFile(path="staged.txt", staged_change=FileChangeType.ADDED),)
+    )
+    panel.commit_message_edit.setPlainText("Message")
+    assert panel.commit_button.isEnabled()
+
+    panel.set_changes(
+        (ChangedFile(path="staged.txt", unstaged_change=FileChangeType.MODIFIED),)
+    )
+
+    assert not panel.commit_button.isEnabled()
+    assert "Нет staged-изменений" in panel.commit_hint_label.text()
+
+
+def test_clear_resets_commit_message_and_disables_commit(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(
+        (ChangedFile(path="staged.txt", staged_change=FileChangeType.ADDED),)
+    )
+    panel.commit_message_edit.setPlainText("Message")
+
+    panel.clear()
+
+    assert panel.commit_message == ""
+    assert not panel.commit_button.isEnabled()
+    assert not panel.commit_message_edit.isEnabled()

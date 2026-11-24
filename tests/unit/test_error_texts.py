@@ -19,6 +19,7 @@ from git_visualizer.infrastructure.git.git_errors import (
 )
 from git_visualizer.presentation.error_texts import (
     GIT_INSTALL_URL,
+    commit_user_message,
     technical_details,
     user_message,
 )
@@ -124,3 +125,74 @@ def test_technical_details_falls_back_to_type_and_message() -> None:
     details = technical_details(ValueError("broken"))
 
     assert details == "ValueError: broken"
+
+
+# --- тексты ошибок создания коммита (FR-COMMIT-06) ---
+
+
+def test_commit_without_author_configuration_explains_what_to_configure() -> None:
+    error = GitCommandError(
+        128,
+        command=("git", "commit", "-F", "-"),
+        stderr=(
+            "Author identity unknown\n"
+            "*** Please tell me who you are.\n"
+            "fatal: unable to auto-detect email address\n"
+        ),
+    )
+
+    message = commit_user_message(error)
+
+    assert error.kind is GitErrorKind.MISSING_AUTHOR
+    assert "автор" in message
+    assert "user.name" in message
+    assert "user.email" in message
+
+
+def test_commit_with_unmerged_files_is_explained() -> None:
+    error = GitCommandError(
+        128,
+        command=("git", "commit", "-F", "-"),
+        stderr=(
+            "error: Committing is not possible because you have unmerged files.\n"
+            "fatal: Exiting because of an unresolved conflict.\n"
+        ),
+    )
+
+    message = commit_user_message(error)
+
+    assert error.kind is GitErrorKind.UNMERGED_FILES
+    assert "конфликт" in message
+
+
+def test_commit_hook_output_is_shown_in_the_main_message() -> None:
+    error = GitCommandError(
+        1,
+        command=("git", "commit", "-F", "-"),
+        stdout="hook stdout line\n",
+        stderr="pre-commit hook rejected the commit\n",
+    )
+
+    message = commit_user_message(error)
+
+    assert "Git не создал коммит (код 1)" in message
+    assert "pre-commit hook rejected the commit" in message
+    assert "hook stdout line" in message
+    assert "Подробнее" in message
+
+
+def test_commit_failure_without_output_mentions_hooks_and_author() -> None:
+    message = commit_user_message(
+        GitCommandError(1, command=("git", "commit", "-F", "-"))
+    )
+
+    assert "Git не создал коммит (код 1)" in message
+    assert "хуки" in message
+    assert "автора" in message
+
+
+def test_commit_validation_error_message_is_russian() -> None:
+    message = commit_user_message(ValueError("Commit message must not be empty"))
+
+    assert "staged-изменений" in message
+    assert "сообщение" in message

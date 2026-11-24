@@ -3,7 +3,8 @@
 Скрывает конкретные команды Git от сервисов. Все команды выполняются через ``GitRunner``
 с рабочим каталогом ``path``. Реализованы открытие, история, ветки, remote, статус
 рабочей директории, stage/unstage (в том числе массовые), diff рабочей директории,
-список изменённых файлов коммита и diff одного файла коммита.
+список изменённых файлов коммита, diff одного файла коммита и создание коммита
+из индекса.
 
 Минимальная версия Git: ``branch --show-current`` требует Git 2.22+.
 """
@@ -250,6 +251,19 @@ def build_unstage_all_arguments(*, has_head: bool) -> list[str]:
     if has_head:
         return ["restore", "--staged", "--", ":/"]
     return ["rm", "-r", "--cached", "--force", "-q", "--", ":/"]
+
+
+def build_commit_arguments() -> list[str]:
+    """Аргументы создания коммита из индекса: ``git commit -F -``.
+
+    Сообщение передаётся через stdin (``-F -``), а не аргументом командной строки:
+    оно может содержать переводы строк, кавычки и Unicode, а длина командной строки
+    на Windows ограничена. Shell не используется, поэтому сообщение не попадает ни в
+    одну shell-строку. Без ``-a`` и без путей коммит включает **только** содержимое
+    индекса: незастейдженные изменения рабочей директории в него не попадают.
+    ``--`` не нужен: путь не передаётся.
+    """
+    return ["commit", "-F", "-"]
 
 
 class GitRepository:
@@ -514,8 +528,31 @@ class GitRepository:
         """
         self._run(build_unstage_all_arguments(has_head=self.has_head()))
 
-    def _run(self, args: list[str], *, check: bool = True) -> GitResult:
-        return self._runner.run(args, cwd=self._path, check=check)
+    def commit(self, message: str) -> None:
+        """Создаёт коммит из индекса, передавая сообщение через stdin.
+
+        Используется ``git commit -F -`` (см. ``build_commit_arguments``): сообщение
+        не попадает в командную строку процесса. Без ``-a`` и без путей Git берёт
+        только staged changes — рабочая директория не включается автоматически.
+        Пустое сообщение на этом уровне не проверяется: политику задаёт Application
+        (``CommitService``), а отказ Git остаётся типизированной ошибкой.
+
+        :raises GitError: команда Git завершилась с ошибкой (например, отказ Git-хука,
+            отсутствие настроек автора или неразрешённый конфликт).
+        """
+        self._run(build_commit_arguments(), stdin_data=message)
+
+    def _run(
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+        stdin_data: str | None = None,
+    ) -> GitResult:
+        kwargs: dict[str, object] = {"cwd": self._path, "check": check}
+        if stdin_data is not None:
+            kwargs["stdin_data"] = stdin_data
+        return self._runner.run(args, **kwargs)
 
 
 def _truncate_diff(text: str, max_chars: int) -> tuple[str, bool]:

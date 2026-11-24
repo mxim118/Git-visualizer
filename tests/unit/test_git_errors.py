@@ -62,6 +62,23 @@ DUBIOUS_OWNERSHIP_STDERR = (
     "To add an exception for this directory, call:\n\n"
     "\tgit config --global --add safe.directory /tmp/own/r\n"
 )
+# Реальные сообщения Git 2.54.0 (LC_ALL=C) при коммите без автора и с конфликтами.
+MISSING_AUTHOR_STDERR = (
+    "Author identity unknown\n\n"
+    "*** Please tell me who you are.\n\n"
+    "Run\n\n"
+    '  git config --global user.email "you@example.com"\n'
+    '  git config --global user.name "Your Name"\n\n'
+    "to set your account's default identity.\n"
+    "Omit --global to set the identity only in this repository.\n\n"
+    "fatal: unable to auto-detect email address (got 'user@host.(none)')\n"
+)
+UNMERGED_FILES_STDERR = (
+    "error: Committing is not possible because you have unmerged files.\n"
+    "hint: Fix them up in the work tree, and then use 'git add/rm <file>'\n"
+    "hint: as appropriate to mark resolution and make a commit.\n"
+    "fatal: Exiting because of an unresolved conflict.\n"
+)
 
 
 @pytest.mark.parametrize(
@@ -69,6 +86,8 @@ DUBIOUS_OWNERSHIP_STDERR = (
     [
         (NOT_A_REPOSITORY_STDERR, GitErrorKind.NOT_A_REPOSITORY),
         (DUBIOUS_OWNERSHIP_STDERR, GitErrorKind.UNSAFE_REPOSITORY),
+        (MISSING_AUTHOR_STDERR, GitErrorKind.MISSING_AUTHOR),
+        (UNMERGED_FILES_STDERR, GitErrorKind.UNMERGED_FILES),
         ("FATAL: NOT A GIT REPOSITORY", GitErrorKind.NOT_A_REPOSITORY),  # регистр не важен
         ("fatal: pathspec 'x' did not match any files\n", GitErrorKind.UNKNOWN),
         ("", GitErrorKind.UNKNOWN),
@@ -81,4 +100,6 @@ def test_classify_command_error(stderr: str, expected: GitErrorKind) -> None:
 def test_command_error_kind_is_derived_from_stderr() -> None:
     assert GitCommandError(128, stderr=NOT_A_REPOSITORY_STDERR).kind is GitErrorKind.NOT_A_REPOSITORY
     assert GitCommandError(128, stderr=DUBIOUS_OWNERSHIP_STDERR).kind is GitErrorKind.UNSAFE_REPOSITORY
+    assert GitCommandError(128, stderr=MISSING_AUTHOR_STDERR).kind is GitErrorKind.MISSING_AUTHOR
+    assert GitCommandError(128, stderr=UNMERGED_FILES_STDERR).kind is GitErrorKind.UNMERGED_FILES
     assert GitCommandError(1).kind is GitErrorKind.UNKNOWN

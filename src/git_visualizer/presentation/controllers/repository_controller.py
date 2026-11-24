@@ -1,9 +1,9 @@
 """Координация Application Services для главного окна.
 
 Контроллер выполняет открытие репозитория, проверку Git, загрузку данных истории,
-состояния рабочей директории и diff файла в фоновых задачах ``TaskRunner``. Он не
-знает о виджетах: результат сообщается сигналами, которые MainWindow связывает с
-интерфейсом. Бизнес-логика остаётся в Application Services.
+состояния рабочей директории, diff файла и создание коммита в фоновых задачах
+``TaskRunner``. Он не знает о виджетах: результат сообщается сигналами, которые
+MainWindow связывает с интерфейсом. Бизнес-логика остаётся в Application Services.
 """
 
 from __future__ import annotations
@@ -11,11 +11,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
 from git_visualizer.application.services.branch_service import BranchService, build_ref_labels
 from git_visualizer.application.services.changes_service import ChangesService
+from git_visualizer.application.services.commit_service import CommitService
 from git_visualizer.application.services.diff_service import DiffService
 from git_visualizer.application.services.git_environment_service import (
     GitEnvironmentService,
@@ -84,6 +86,10 @@ class RepositoryController(QObject):
     changes_operation_succeeded = Signal()
     changes_operation_failed = Signal(object)  # TaskFailure
 
+    commit_started = Signal()
+    commit_succeeded = Signal()
+    commit_failed = Signal(object)  # TaskFailure
+
     worktree_diff_loading = Signal(str, bool)  # path, staged
     worktree_diff_loaded = Signal(str, bool, object)  # path, staged, Diff
     worktree_diff_failed = Signal(str, bool, object)  # path, staged, TaskFailure
@@ -99,6 +105,7 @@ class RepositoryController(QObject):
         graph_service: GraphService,
         diff_service: DiffService,
         changes_service: ChangesService,
+        commit_service: CommitService,
         git_environment_service: GitEnvironmentService,
         task_runner: TaskRunner | None = None,
         parent: QObject | None = None,
@@ -110,6 +117,7 @@ class RepositoryController(QObject):
         self._graph_service = graph_service
         self._diff_service = diff_service
         self._changes_service = changes_service
+        self._commit_service = commit_service
         self._git_environment_service = git_environment_service
         self._runner = task_runner or TaskRunner(self)
 
@@ -307,6 +315,36 @@ class RepositoryController(QObject):
         return self._submit_changes_operation(
             "unstage-all", self._changes_service.unstage_all
         )
+
+    def commit(self, message: str) -> bool:
+        """Создаёт коммит из staged changes в фоновой задаче.
+
+        Используется тот же ключ, что у операций с индексом: коммит и stage/unstage
+        не должны выполняться одновременно — обе операции меняют индекс, а коммит
+        дополнительно создаёт объект и сдвигает HEAD. После успеха контроллер
+        переоткрывает репозиторий (снимок ``Repository`` описывает HEAD на момент
+        открытия) и заново загружает историю, граф, ветки и refs; статус рабочей
+        директории обновляет MainWindow по сигналу ``repository_loaded``.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не открыт
+            или другая операция с индексом уже выполняется.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+
+        session = self._session
+        task = self._runner.submit(
+            partial(self._commit_service.commit, repository, message),
+            name="commit",
+            key=f"changes-operation:{session}",
+        )
+        if task is None:
+            return False
+        self.commit_started.emit()
+        task.succeeded.connect(partial(self._handle_commit_succeeded, session))
+        task.failed.connect(partial(self._handle_commit_failed, session))
+        return True
 
     def _submit_changes_operation(
         self, name: str, operation: Callable[..., object], *args
@@ -516,6 +554,58 @@ class RepositoryController(QObject):
         # Частичный отказ Git или устаревший список: обновляем статус, чтобы
         # пользователь видел фактическое состояние перед повтором.
         self.load_changes()
+
+    def _handle_commit_succeeded(self, session: int, _result: object = None) -> None:
+        if session != self._session:
+            return
+        self.commit_succeeded.emit()
+        # Коммит сдвинул HEAD: снимок Repository устарел (он описывает HEAD на момент
+        # открытия). Переоткрываем репозиторий и загружаем всё состояние заново —
+        # историю, граф, ветки, refs и remote; Changes обновит MainWindow.
+        self._reload_after_commit()
+
+    def _handle_commit_failed(self, session: int, failure: TaskFailure) -> None:
+        if session != self._session:
+            return
+        self.commit_failed.emit(failure)
+        # Индекс после неудачного коммита может быть изменён хуком или частично
+        # затронут: показываем фактическое состояние, чтобы пользователь мог повторить.
+        self.load_changes()
+
+    def _reload_after_commit(self) -> bool:
+        """Переоткрывает репозиторий и загружает данные после успешного коммита."""
+        repository = self._repository
+        if repository is None:
+            return False
+        # Новая сессия отбрасывает результаты прежних фоновых задач: они относятся
+        # к устаревшему HEAD (например, открытый diff старого коммита).
+        self._session += 1
+        session = self._session
+        task = self._runner.submit(
+            partial(self._open_and_load, repository.path),
+            name="reload-after-commit",
+            key=f"load:{session}",
+        )
+        if task is None:
+            return False
+        self.history_loading.emit()
+        task.succeeded.connect(partial(self._handle_reloaded_workspace, session))
+        task.failed.connect(partial(self._handle_load_failed, session))
+        return True
+
+    def _open_and_load(self, path: Path) -> WorkspaceData:
+        """Worker-функция: переоткрывает репозиторий и собирает данные для окна."""
+        repository = self._repository_service.open_repository(str(path))
+        return self._load_data(repository)
+
+    def _handle_reloaded_workspace(
+        self, session: int, data: WorkspaceData
+    ) -> None:
+        if session != self._session:
+            return
+        self._repository = data.repository
+        self._workspace = data
+        self.repository_loaded.emit(data)
 
     def _handle_worktree_diff_loaded(
         self, session: int, path: str, staged: bool, diff: Diff
