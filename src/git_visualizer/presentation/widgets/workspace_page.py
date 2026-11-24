@@ -50,7 +50,9 @@ class WorkspacePage(QWidget):
 
         self.body_splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.body_splitter.setObjectName("body_splitter")
-        self.body_splitter.setChildrenCollapsible(True)
+        # Иначе ручку можно дотянуть до края, и граф сворачивается до нулевой
+        # ширины, исчезая с экрана: панели не должны «съедать» центральную область.
+        self.body_splitter.setChildrenCollapsible(False)
         self.body_splitter.addWidget(self.branches_panel)
         self.body_splitter.addWidget(self.graph_view)
         self.body_splitter.addWidget(self.details_panel)
