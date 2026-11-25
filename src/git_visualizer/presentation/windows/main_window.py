@@ -7,6 +7,11 @@ MainWindow не содержит бизнес-логики: открытие р�
 устаревших результатов по выбранному коммиту/файлу, подтверждение области действия
 массовой операции и передачи данных виджетам. Diff файла коммита показывается в
 большой панели ``DiffOverlay`` поверх всего окна.
+
+Локальные настройки (``AppSettings`` на ``QSettings``) окно читает при создании и
+сохраняет при закрытии: недавние репозитории, геометрию, состояние сплиттеров,
+предпочтительный масштаб графа и лимит загрузки коммитов. Пароли, токены и прочие
+учётные данные в настройки не попадают.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QDialog,
     QFileDialog,
     QMainWindow,
     QMessageBox,
@@ -39,6 +45,7 @@ from git_visualizer.presentation.controllers.repository_controller import (
     RepositoryController,
     WorkspaceData,
 )
+from git_visualizer.presentation.dialogs.settings_dialog import SettingsDialog
 from git_visualizer.presentation.error_texts import (
     branch_user_message,
     commit_user_message,
@@ -51,6 +58,7 @@ from git_visualizer.presentation.remote_texts import (
     remote_result_text,
     remote_user_message,
 )
+from git_visualizer.presentation.settings import AppSettings
 from git_visualizer.presentation.widgets.changes_panel import (
     scope_details,
     scope_summary,
@@ -93,16 +101,30 @@ class MainWindow(QMainWindow):
     def __init__(
         self,
         controller: RepositoryController,
+        settings: AppSettings,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._controller = controller
+        self._settings = settings
+        # Предпочтительный масштаб графа: None — вписывать историю автоматически.
+        self._preferred_graph_zoom = settings.graph_zoom()
 
         self.setWindowTitle(_WINDOW_TITLE)
         self.resize(1280, 800)
+        geometry = settings.window_geometry()
+        if geometry is not None:
+            self.restoreGeometry(geometry)
 
         self.start_screen = StartScreen(self)
         self.workspace_page = WorkspacePage(self)
+        self.workspace_page.restore_panel_state(
+            main_state=settings.main_splitter_state(),
+            body_state=settings.body_splitter_state(),
+        )
+        self.start_screen.set_recent_repositories(settings.recent_repositories())
+        # Лимит загрузки коммитов — пользовательская настройка Application-сервиса.
+        self._controller.set_history_limit(settings.history_limit())
 
         self.stack = QStackedWidget(self)
         self.stack.setObjectName("main_stack")
@@ -146,6 +168,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
         # Фоновые задачи должны завершиться раньше окна: их слоты меняют виджеты.
         self._controller.wait_for_done()
+        self._save_settings()
         super().closeEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
@@ -157,6 +180,16 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.start_screen.open_repository_requested.connect(self._choose_repository)
+        self.start_screen.recent_repository_requested.connect(
+            self._open_recent_repository
+        )
+        self.start_screen.settings_requested.connect(self._open_settings_dialog)
+        self.workspace_page.graph_view.zoom_changed.connect(
+            self._on_graph_zoom_changed
+        )
+        self.workspace_page.graph_view.fit_graph_action.triggered.connect(
+            self._on_graph_fit_requested
+        )
         self.workspace_page.refresh_requested.connect(self._refresh_history)
         self.workspace_page.close_repository_requested.connect(self._close_repository)
         self.workspace_page.fetch_requested.connect(self._on_fetch_requested)
@@ -264,6 +297,77 @@ class MainWindow(QMainWindow):
         if path:
             self._controller.open_repository(path)
 
+    def _open_recent_repository(self, path: str) -> None:
+        """Открывает репозиторий из списка недавних, проверяя, что папка на месте.
+
+        Перемещённый или удалённый репозиторий не должен приводить к падению:
+        запись убирается из списка, показывается понятное сообщение, а
+        приложение остаётся на стартовом экране.
+        """
+        if not _is_existing_directory(path):
+            self._forget_recent_repository(path)
+            self.statusBar().showMessage(
+                "Репозиторий из списка недавних не найден."
+            )
+            self._show_notice(
+                "Репозиторий недоступен",
+                f"Папка не найдена: {path}\n\n"
+                "Возможно, репозиторий перемещён или удалён. Запись удалена из "
+                "списка недавних репозиториев.",
+            )
+            return
+        self._controller.open_repository(path)
+
+    def _remember_recent_repository(self, path: str) -> None:
+        """Добавляет путь в недавние (первым) и сразу сохраняет на диск."""
+        repositories = self._settings.add_recent_repository(path)
+        self._settings.sync()
+        self.start_screen.set_recent_repositories(repositories)
+
+    def _forget_recent_repository(self, path: str) -> None:
+        repositories = self._settings.remove_recent_repository(path)
+        self._settings.sync()
+        self.start_screen.set_recent_repositories(repositories)
+
+    def _open_settings_dialog(self) -> None:
+        """Открывает диалог настроек; изменения применяются и сохраняются."""
+        dialog = SettingsDialog(history_limit=self._settings.history_limit(), parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._apply_history_limit(dialog.history_limit())
+
+    def _apply_history_limit(self, limit: int) -> None:
+        """Сохраняет лимит загрузки коммитов и передаёт его контроллеру."""
+        self._settings.set_history_limit(limit)
+        self._settings.sync()
+        self._controller.set_history_limit(limit)
+        self.statusBar().showMessage(f"Лимит загрузки коммитов: {limit}.")
+
+    # --- предпочтительный масштаб графа ---
+
+    def _on_graph_zoom_changed(self, zoom: float) -> None:
+        """Запоминает масштаб, выбранный пользователем; сохраняется при закрытии."""
+        self._preferred_graph_zoom = zoom
+
+    def _on_graph_fit_requested(self) -> None:
+        """«Вписать граф» сбрасывает предпочтение: дальше история вписывается сама."""
+        self._preferred_graph_zoom = None
+
+    def _apply_preferred_graph_zoom(self) -> None:
+        zoom = self._preferred_graph_zoom
+        if zoom is None:
+            return
+        self.workspace_page.graph_view.set_zoom_factor(zoom)
+
+    def _save_settings(self) -> None:
+        """Сохраняет геометрию окна, панели и масштаб графа при закрытии."""
+        self._settings.set_window_geometry(self.saveGeometry())
+        main_state, body_state = self.workspace_page.panel_state()
+        self._settings.set_main_splitter_state(main_state)
+        self._settings.set_body_splitter_state(body_state)
+        self._settings.set_graph_zoom(self._preferred_graph_zoom)
+        self._settings.sync()
+
     def _refresh_history(self) -> None:
         if self._controller.repository is None:
             return
@@ -329,6 +433,7 @@ class MainWindow(QMainWindow):
         self.workspace_page.set_repository(repository)
         self.stack.setCurrentWidget(self.workspace_page)
         self.start_screen.set_open_enabled(True)
+        self._remember_recent_repository(str(repository.path))
         self.statusBar().showMessage("Загрузка истории…")
 
     def _on_open_failed(self, failure: TaskFailure) -> None:
@@ -360,6 +465,7 @@ class MainWindow(QMainWindow):
     def _on_workspace_loaded(self, data: WorkspaceData) -> None:
         self.workspace_page.set_workspace_data(data)
         self.workspace_page.set_busy(False)
+        self._apply_preferred_graph_zoom()
         # Статус рабочей директории — отдельный запрос: он меняется независимо от HEAD.
         self._controller.load_changes()
         if self._pending_workspace_status is not None:
@@ -1165,3 +1271,12 @@ class MainWindow(QMainWindow):
         box.setDetailedText(technical_details(error))
         box.setStandardButtons(QMessageBox.StandardButton.Ok)
         box.exec()
+
+
+def _is_existing_directory(path: str) -> bool:
+    """Существует ли путь и является ли он каталогом (без исключений ОС)."""
+    try:
+        return Path(path).is_dir()
+    except (OSError, ValueError):
+        # Некорректный для ОС путь — такой же несуществующий репозиторий.
+        return False

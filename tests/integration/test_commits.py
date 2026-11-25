@@ -259,18 +259,23 @@ def test_commit_with_unmerged_files_returns_typed_error(
 # --- GUI-поток: коммит через нижнюю панель Changes ---
 
 
-def open_window(qt_app, path: Path, monkeypatch: pytest.MonkeyPatch) -> MainWindow:
+def open_window(
+    qt_app,
+    path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings,
+) -> MainWindow:
     monkeypatch.setattr(
         QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
     )
-    window = MainWindow(build_controller())
+    window = MainWindow(build_controller(), settings)
     window.start_screen.open_button.click()
     wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
     return window
 
 
 def test_gui_commit_updates_history_graph_refs_and_changes(
-    qt_app, make_repo: MakeRepo, git: Git, monkeypatch: pytest.MonkeyPatch
+    qt_app, make_repo: MakeRepo, git: Git, monkeypatch: pytest.MonkeyPatch, app_settings
 ) -> None:
     path = make_repo("gui-commit", commits=1)
     configure_author(git, path)
@@ -279,7 +284,7 @@ def test_gui_commit_updates_history_graph_refs_and_changes(
     git(path, "add", "--", "staged.txt")
     unstaged = path / "file0.txt"
     unstaged.write_text("worktree change\n", encoding="utf-8")
-    window = open_window(qt_app, path, monkeypatch)
+    window = open_window(qt_app, path, monkeypatch, app_settings)
     shown: list[tuple[str, BaseException]] = []
     try:
         monkeypatch.setattr(
@@ -341,7 +346,7 @@ def test_gui_commit_updates_history_graph_refs_and_changes(
 
 
 def test_gui_commit_error_without_author_keeps_application_alive(
-    qt_app, make_repo: MakeRepo, git: Git, monkeypatch: pytest.MonkeyPatch
+    qt_app, make_repo: MakeRepo, git: Git, monkeypatch: pytest.MonkeyPatch, app_settings
 ) -> None:
     path = make_repo("gui-commit-error", commits=1)
     for variable in (
@@ -354,7 +359,7 @@ def test_gui_commit_error_without_author_keeps_application_alive(
         monkeypatch.delenv(variable, raising=False)
     (path / "staged.txt").write_text("staged\n", encoding="utf-8")
     git(path, "add", "--", "staged.txt")
-    window = open_window(qt_app, path, monkeypatch)
+    window = open_window(qt_app, path, monkeypatch, app_settings)
     shown: list[tuple[str, BaseException, dict[str, object]]] = []
     try:
         monkeypatch.setattr(

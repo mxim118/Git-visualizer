@@ -24,7 +24,10 @@ from git_visualizer.application.services.git_environment_service import (
     GitEnvironmentService,
 )
 from git_visualizer.application.services.graph_service import GraphService
-from git_visualizer.application.services.history_service import HistoryService
+from git_visualizer.application.services.history_service import (
+    DEFAULT_HISTORY_LIMIT,
+    HistoryService,
+)
 from git_visualizer.application.services.repository_service import RepositoryService
 from git_visualizer.application.services.remote_service import (
     RemoteOperationContext,
@@ -122,10 +125,13 @@ class RepositoryController(QObject):
         commit_service: CommitService,
         remote_service: RemoteService,
         git_environment_service: GitEnvironmentService,
+        history_limit: int = DEFAULT_HISTORY_LIMIT,
         task_runner: TaskRunner | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
+        if history_limit < 1:
+            raise ValueError(f"History limit must be positive, got {history_limit}")
         self._repository_service = repository_service
         self._history_service = history_service
         self._branch_service = branch_service
@@ -135,6 +141,7 @@ class RepositoryController(QObject):
         self._commit_service = commit_service
         self._remote_service = remote_service
         self._git_environment_service = git_environment_service
+        self._history_limit = history_limit
         self._runner = task_runner or TaskRunner(self)
 
         self._session = 0
@@ -159,6 +166,23 @@ class RepositoryController(QObject):
     def is_loading(self) -> bool:
         """Идёт ли загрузка данных текущего открытого репозитория."""
         return self._runner.is_running(self._load_key())
+
+    @property
+    def history_limit(self) -> int:
+        """Лимит коммитов, который применяется к следующим загрузкам истории."""
+        return self._history_limit
+
+    def set_history_limit(self, limit: int) -> None:
+        """Меняет лимит загрузки коммитов (пользовательская настройка).
+
+        Уже загруженная история не перезагружается: новое значение действует при
+        следующем открытии репозитория или ручном обновлении.
+
+        :raises ValueError: ``limit`` меньше 1.
+        """
+        if limit < 1:
+            raise ValueError(f"History limit must be positive, got {limit}")
+        self._history_limit = limit
 
     def check_git_environment(self) -> None:
         """Проверяет наличие и версию Git в фоне."""
@@ -632,7 +656,9 @@ class RepositoryController(QObject):
 
     def _load_data(self, repository: Repository) -> WorkspaceData:
         """Worker-функция: выполняется вне GUI-потока, без обращения к виджетам."""
-        commits = self._history_service.get_history(repository)
+        commits = self._history_service.get_history(
+            repository, limit=self._history_limit
+        )
         branches = self._branch_service.get_branches(repository)
         remotes = self._repository_service.get_remotes(repository)
         layout = self._graph_service.build_layout(commits)

@@ -8,12 +8,15 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from git_visualizer.application.errors import (
     NotAGitRepositoryError,
     UpstreamNotConfiguredError,
 )
 from git_visualizer.application.services.git_environment_service import GitEnvironment
 from git_visualizer.application.services.graph_service import GraphService
+from git_visualizer.application.services.history_service import DEFAULT_HISTORY_LIMIT
 from git_visualizer.application.services.remote_service import RemoteOperationResult
 from git_visualizer.domain.enums import FileChangeType
 from git_visualizer.domain.models import (
@@ -127,8 +130,12 @@ class FakeHistoryService:
         self.error = error
         self._gate = gate
         self._started = started
+        self.limits: list[int] = []
 
-    def get_history(self, repository: Repository) -> tuple[Commit, ...]:
+    def get_history(
+        self, repository: Repository, *, limit: int
+    ) -> tuple[Commit, ...]:
+        self.limits.append(limit)
         if self._started is not None:
             self._started.set()
         if self._gate is not None:
@@ -358,6 +365,7 @@ def build_controller(
     changes_service: FakeChangesService | None = None,
     commit_service: FakeCommitService | None = None,
     remote_service: FakeRemoteService | None = None,
+    history_limit: int = DEFAULT_HISTORY_LIMIT,
 ) -> tuple[
     RepositoryController,
     FakeRepositoryService,
@@ -383,6 +391,7 @@ def build_controller(
         git_environment_service=FakeEnvironmentService(
             environment=environment, error=environment_error
         ),
+        history_limit=history_limit,
     )
     return controller, repository_service, history_service, diff_service
 
@@ -1226,3 +1235,54 @@ def test_remote_operations_require_open_repository(qt_app) -> None:
     assert controller.pull() is False
     assert controller.push() is False
     assert controller.push_initial("origin") is False
+
+
+# --- лимит загрузки коммитов (пользовательская настройка) ---
+
+
+def test_history_limit_is_passed_to_the_history_service(
+    qt_app, tmp_path: Path
+) -> None:
+    commit = make_commit("only")
+    controller, _, history, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        history_limit=500,
+    )
+    loaded: list[WorkspaceData] = []
+    controller.repository_loaded.connect(loaded.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: bool(loaded))
+
+    assert history.limits == [500]
+    controller.wait_for_done()
+
+
+def test_set_history_limit_applies_to_next_load(qt_app, tmp_path: Path) -> None:
+    commit = make_commit("only")
+    controller, _, history, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+    )
+    loaded: list[WorkspaceData] = []
+    controller.repository_loaded.connect(loaded.append)
+
+    assert controller.history_limit == DEFAULT_HISTORY_LIMIT
+    controller.set_history_limit(1000)
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: bool(loaded))
+
+    assert history.limits == [1000]
+    controller.wait_for_done()
+
+
+def test_set_history_limit_rejects_non_positive_value(qt_app) -> None:
+    controller, _, _, _ = build_controller(
+        repository=make_repository(Path("repo"), head_commit=None)
+    )
+
+    with pytest.raises(ValueError):
+        controller.set_history_limit(0)
+
+    assert controller.history_limit == DEFAULT_HISTORY_LIMIT

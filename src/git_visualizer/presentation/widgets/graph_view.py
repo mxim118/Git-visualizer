@@ -80,6 +80,9 @@ class GraphView(QGraphicsView):
     """Отображает готовую раскладку истории; выбранный hash сообщается сигналом."""
 
     commit_selected = Signal(str)
+    # Пользователь изменил масштаб (колесо или кнопки меню). MainWindow сохраняет
+    # последнее значение как предпочтение; автоматический fit сигнал не даёт.
+    zoom_changed = Signal(float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -230,6 +233,20 @@ class GraphView(QGraphicsView):
 
     def zoom_out(self) -> None:
         self._zoom_by(1.0 / ZOOM_STEP)
+
+    def set_zoom_factor(self, factor: float) -> None:
+        """Устанавливает масштаб в тех же пределах, что и зум колесом.
+
+        Используется для восстановления предпочтительного масштаба после загрузки
+        графа. Масштабируется центр окна; если граф не загружен, ничего не меняется.
+        """
+        if not self._node_items:
+            return
+        target = max(MIN_ZOOM, min(MAX_ZOOM, float(factor)))
+        current = self.zoom_factor
+        if current <= 0:
+            return
+        self._zoom_by(target / current)
 
     def select_commit(self, commit_hash: str, *, emit_signal: bool = False) -> bool:
         """Выбирает узел по hash; возвращает ``False``, если такого узла нет."""
@@ -505,6 +522,7 @@ class GraphView(QGraphicsView):
         if not on_content:
             # Точка вне содержимого: якорить нечего, зато граф нельзя потерять.
             self._apply_origin(self.mapToScene(QPoint(0, 0)), strict=True)
+        self.zoom_changed.emit(self.zoom_factor)
 
     def _add_ref_labels(
         self,

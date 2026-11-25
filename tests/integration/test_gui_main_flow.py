@@ -74,13 +74,14 @@ def test_main_flow_with_real_repository(
     make_repo,
     git,
     monkeypatch,
+    app_settings,
 ) -> None:
     path = make_repo("gui-repo", commits=2)
     monkeypatch.setattr(
         QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
     )
     controller = build_controller()
-    window = MainWindow(controller)
+    window = MainWindow(controller, app_settings)
 
     try:
         wait_until(
@@ -146,6 +147,7 @@ def test_gui_commit_details_and_file_diff_flow(
     make_repo,
     git,
     monkeypatch,
+    app_settings,
 ) -> None:
     path = make_repo("gui-diff", commits=1)
     (path / "file0.txt").write_text("changed\n", encoding="utf-8")
@@ -161,7 +163,7 @@ def test_gui_commit_details_and_file_diff_flow(
         QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
     )
     controller = build_controller()
-    window = MainWindow(controller)
+    window = MainWindow(controller, app_settings)
 
     try:
         window.start_screen.open_button.click()
@@ -199,6 +201,7 @@ def test_gui_worktree_changes_flow(
     make_repo,
     git,
     monkeypatch,
+    app_settings,
 ) -> None:
     path = make_repo("gui-changes", commits=1)
     (path / "file0.txt").write_text("unstaged change\n", encoding="utf-8")
@@ -209,7 +212,7 @@ def test_gui_worktree_changes_flow(
         QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
     )
     controller = build_controller()
-    window = MainWindow(controller)
+    window = MainWindow(controller, app_settings)
 
     try:
         window.start_screen.open_button.click()
@@ -282,6 +285,7 @@ def test_gui_stage_and_unstage_flow(
     make_repo,
     git,
     monkeypatch,
+    app_settings,
 ) -> None:
     path = make_repo("gui-stage", commits=1)
     file = path / "file0.txt"
@@ -290,7 +294,7 @@ def test_gui_stage_and_unstage_flow(
         QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
     )
     controller = build_controller()
-    window = MainWindow(controller)
+    window = MainWindow(controller, app_settings)
 
     try:
         window.start_screen.open_button.click()
@@ -350,13 +354,14 @@ def test_empty_repository_flow_with_real_git(
     qt_app,
     make_repo,
     monkeypatch,
+    app_settings,
 ) -> None:
     path = make_repo("empty-repo", commits=0)
     monkeypatch.setattr(
         QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
     )
     controller = build_controller()
-    window = MainWindow(controller)
+    window = MainWindow(controller, app_settings)
 
     try:
         window.start_screen.open_button.click()

@@ -7,6 +7,7 @@
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from git_visualizer.application.ports import GitRepositoryFactory
@@ -26,6 +27,7 @@ from git_visualizer.infrastructure.git.git_runner import GitRunner
 from git_visualizer.presentation.controllers.repository_controller import (
     RepositoryController,
 )
+from git_visualizer.presentation.settings import AppSettings
 from git_visualizer.presentation.windows.main_window import MainWindow
 
 
@@ -53,9 +55,11 @@ def build_repository_controller() -> RepositoryController:
 def main() -> int:
     """Создаёт QApplication, показывает главное окно и запускает цикл событий."""
     app = QApplication(sys.argv)
-    app.setApplicationName("Git Visualizer")
+    # Организация и приложение задают платформенное место хранения QSettings.
+    app.setOrganizationName("GitVisualizer")
+    app.setApplicationName("GitVisualizer")
 
-    window = MainWindow(build_repository_controller())
+    window = MainWindow(build_repository_controller(), AppSettings.from_default())
     window.show()
 
     return app.exec()

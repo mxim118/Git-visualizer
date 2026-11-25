@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QSettings, QSize
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import QFileDialog, QFrame, QLabel
 
@@ -35,7 +36,9 @@ from git_visualizer.main import main
 from git_visualizer.presentation.controllers.repository_controller import (
     RepositoryController,
 )
+from git_visualizer.presentation.dialogs.settings_dialog import SettingsDialog
 from git_visualizer.presentation.error_texts import user_message
+from git_visualizer.presentation.settings import AppSettings
 from git_visualizer.presentation.widgets.diff_view import (
     ADDED_BACKGROUND,
     DELETED_BACKGROUND,
@@ -135,9 +138,13 @@ class FakeHistoryService:
         self.commits = commits
         self.error = error
         self.requests = 0
+        self.limits: list[int] = []
 
-    def get_history(self, repository: Repository) -> tuple[Commit, ...]:
+    def get_history(
+        self, repository: Repository, *, limit: int
+    ) -> tuple[Commit, ...]:
         self.requests += 1
+        self.limits.append(limit)
         if self.error is not None:
             raise self.error
         return self.commits
@@ -384,13 +391,50 @@ def wait_until(
         time.sleep(0.005)
 
 
+class MemorySettingsStorage:
+    """Замена ``QSettings`` для тестов, которым не важно сохранение на диск."""
+
+    def __init__(self) -> None:
+        self._values: dict[str, object] = {}
+
+    def value(self, key: str, default: object = None) -> object:
+        return self._values.get(key, default)
+
+    def setValue(self, key: str, value: object) -> None:  # noqa: N802 (QSettings API)
+        self._values[key] = value
+
+    def remove(self, key: str) -> None:
+        self._values.pop(key, None)
+
+    def sync(self) -> None:
+        pass
+
+
+def memory_settings() -> AppSettings:
+    """Настройки без файла: тесты не трогают конфигурацию пользователя."""
+    return AppSettings(MemorySettingsStorage())
+
+
 @contextmanager
-def opened_window(controller: RepositoryController) -> Iterator[MainWindow]:
-    window = MainWindow(controller)
+def opened_window(
+    controller: RepositoryController,
+    settings: AppSettings | None = None,
+) -> Iterator[MainWindow]:
+    window = MainWindow(controller, settings or memory_settings())
     try:
         yield window
     finally:
         window.close()
+
+
+def make_settings(tmp_path: Path) -> AppSettings:
+    """Настройки во временном INI-файле: проверяют сохранение между запусками."""
+    return AppSettings(
+        QSettings(
+            str(tmp_path / "git-visualizer-settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+    )
 
 
 def patch_folder_dialog(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
@@ -980,7 +1024,7 @@ def open_workspace_with_changes(
         commit_service=commit_service,
     )
     patch_folder_dialog(monkeypatch, tmp_path)
-    window = MainWindow(controller)
+    window = MainWindow(controller, memory_settings())
     window.start_screen.open_button.click()
     wait_until(
         qt_app,
@@ -1436,7 +1480,7 @@ def test_commit_success_clears_message_and_reloads_history_and_changes(
         commit_service=commit_service,
     )
     patch_folder_dialog(monkeypatch, tmp_path)
-    window = MainWindow(controller)
+    window = MainWindow(controller, memory_settings())
     shown: list[tuple[str, BaseException]] = []
     try:
         monkeypatch.setattr(
@@ -1499,7 +1543,7 @@ def test_commit_failure_shows_error_details_and_keeps_message(
         commit_service=commit_service,
     )
     patch_folder_dialog(monkeypatch, tmp_path)
-    window = MainWindow(controller)
+    window = MainWindow(controller, memory_settings())
     shown: list[tuple[str, BaseException, dict[str, object]]] = []
     try:
         monkeypatch.setattr(
@@ -1553,7 +1597,7 @@ def test_cancel_commit_overlay_does_not_start_commit(
         commit_service=commit_service,
     )
     patch_folder_dialog(monkeypatch, tmp_path)
-    window = MainWindow(controller)
+    window = MainWindow(controller, memory_settings())
     try:
         window.start_screen.open_button.click()
         panel = window.workspace_page.changes_panel
@@ -1741,7 +1785,7 @@ def open_workspace_with_remote(
         remote_service=remote_service,
     )
     patch_folder_dialog(monkeypatch, tmp_path)
-    window = MainWindow(controller)
+    window = MainWindow(controller, memory_settings())
     window.start_screen.open_button.click()
     wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
     return window
@@ -1918,3 +1962,215 @@ def test_network_failure_is_reported_and_ui_is_not_busy(
         wait_until(qt_app, lambda: not window.workspace_page.top_bar.is_busy)
     finally:
         window.close()
+
+
+# --- локальные настройки: недавние репозитории, окно, панели, лимит ---
+
+
+def test_recent_repository_is_shown_and_reopened(
+    qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_path = tmp_path / "recent-repo"
+    repo_path.mkdir()
+    commit = make_commit("head")
+    controller, _ = build_controller(
+        repository=make_repository(repo_path, head_commit=commit.hash),
+        commits=(commit,),
+    )
+    app_settings.add_recent_repository(str(repo_path))
+    app_settings.sync()
+
+    with opened_window(controller, app_settings) as window:
+        screen = window.start_screen
+        assert screen.recent_repositories == (str(repo_path),)
+        assert not screen.recent_section.isHidden()
+
+        screen.recent_list.itemActivated.emit(screen.recent_list.item(0))
+
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None
+            and window.stack.currentWidget() is window.workspace_page,
+        )
+        assert controller.repository is not None
+        assert controller.repository.path == repo_path
+        assert app_settings.recent_repositories() == (str(repo_path),)
+
+
+def test_missing_recent_repository_is_removed_without_crash(
+    qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / "moved-repo"
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=None)
+    )
+    app_settings.add_recent_repository(str(missing))
+    app_settings.sync()
+
+    with opened_window(controller, app_settings) as window:
+        notices: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            window,
+            "_show_notice",
+            lambda title, message: notices.append((title, message)),
+        )
+
+        window.start_screen.recent_list.itemActivated.emit(
+            window.start_screen.recent_list.item(0)
+        )
+
+        assert notices and notices[0][0] == "Репозиторий недоступен"
+        assert str(missing) in notices[0][1]
+        assert controller.repository is None
+        assert window.stack.currentWidget() is window.start_screen
+        # Перемещённый путь убран из настроек и из списка на стартовом экране.
+        assert app_settings.recent_repositories() == ()
+        assert window.start_screen.recent_repositories == ()
+        assert window.start_screen.recent_section.isHidden()
+
+
+def test_opened_repository_becomes_the_first_recent(
+    qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = make_commit("head")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+    )
+    app_settings.set_recent_repositories(["C:/old-place"])
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller, app_settings) as window:
+        window.start_screen.open_button.click()
+        wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
+
+        assert app_settings.recent_repositories() == (str(tmp_path), "C:/old-place")
+        assert window.start_screen.recent_repositories == (
+            str(tmp_path),
+            "C:/old-place",
+        )
+
+
+def test_window_panel_zoom_and_history_settings_survive_restart(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = make_commit("head")
+    patch_folder_dialog(monkeypatch, tmp_path)
+    first_controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+    )
+    first_settings = make_settings(tmp_path)
+    first_settings.set_history_limit(700)
+    first_settings.sync()
+    window = MainWindow(first_controller, first_settings)
+    try:
+        window.resize(1000, 640)
+        window.show()
+        window.start_screen.open_button.click()
+        wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
+        qt_app.processEvents()
+        window.workspace_page.main_splitter.setSizes([420, 210])
+        window.workspace_page.body_splitter.setSizes([220, 560, 400])
+        window.workspace_page.graph_view.zoom_in()
+        qt_app.processEvents()
+
+        expected_size = window.size()
+        workspace = window.workspace_page
+        expected_main = workspace.main_splitter.sizes()
+        expected_body = workspace.body_splitter.sizes()
+        expected_zoom = workspace.graph_view.zoom_factor
+    finally:
+        window.close()
+
+    # Второй запуск: новые объекты читают тот же файл настроек.
+    second_controller, history = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+    )
+    second_settings = make_settings(tmp_path)
+    window = MainWindow(second_controller, second_settings)
+    try:
+        window.show()
+        window.start_screen.open_button.click()
+        wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
+        qt_app.processEvents()
+
+        assert window.size() == QSize(expected_size)
+        assert window.workspace_page.main_splitter.sizes() == expected_main
+        assert window.workspace_page.body_splitter.sizes() == expected_body
+        assert abs(
+            window.workspace_page.graph_view.zoom_factor - expected_zoom
+        ) < 1e-6
+        # Лимит истории применился к открытию репозитория во втором запуске.
+        assert history.limits == [700]
+    finally:
+        window.close()
+
+
+def test_history_limit_from_settings_is_applied_to_open(
+    qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = make_commit("head")
+    app_settings.set_history_limit(800)
+    controller, history = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller, app_settings) as window:
+        window.start_screen.open_button.click()
+        wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
+
+        assert history.limits == [800]
+
+
+def test_applying_history_limit_saves_it_and_updates_controller(
+    qt_app, tmp_path: Path, app_settings
+) -> None:
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=None)
+    )
+
+    with opened_window(controller, app_settings) as window:
+        window._apply_history_limit(1200)
+
+        assert controller.history_limit == 1200
+        assert app_settings.history_limit() == 1200
+        assert make_settings(tmp_path).history_limit() == 1200
+
+
+def test_settings_dialog_returns_selected_history_limit(qt_app) -> None:
+    dialog = SettingsDialog(history_limit=3000)
+    try:
+        assert dialog.history_limit() == 3000
+
+        dialog.history_limit_spin.setValue(500)
+        dialog.accept()
+
+        assert dialog.history_limit() == 500
+    finally:
+        dialog.close()
+
+
+def test_fit_graph_clears_preferred_zoom(
+    qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = make_commit("head")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller, app_settings) as window:
+        window.start_screen.open_button.click()
+        wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
+
+        graph = window.workspace_page.graph_view
+        graph.zoom_in()
+        assert window._preferred_graph_zoom is not None
+
+        graph.fit_graph_action.trigger()
+        assert window._preferred_graph_zoom is None

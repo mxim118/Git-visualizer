@@ -372,6 +372,7 @@ def test_gui_fetch_pull_push_flow_updates_graph_branch_and_changes(
     git: Git,
     make_repo: MakeRepo,
     monkeypatch: pytest.MonkeyPatch,
+    app_settings,
 ) -> None:
     seed, remote = make_seed_with_bare_remote(tmp_path, git, make_repo)
     local = clone_local(tmp_path, git, remote)
@@ -382,7 +383,7 @@ def test_gui_fetch_pull_push_flow_updates_graph_branch_and_changes(
     monkeypatch.setattr(
         QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(local)
     )
-    window = MainWindow(build_controller())
+    window = MainWindow(build_controller(), app_settings)
     shown: list[tuple[str, BaseException]] = []
     monkeypatch.setattr(
         window, "_show_error", lambda title, exc, **kwargs: shown.append((title, exc))

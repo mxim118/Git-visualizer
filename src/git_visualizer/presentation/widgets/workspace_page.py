@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import QEvent, QObject, Qt, Signal
+from PySide6.QtCore import QByteArray, QEvent, QObject, Qt, Signal
 from PySide6.QtWidgets import QPushButton, QSplitter, QVBoxLayout, QWidget
 
 from git_visualizer.domain.models import Commit, FileChange, Repository
@@ -236,6 +236,30 @@ class WorkspacePage(QWidget):
     @property
     def workspace_data(self) -> WorkspaceData | None:
         return self._data
+
+    def panel_state(self) -> tuple[QByteArray, QByteArray]:
+        """Состояние сплиттеров для ``QSettings``: ``(main, body)``."""
+        return self.main_splitter.saveState(), self.body_splitter.saveState()
+
+    def restore_panel_state(
+        self,
+        *,
+        main_state: QByteArray | None,
+        body_state: QByteArray | None,
+    ) -> bool:
+        """Восстанавливает деление панелей, сохранённое в прошлом запуске.
+
+        Qt до первого показа окна ещё не знает фактических размеров, поэтому
+        ``restoreState`` применяет сохранённые размеры при первой раскладке.
+        Некорректное или пустое состояние игнорируется: панели остаются на
+        начальных размерах.
+        """
+        restored = False
+        if body_state is not None:
+            restored = self.body_splitter.restoreState(body_state) or restored
+        if main_state is not None:
+            restored = self.main_splitter.restoreState(main_state) or restored
+        return restored
 
     def clear_file_selection(self) -> None:
         """Снимает выбор файла коммита (закрытие панели diff или смена коммита)."""

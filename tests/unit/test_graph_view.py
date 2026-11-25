@@ -233,6 +233,34 @@ def test_wheel_zoom_uses_the_same_limits(qt_app) -> None:
     view.close()
 
 
+def test_set_zoom_factor_restores_preferred_scale(qt_app) -> None:
+    view = make_view(qt_app)
+    emitted: list[float] = []
+    view.zoom_changed.connect(emitted.append)
+
+    view.set_zoom_factor(2.0)
+
+    assert abs(view.zoom_factor - 2.0) < 1e-9
+    assert emitted and abs(emitted[-1] - 2.0) < 1e-9
+    view.close()
+
+
+def test_set_zoom_factor_is_clamped_and_ignored_without_graph(qt_app) -> None:
+    view = make_view(qt_app)
+
+    view.set_zoom_factor(100.0)
+    assert abs(view.zoom_factor - MAX_ZOOM) < 1e-9
+
+    view.set_zoom_factor(0.0)
+    assert abs(view.zoom_factor - MIN_ZOOM) < 1e-9
+    view.close()
+
+    empty = GraphView()
+    empty.set_zoom_factor(2.0)
+    assert abs(empty.zoom_factor - 1.0) < 1e-9
+    empty.close()
+
+
 def make_narrow_layout() -> GraphLayout:
     return GraphLayout(
         nodes=tuple(

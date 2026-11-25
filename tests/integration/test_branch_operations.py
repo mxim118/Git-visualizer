@@ -287,21 +287,26 @@ def wait_until(
     qt_app.processEvents()
 
 
-def open_window(qt_app, path: Path, monkeypatch: pytest.MonkeyPatch) -> MainWindow:
+def open_window(
+    qt_app,
+    path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings,
+) -> MainWindow:
     monkeypatch.setattr(
         QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
     )
-    window = MainWindow(build_controller())
+    window = MainWindow(build_controller(), settings)
     window.start_screen.open_button.click()
     wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
     return window
 
 
 def test_gui_creates_and_switches_branch_and_refreshes_graph_refs_changes(
-    qt_app, make_repo: MakeRepo, git: Git, monkeypatch: pytest.MonkeyPatch
+    qt_app, make_repo: MakeRepo, git: Git, monkeypatch: pytest.MonkeyPatch, app_settings
 ) -> None:
     path = make_repo("gui-branches", commits=2)
-    window = open_window(qt_app, path, monkeypatch)
+    window = open_window(qt_app, path, monkeypatch, app_settings)
     panel = window.workspace_page.branches_panel
     try:
         panel.branch_name_edit.setText("feature/gui")
@@ -354,11 +359,11 @@ def test_gui_creates_and_switches_branch_and_refreshes_graph_refs_changes(
 
 
 def test_gui_creates_branch_from_selected_commit(
-    qt_app, make_repo: MakeRepo, git: Git, monkeypatch: pytest.MonkeyPatch
+    qt_app, make_repo: MakeRepo, git: Git, monkeypatch: pytest.MonkeyPatch, app_settings
 ) -> None:
     path = make_repo("gui-branch-from-commit", commits=3)
     selected = rev(git, path, "HEAD~1")
-    window = open_window(qt_app, path, monkeypatch)
+    window = open_window(qt_app, path, monkeypatch, app_settings)
     panel = window.workspace_page.branches_panel
     try:
         assert window.workspace_page.graph_view.select_commit(
