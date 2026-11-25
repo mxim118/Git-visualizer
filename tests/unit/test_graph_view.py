@@ -137,6 +137,7 @@ def test_empty_state(qt_app) -> None:
     assert view.edge_count == 0
     assert view.selected_commit_hash is None
     assert not view.fit_graph_action.isEnabled()
+    assert view.viewport().cursor().shape() == Qt.CursorShape.ArrowCursor
     assert not view.grab().isNull()
     assert EMPTY_STATE_TEXT == "История пуста"
     view.close()
@@ -321,4 +322,113 @@ def test_dragging_empty_space_pans_view(qt_app) -> None:
         view.horizontalScrollBar().value() != horizontal_before
         or view.verticalScrollBar().value() != vertical_before
     )
+    view.close()
+
+
+def test_graph_can_be_panned_when_it_fits_the_viewport(qt_app) -> None:
+    """Граф, вписанный в окно, всё равно можно двигать мышью в обе стороны."""
+    view = make_view(qt_app)
+    horizontal = view.horizontalScrollBar()
+    vertical = view.verticalScrollBar()
+    assert horizontal.maximum() > horizontal.minimum()
+    assert vertical.maximum() > vertical.minimum()
+
+    center = view.viewport().rect().center()
+    before = view.mapToScene(center)
+    start = view.viewport().rect().topLeft() + QPoint(20, 20)
+
+    QTest.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    assert view.viewport().cursor().shape() == Qt.CursorShape.ClosedHandCursor
+    QTest.mouseMove(view.viewport(), start + QPoint(-70, -50))
+    QTest.mouseRelease(
+        view.viewport(), Qt.MouseButton.LeftButton, pos=start + QPoint(-70, -50)
+    )
+
+    after = view.mapToScene(center)
+    assert after.x() > before.x()
+    assert after.y() > before.y()
+    assert view.viewport().cursor().shape() == Qt.CursorShape.OpenHandCursor
+    view.close()
+
+
+def test_dragging_from_a_node_pans_and_keeps_the_click_selection(qt_app) -> None:
+    view = make_view(qt_app)
+    node_point = view.mapFromScene(QPointF(0.0, 0.0))
+    center = view.viewport().rect().center()
+    before = view.mapToScene(center)
+
+    QTest.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=node_point)
+    QTest.mouseMove(view.viewport(), node_point + QPoint(60, 40))
+    QTest.mouseRelease(
+        view.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=node_point + QPoint(60, 40),
+    )
+
+    assert view.selected_commit_hash == MERGE
+    after = view.mapToScene(center)
+    assert after.x() < before.x()
+    assert after.y() < before.y()
+    node_item = next(
+        item
+        for item in view.scene().items()
+        if getattr(item, "commit_hash", None) == MERGE
+    )
+    assert node_item.pos() == QPointF(0.0, 0.0)
+    view.close()
+
+
+def test_panning_stays_available_at_every_zoom_level(qt_app) -> None:
+    view = make_view(qt_app)
+
+    for _ in range(12):
+        view.zoom_out()
+        horizontal = view.horizontalScrollBar()
+        vertical = view.verticalScrollBar()
+        assert horizontal.maximum() > horizontal.minimum()
+        assert vertical.maximum() > vertical.minimum()
+
+    for _ in range(30):
+        view.zoom_in()
+        horizontal = view.horizontalScrollBar()
+        vertical = view.verticalScrollBar()
+        assert horizontal.maximum() > horizontal.minimum()
+        assert vertical.maximum() > vertical.minimum()
+    view.close()
+
+
+def test_resizing_the_view_keeps_the_visible_center(qt_app) -> None:
+    view = make_view(qt_app)
+    before = view.mapToScene(view.viewport().rect().center())
+
+    view.resize(900, 620)
+    qt_app.processEvents()
+
+    after = view.mapToScene(view.viewport().rect().center())
+    assert abs(after.x() - before.x()) < 1.0
+    assert abs(after.y() - before.y()) < 1.0
+    view.close()
+
+
+def test_wheel_zoom_keeps_the_point_under_cursor_when_graph_fits(qt_app) -> None:
+    view = make_view(qt_app)
+    cursor = QPoint(view.viewport().width() // 3, view.viewport().height() // 3)
+    before = view.mapToScene(cursor)
+
+    event = QWheelEvent(
+        QPointF(cursor),
+        QPointF(view.viewport().mapToGlobal(cursor)),
+        QPoint(),
+        QPoint(0, 120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase,
+        False,
+    )
+    qt_app.sendEvent(view.viewport(), event)
+    qt_app.processEvents()
+
+    after = view.mapToScene(cursor)
+    assert abs(after.x() - before.x()) < 0.01
+    assert abs(after.y() - before.y()) < 0.01
     view.close()

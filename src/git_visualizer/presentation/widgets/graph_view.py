@@ -101,6 +101,7 @@ class GraphView(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor("#f8fafc")))
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
         self._scene.setSceneRect(QRectF(-220.0, -160.0, 440.0, 320.0))
 
         self.fit_graph_action = QAction("Вписать граф", self)
@@ -177,14 +178,11 @@ class GraphView(QGraphicsView):
             self._node_items[node.commit_hash] = item
             self._add_ref_labels(item, labels, self._lane_color(node.lane))
 
-        content = self._scene.itemsBoundingRect()
-        self._scene.setSceneRect(
-            content.adjusted(-SCENE_MARGIN, -SCENE_MARGIN, SCENE_MARGIN, SCENE_MARGIN)
-        )
         self.fit_graph_action.setEnabled(True)
         if fit:
             self.fit_graph()
         else:
+            self._update_scene_rect()
             self.viewport().update()
 
     def clear(self) -> None:
@@ -211,6 +209,7 @@ class GraphView(QGraphicsView):
         scale = min(viewport.width() / padded.width(), viewport.height() / padded.height())
         scale = max(MIN_ZOOM, min(MAX_ZOOM, scale))
         self.setTransform(QTransform().scale(scale, scale))
+        self._update_scene_rect()
         self.centerOn(padded.center())
 
     def zoom_in(self) -> None:
@@ -265,10 +264,9 @@ class GraphView(QGraphicsView):
             item = self._commit_item_at(event.position().toPoint())
             if item is not None:
                 self._select_commit(item, emit=True)
-                event.accept()
-                return
-            self._scene.clearSelection()
-            self._selected_hash = None
+            else:
+                self._scene.clearSelection()
+                self._selected_hash = None
             self._start_pan(event)
             return
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -297,10 +295,26 @@ class GraphView(QGraphicsView):
             Qt.MouseButton.MiddleButton,
         ):
             self._panning = False
-            self.viewport().unsetCursor()
+            self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        if not self._node_items:
+            super().resizeEvent(event)
+            self._update_scene_rect()
+            return
+        old_size = event.oldSize()
+        center: QPointF | None = None
+        if old_size.width() > 0 and old_size.height() > 0:
+            center = self.mapToScene(
+                QPoint(old_size.width() // 2, old_size.height() // 2)
+            )
+        super().resizeEvent(event)
+        self._update_scene_rect()
+        if center is not None:
+            self.centerOn(center)
 
     def paintEvent(self, event) -> None:  # noqa: N802 (Qt API)
         super().paintEvent(event)
@@ -327,14 +341,33 @@ class GraphView(QGraphicsView):
         self._scene.clear()
         self._selected_hash = None
         self._panning = False
-        self.viewport().unsetCursor()
+        self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
 
     def _show_empty_state(self) -> None:
         self._scene.setSceneRect(QRectF(-220.0, -160.0, 440.0, 320.0))
         self.fit_graph_action.setEnabled(False)
+        self.viewport().setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self.resetTransform()
         self.centerOn(0.0, 0.0)
         self.viewport().update()
+
+    def _update_scene_rect(self) -> None:
+        """Расширяет сцену вокруг содержимого, чтобы граф можно было двигать.
+
+        Полоса прокрутки ограничивает перетаскивание пределами ``sceneRect``:
+        если сцена вписана в окно, диапазон равен нулю и панорамирование
+        не работает. Поэтому вокруг содержимого всегда оставляется запас
+        минимум в один экран (в координатах сцены) с каждой стороны.
+        """
+        content = self._scene.itemsBoundingRect()
+        if content.isEmpty():
+            self._scene.setSceneRect(QRectF(-220.0, -160.0, 440.0, 320.0))
+            return
+        scale = max(self.zoom_factor, MIN_ZOOM)
+        viewport = self.viewport().rect()
+        pad_x = max(SCENE_MARGIN, viewport.width() / scale)
+        pad_y = max(SCENE_MARGIN, viewport.height() / scale)
+        self._scene.setSceneRect(content.adjusted(-pad_x, -pad_y, pad_x, pad_y))
 
     def _select_commit(self, item: _CommitNodeItem, *, emit: bool) -> None:
         self._scene.clearSelection()
@@ -372,6 +405,7 @@ class GraphView(QGraphicsView):
             anchor = self.viewport().rect().center()
         before = self.mapToScene(anchor)
         self.scale(ratio, ratio)
+        self._update_scene_rect()
         after = self.mapToScene(anchor)
         delta = after - before
         self.translate(delta.x(), delta.y())
