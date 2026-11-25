@@ -380,34 +380,45 @@ class GraphView(QGraphicsView):
         pad_y = max(SCENE_MARGIN, viewport.height() / scale)
         self._scene.setSceneRect(content.adjusted(-pad_x, -pad_y, pad_x, pad_y))
 
-    def _clamp_view_origin(self, origin: QPointF) -> QPointF:
+    def _clamp_view_origin(
+        self, origin: QPointF, *, current: QPointF | None = None
+    ) -> QPointF:
         """Ограничивает положение окна относительно графа.
 
         По каждой оси видимая часть графа не меньше ``MIN_VISIBLE_SHARE`` окна;
         граф меньше этой доли остаётся виден целиком. Считается по узлам и
         рёбрам, без подписей ref: длинные подписи иначе дают утащить сами
         коммиты за край окна.
+
+        ``current`` — текущее положение окна. Если оно уже вне допустимых
+        пределов (зум под курсором у края графа), пределы расширяются до него:
+        окно не возвращается скачком, но и уйти дальше не даёт.
         """
         graph = self._graph_rect
         if graph.isEmpty():
             return origin
         scale = max(self.zoom_factor, MIN_ZOOM)
         viewport = self.viewport().rect()
+        x_bounds = self._clamp_bounds(
+            graph.left(), graph.right(), viewport.width() / scale
+        )
+        y_bounds = self._clamp_bounds(
+            graph.top(), graph.bottom(), viewport.height() / scale
+        )
+        if current is not None:
+            x_bounds = (min(x_bounds[0], current.x()), max(x_bounds[1], current.x()))
+            y_bounds = (min(y_bounds[0], current.y()), max(y_bounds[1], current.y()))
         return QPointF(
-            self._clamp_axis(
-                origin.x(), graph.left(), graph.right(), viewport.width() / scale
-            ),
-            self._clamp_axis(
-                origin.y(), graph.top(), graph.bottom(), viewport.height() / scale
-            ),
+            min(max(origin.x(), x_bounds[0]), x_bounds[1]),
+            min(max(origin.y(), y_bounds[0]), y_bounds[1]),
         )
 
     @staticmethod
-    def _clamp_axis(
-        value: float, start: float, end: float, viewport_size: float
-    ) -> float:
+    def _clamp_bounds(
+        start: float, end: float, viewport_size: float
+    ) -> tuple[float, float]:
         visible = min(end - start, viewport_size * MIN_VISIBLE_SHARE)
-        return min(max(value, start + visible - viewport_size), end - visible)
+        return start + visible - viewport_size, end - visible
 
     def _scroll_by(self, dx: float, dy: float) -> None:
         """Сдвигает видимую область, удерживая граф в окне."""
@@ -415,11 +426,15 @@ class GraphView(QGraphicsView):
         origin = self.mapToScene(QPoint(0, 0))
         self._apply_origin(origin - QPointF(dx / scale, dy / scale))
 
-    def _apply_origin(self, target: QPointF) -> None:
-        """Ставит левый верхний угол окна в ``target`` с ограничением."""
+    def _apply_origin(self, target: QPointF, *, strict: bool = False) -> None:
+        """Ставит левый верхний угол окна в ``target`` с ограничением.
+
+        ``strict`` возвращает окно в допустимые пределы даже скачком; иначе
+        уже вышедшее за них окно остаётся на месте (см. ``_clamp_view_origin``).
+        """
         scale = max(self.zoom_factor, MIN_ZOOM)
         origin = self.mapToScene(QPoint(0, 0))
-        clamped = self._clamp_view_origin(target)
+        clamped = self._clamp_view_origin(target, current=None if strict else origin)
         shift_x = (origin.x() - clamped.x()) * scale
         shift_y = (origin.y() - clamped.y()) * scale
         self.horizontalScrollBar().setValue(
@@ -434,31 +449,6 @@ class GraphView(QGraphicsView):
         if not self._node_items:
             return
         self._apply_origin(self.mapToScene(QPoint(0, 0)))
-
-    def _align_after_zoom(self) -> None:
-        """Ставит граф по центру окна по горизонтали после зума.
-
-        Иначе граф остаётся сдвинутым в сторону, и перетаскивать его в одну
-        сторону можно заметно дальше, чем в другую. По вертикали граф
-        центрируется, только если целиком помещается в окно: иначе зум должен
-        оставаться на просматриваемом участке истории. Центрируются именно узлы
-        и рёбра: подписи ref могут быть длинными и смещать центр в сторону.
-        """
-        if not self._node_items:
-            return
-        graph = self._graph_rect
-        if graph.isEmpty():
-            return
-        scale = max(self.zoom_factor, MIN_ZOOM)
-        viewport = self.viewport().rect()
-        origin = self.mapToScene(QPoint(0, 0))
-        view_height = viewport.height() / scale
-        target = QPointF(
-            graph.center().x() - viewport.width() / scale / 2.0, origin.y()
-        )
-        if graph.height() < view_height:
-            target.setY(graph.center().y() - view_height / 2.0)
-        self._apply_origin(target)
 
     def _select_commit(self, item: _CommitNodeItem, *, emit: bool) -> None:
         self._scene.clearSelection()
@@ -482,6 +472,14 @@ class GraphView(QGraphicsView):
         event.accept()
 
     def _zoom_by(self, factor: float, *, anchor: QPoint | None = None) -> None:
+        """Меняет масштаб, оставляя точку под ``anchor`` на месте.
+
+        ``anchor`` — точка окна (для колеса — позиция курсора). С явной точкой
+        масштаб меняется вокруг неё: если она на видимой части графа (узлы,
+        рёбра, подписи), точка остаётся на месте; если вне содержимого, граф
+        удерживается в окне так же, как при перетаскивании. Без точки
+        масштабируется центр окна с прежним ограничением.
+        """
         if not self._node_items:
             return
         current = self.zoom_factor
@@ -492,17 +490,21 @@ class GraphView(QGraphicsView):
         if abs(ratio - 1.0) < 1e-9:
             return
 
+        explicit_anchor = anchor is not None
         if anchor is None:
             anchor = self.viewport().rect().center()
-        # Вертикаль держим под курсором, горизонталь выравнивается ниже.
-        anchor = QPoint(self.viewport().rect().center().x(), anchor.y())
         before = self.mapToScene(anchor)
+        on_content = explicit_anchor and self._content_rect.contains(before)
         self.scale(ratio, ratio)
         self._update_scene_rect()
+        # translate сдвигает сцену ровно настолько, чтобы точка под курсором
+        # осталась под ним; в отличие от centerOn он не округляет до пикселя.
         after = self.mapToScene(anchor)
         delta = after - before
         self.translate(delta.x(), delta.y())
-        self._align_after_zoom()
+        if not on_content:
+            # Точка вне содержимого: якорить нечего, зато граф нельзя потерять.
+            self._apply_origin(self.mapToScene(QPoint(0, 0)), strict=True)
 
     def _add_ref_labels(
         self,

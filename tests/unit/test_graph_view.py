@@ -285,8 +285,8 @@ def wheel_at(view: GraphView, cursor: QPoint, *, steps: int = 1) -> None:
     QApplication.processEvents()
 
 
-def test_wheel_zoom_keeps_history_position_under_cursor(qt_app) -> None:
-    """При зуме точка истории под курсором не уезжает по вертикали."""
+def test_wheel_zoom_keeps_the_point_under_the_cursor(qt_app) -> None:
+    """При зуме точка графа под курсором не уезжает ни по горизонтали, ни по вертикали."""
     view = show_view(make_dense_layout())
     for _ in range(5):
         view.zoom_in()
@@ -297,15 +297,30 @@ def test_wheel_zoom_keeps_history_position_under_cursor(qt_app) -> None:
     assert content.width() > visible.width()
     assert content.height() > visible.height()
 
-    cursor = view.mapFromScene(content.center())
+    cursor = view.mapFromScene(QPointF(120.0, 200.0))
     assert view.viewport().rect().contains(cursor)
-    before = view.mapToScene(cursor)
-    wheel_at(view, cursor)
-    after = view.mapToScene(cursor)
-    content_center = view.mapFromScene(content.center())
+    for _ in range(5):
+        anchor = view.mapToScene(cursor)
+        wheel_at(view, cursor)
+        moved = view.mapFromScene(anchor)
+        assert abs(moved.x() - cursor.x()) <= 1
+        assert abs(moved.y() - cursor.y()) <= 1
+    view.close()
 
-    assert abs(after.y() - before.y()) < 0.01
-    assert abs(content_center.x() - view.viewport().rect().center().x()) <= 1
+
+def test_wheel_zoom_keeps_the_cursor_anchor_at_max_zoom(qt_app) -> None:
+    """Даже на максимальном масштабе у крайней дорожки точка под курсором стоит на месте."""
+    view = show_view(make_dense_layout())
+    cursor = view.mapFromScene(QPointF(280.0, 280.0))
+    assert view.viewport().rect().contains(cursor)
+
+    anchor = view.mapToScene(cursor)
+    wheel_at(view, cursor, steps=25)
+    assert view.zoom_factor >= MAX_ZOOM - 1e-9
+
+    moved = view.mapFromScene(anchor)
+    assert abs(moved.x() - cursor.x()) <= 1
+    assert abs(moved.y() - cursor.y()) <= 1
     view.close()
 
 
@@ -539,72 +554,86 @@ def test_resizing_the_view_keeps_the_visible_center(qt_app) -> None:
     view.close()
 
 
-def test_wheel_zoom_centers_a_graph_that_fits_the_viewport(qt_app) -> None:
-    """Узкий граф после зума остаётся по центру, а не прижимается к краю."""
+def test_zoom_does_not_recenter_a_narrow_graph(qt_app) -> None:
+    """Узкий граф зумится под курсором, а не притягивается к центру окна."""
     view = show_view(make_narrow_layout())
-    wheel_at(view, QPoint(60, 140), steps=5)
+    cursor = view.mapFromScene(QPointF(0.0, 80.0))
+    assert view.viewport().rect().contains(cursor)
+    anchor = view.mapToScene(cursor)
 
-    content = view.scene().itemsBoundingRect()
-    visible = view.mapToScene(view.viewport().rect()).boundingRect()
-    assert content.width() < visible.width()
-    content_center = view.mapFromScene(content.center())
-    assert abs(content_center.x() - view.viewport().rect().center().x()) <= 1
+    wheel_at(view, cursor, steps=5)
+
+    moved = view.mapFromScene(anchor)
+    assert abs(moved.x() - cursor.x()) <= 1
+    assert abs(moved.y() - cursor.y()) <= 1
     view.close()
 
 
-def test_panning_stays_symmetric_after_zooming_a_narrow_graph(qt_app) -> None:
-    """После зума у края граф можно двигать влево и вправо одинаково."""
+def test_wheel_zoom_off_the_graph_keeps_it_in_view(qt_app) -> None:
+    """Если курсор вне графа, якорить нечего, но граф не должен уйти из окна."""
     view = show_view(make_narrow_layout())
-    wheel_at(view, QPoint(60, 140), steps=5)
+    cursor = QPoint(20, 20)
+    assert not _graph_rect(view).contains(view.mapToScene(cursor))
 
-    start = view.mapToScene(view.viewport().rect().center()).x()
-    for _ in range(30):
-        _drag(view, QPoint(-400, 0))
-    leftmost = view.mapToScene(view.viewport().rect().center()).x()
-    for _ in range(60):
-        _drag(view, QPoint(400, 0))
-    rightmost = view.mapToScene(view.viewport().rect().center()).x()
+    wheel_at(view, cursor, steps=8)
 
-    assert leftmost > start > rightmost
-    assert abs((leftmost - start) - (start - rightmost)) <= 1.0
-    view.close()
-
-
-def test_panning_stays_symmetric_after_zooming_a_wide_graph(qt_app) -> None:
-    """Даже если граф шире окна, после зума он по центру и ход симметричен."""
-    view = show_view(make_dense_layout())
-    for _ in range(5):
-        view.zoom_in()
-    wheel_at(view, QPoint(40, 120), steps=3)
-
-    content = view.scene().itemsBoundingRect()
-    visible = view.mapToScene(view.viewport().rect()).boundingRect()
-    assert content.width() > visible.width()
-
-    start = view.mapToScene(view.viewport().rect().center()).x()
-    for _ in range(30):
-        _drag(view, QPoint(-400, 0))
-    leftmost = view.mapToScene(view.viewport().rect().center()).x()
-    for _ in range(60):
-        _drag(view, QPoint(400, 0))
-    rightmost = view.mapToScene(view.viewport().rect().center()).x()
-
-    assert leftmost > start > rightmost
-    assert abs((leftmost - start) - (start - rightmost)) <= 1.0
-    view.close()
-
-
-def test_zoom_centers_the_graph_again_after_horizontal_panning(qt_app) -> None:
-    view = show_view(make_dense_layout())
-    for _ in range(5):
-        view.zoom_in()
-
-    _drag(view, QPoint(-200, 0))
-    wheel_at(view, QPoint(80, 120))
-
-    graph_center = view.mapFromScene(_graph_rect(view).center())
-    assert abs(graph_center.x() - view.viewport().rect().center().x()) <= 1
     _assert_graph_in_view(view)
+    view.close()
+
+
+def test_panning_stays_available_after_zooming_the_graph(qt_app) -> None:
+    """После зума под курсором граф по-прежнему можно двигать в обе стороны."""
+    view = show_view(make_narrow_layout())
+    cursor = view.mapFromScene(QPointF(0.0, 80.0))
+    wheel_at(view, cursor, steps=5)
+
+    center = view.viewport().rect().center()
+    start = view.mapToScene(center).x()
+    _drag(view, QPoint(-80, 0))
+    left = view.mapToScene(center).x()
+    _drag(view, QPoint(80, 0))
+    right = view.mapToScene(center).x()
+
+    assert left > start
+    assert right < left
+    _assert_graph_in_view(view)
+    view.close()
+
+
+def test_zoom_after_a_horizontal_pan_keeps_the_cursor_anchor(qt_app) -> None:
+    view = show_view(make_dense_layout())
+    for _ in range(5):
+        view.zoom_in()
+    _drag(view, QPoint(-200, 0))
+
+    cursor = view.mapFromScene(QPointF(280.0, 280.0))
+    assert view.viewport().rect().contains(cursor)
+    anchor = view.mapToScene(cursor)
+    wheel_at(view, cursor)
+
+    moved = view.mapFromScene(anchor)
+    assert abs(moved.x() - cursor.x()) <= 1
+    assert abs(moved.y() - cursor.y()) <= 1
+    _assert_graph_in_view(view)
+    view.close()
+
+
+def test_view_already_outside_the_pan_limits_is_not_pulled_back(qt_app) -> None:
+    """Зум у края графа может оставить окно за пределами перетаскивания.
+
+    Возвращать его скачком нельзя: разрешено только не уходить дальше.
+    """
+    view = show_view(make_dense_layout())
+    graph = _graph_rect(view)
+    scale = view.zoom_factor
+    viewport = view.viewport().rect()
+    _, high = view._clamp_bounds(
+        graph.left(), graph.right(), viewport.width() / scale
+    )
+    outside = QPointF(high + 100.0, graph.center().y())
+
+    assert view._clamp_view_origin(outside).x() < outside.x()
+    assert view._clamp_view_origin(outside, current=outside) == outside
     view.close()
 
 
@@ -621,6 +650,24 @@ def make_long_label_refs() -> dict[str, tuple[RefLabel, ...]]:
             ),
         ),
     }
+
+
+def test_zoom_over_a_ref_label_keeps_the_label_under_the_cursor(qt_app) -> None:
+    """Подпись ref — часть видимого графа, зум и над ней идёт под курсором."""
+    view = show_view(make_narrow_layout(), ref_labels=make_long_label_refs())
+    label_item = next(
+        item for item in view.scene().items() if hasattr(item, "label")
+    )
+    cursor = view.mapFromScene(label_item.sceneBoundingRect().center())
+    assert view.viewport().rect().contains(cursor)
+    anchor = view.mapToScene(cursor)
+
+    wheel_at(view, cursor, steps=3)
+
+    moved = view.mapFromScene(anchor)
+    assert abs(moved.x() - cursor.x()) <= 1
+    assert abs(moved.y() - cursor.y()) <= 1
+    view.close()
 
 
 def test_long_ref_labels_do_not_push_the_graph_out_of_view(qt_app) -> None:
