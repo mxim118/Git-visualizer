@@ -47,6 +47,27 @@ class UnsafeRepositoryError(RepositoryOpenError):
     """Git отказался работать с каталогом из-за владельца (safe.directory, «dubious ownership»)."""
 
 
+class UntrackedFileDeleteError(Exception):
+    """Не удалось удалить неотслеживаемый файл при отмене изменений.
+
+    Оборачивает ошибку файловой системы (``OSError``) из Infrastructure: у
+    неотслеживаемого файла нет Git-команды отмены, поэтому Presentation получает
+    отдельный тип, а не общий текст неожиданной ошибки.
+    """
+
+    def __init__(self, message: str, *, path: str, details: str = "") -> None:
+        super().__init__(message)
+        self.message = message
+        self.path = path
+        self._details = details
+
+    def technical_details(self) -> str:
+        lines = [self.message, f"Path: {self.path}"]
+        if self._details:
+            lines.append(self._details)
+        return "\n".join(lines)
+
+
 class RemoteOperationValidationError(ValueError):
     """Операция с remote отклонена до запуска Git: состояние не менялось."""
 

@@ -8,6 +8,7 @@ from git_visualizer.application.errors import (
     PathDoesNotExistError,
     PathIsNotDirectoryError,
     UnsafeRepositoryError,
+    UntrackedFileDeleteError,
 )
 from git_visualizer.infrastructure.git.git_errors import (
     GitCommandError,
@@ -65,6 +66,21 @@ def test_unsafe_repository_message_contains_safe_directory_command() -> None:
 
     assert "владелец" in message
     assert f'git config --global --add safe.directory "{PATH}"' in message
+
+
+def test_untracked_delete_error_explains_what_failed() -> None:
+    error = UntrackedFileDeleteError(
+        "Failed to delete untracked path: 'new.txt'",
+        path="new.txt",
+        details="PermissionError: Permission denied",
+    )
+
+    message = user_message(error)
+
+    assert "Не удалось удалить неотслеживаемый файл" in message
+    assert "«new.txt»" in message
+    assert "занят другой программой" in message
+    assert "PermissionError: Permission denied" in technical_details(error)
 
 
 def test_missing_git_message_contains_download_url() -> None:

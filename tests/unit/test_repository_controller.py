@@ -212,12 +212,14 @@ class FakeChangesService:
         self.changes_error = changes_error
         self.diff_error = diff_error
         self.operation_error = operation_error
+        self.after_discard: tuple[ChangedFile, ...] | None = None
         self.status_requests = 0
         self.diff_requests: list[tuple[str, bool]] = []
         self.stage_requests: list[ChangedFile] = []
         self.unstage_requests: list[ChangedFile] = []
         self.stage_all_requests = 0
         self.unstage_all_requests = 0
+        self.discard_requests: list[ChangedFile] = []
 
     def get_status(self, repository: Repository) -> tuple[ChangedFile, ...]:
         self.status_requests += 1
@@ -257,6 +259,14 @@ class FakeChangesService:
     def unstage_all(self, repository: Repository) -> None:
         self.unstage_all_requests += 1
         self._raise_operation_error()
+
+    def discard_file(
+        self, repository: Repository, changed_file: ChangedFile
+    ) -> None:
+        self.discard_requests.append(changed_file)
+        self._raise_operation_error()
+        if self.after_discard is not None:
+            self.changes = self.after_discard
 
 
 class FakeCommitService:
@@ -912,6 +922,40 @@ def test_changes_operation_failure_is_reported_and_status_is_reloaded(
     controller.wait_for_done()
 
 
+def test_discard_file_runs_in_background_and_refreshes_status(
+    qt_app, tmp_path: Path
+) -> None:
+    changed = ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED)
+    changes_service = FakeChangesService((changed,))
+    changes_service.after_discard = ()
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        changes_service=changes_service,
+    )
+    started: list[bool] = []
+    succeeded: list[bool] = []
+    failed: list[TaskFailure] = []
+    controller.changes_operation_started.connect(lambda: started.append(True))
+    controller.changes_operation_succeeded.connect(lambda: succeeded.append(True))
+    controller.changes_operation_failed.connect(failed.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert controller.discard_file(changed) is True
+
+    wait_until(qt_app, lambda: bool(succeeded))
+    wait_until(qt_app, lambda: changes_service.status_requests == 1)
+    assert controller.changes == ()
+    assert started == [True]
+    assert failed == []
+    assert changes_service.discard_requests == [changed]
+    # После отмены статус запрашивается заново: панель показывает фактическое
+    # состояние (файл исчез из списка изменений).
+    controller.wait_for_done()
+
+
 def test_changes_operations_require_open_repository(qt_app) -> None:
     controller, _, _, _ = build_controller(
         repository=make_repository(Path("repo"), head_commit=None)
@@ -922,6 +966,7 @@ def test_changes_operations_require_open_repository(qt_app) -> None:
     assert controller.unstage_file(changed) is False
     assert controller.stage_all() is False
     assert controller.unstage_all() is False
+    assert controller.discard_file(changed) is False
 
 
 # --- создание коммита через контроллер ---
@@ -1039,8 +1084,9 @@ def test_commit_is_blocked_while_another_index_operation_runs(
     wait_until(qt_app, started.is_set)
 
     changed = ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED)
-    # Коммит и stage/unstage делят ключ: индекс нельзя менять параллельно.
+    # Коммит и stage/unstage/discard делят ключ: индекс нельзя менять параллельно.
     assert controller.stage_file(changed) is False
+    assert controller.discard_file(changed) is False
     assert controller.commit("second") is False
 
     gate.set()

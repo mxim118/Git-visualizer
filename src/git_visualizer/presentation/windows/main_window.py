@@ -60,6 +60,7 @@ from git_visualizer.presentation.remote_texts import (
 )
 from git_visualizer.presentation.settings import AppSettings
 from git_visualizer.presentation.widgets.changes_panel import (
+    discard_confirmation,
     scope_details,
     scope_summary,
 )
@@ -77,12 +78,14 @@ _OPERATION_PROGRESS: dict[str, str] = {
     "unstage-file": "Удаление файла из индекса…",
     "stage-all": "Добавление всех изменений в индекс…",
     "unstage-all": "Удаление всех изменений из индекса…",
+    "discard-file": "Отмена изменений файла…",
 }
 _OPERATION_ERROR_TITLES: dict[str, str] = {
     "stage-file": "Не удалось добавить файл в индекс",
     "unstage-file": "Не удалось убрать файл из индекса",
     "stage-all": "Не удалось добавить изменения в индекс",
     "unstage-all": "Не удалось убрать изменения из индекса",
+    "discard-file": "Не удалось отменить изменения файла",
 }
 _BRANCH_PROGRESS: dict[str, str] = {
     "create": "Создание ветки…",
@@ -146,7 +149,7 @@ class MainWindow(QMainWindow):
         # Какая секция открыла панель: "commit" или "worktree".
         self._diff_overlay_kind: str | None = None
         # Текущая операция с индексом: "stage-file"/"unstage-file"/"stage-all"/
-        # "unstage-all". Нужна для заголовка ошибки и статусной строки.
+        # "unstage-all"/"discard-file". Нужна для заголовка ошибки и статусной строки.
         self._changes_operation: str | None = None
         # Diff какого файла обновить после операции: (путь, секция после операции).
         self._pending_worktree_diff_refresh: tuple[str, bool] | None = None
@@ -216,6 +219,9 @@ class MainWindow(QMainWindow):
         )
         self.workspace_page.changes_unstage_all_requested.connect(
             self._on_unstage_all_requested
+        )
+        self.workspace_page.changes_discard_requested.connect(
+            self._on_discard_requested
         )
         self.workspace_page.changes_commit_requested.connect(
             self._open_commit_overlay
@@ -788,6 +794,48 @@ class MainWindow(QMainWindow):
         box.setStandardButtons(
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _on_discard_requested(self, changed_file: ChangedFile) -> None:
+        """Подтверждает и запускает необратимую отмену изменений выбранного файла."""
+        repository = self._controller.repository
+        if repository is None or not changed_file.can_discard:
+            return
+        if not self._confirm_discard(
+            changed_file, has_head=not repository.is_unborn
+        ):
+            return
+
+        # Отменённый файл исчезнет из списков (или перестанет быть отслеживаемым):
+        # открытый diff и запомненное обновление относятся к прежнему состоянию.
+        self._hide_diff_overlay()
+        self._pending_worktree_diff_refresh = None
+        self.workspace_page.changes_panel.clear_selection()
+        self._changes_operation = "discard-file"
+        if not self._controller.discard_file(changed_file):
+            self._changes_operation = None
+            self.statusBar().showMessage(
+                "Другая операция с индексом уже выполняется…"
+            )
+
+    def _confirm_discard(
+        self, changed_file: ChangedFile, *, has_head: bool
+    ) -> bool:
+        """Показывает предупреждение о необратимости отмены изменений."""
+        confirmation = discard_confirmation(
+            changed_file, has_head=has_head
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(confirmation.title)
+        box.setText(confirmation.question)
+        box.setInformativeText(confirmation.warning)
+        box.setDetailedText(confirmation.details)
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        # По умолчанию — отмена: потерять изменения случайным Enter нельзя.
         box.setDefaultButton(QMessageBox.StandardButton.No)
         return box.exec() == QMessageBox.StandardButton.Yes
 

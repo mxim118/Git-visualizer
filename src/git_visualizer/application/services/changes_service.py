@@ -1,9 +1,9 @@
-"""Сценарии состояния рабочей директории: статус, diff staged/unstaged и stage/unstage.
+"""Сценарии состояния рабочей директории: статус, diff staged/unstaged, stage/unstage и Discard Changes.
 
 Сервис получает ``git status`` и diff одного файла отдельно для индекса (staged) и
-рабочей директории (unstaged), а также добавляет файлы в индекс и убирает их оттуда.
-Ограничение размера diff задаётся здесь, в Application; презентация только рисует
-готовый ``Diff``.
+рабочей директории (unstaged), а также добавляет файлы в индекс, убирает их оттуда
+и отменяет незакоммиченные изменения выбранного файла. Ограничение размера diff
+задаётся здесь, в Application; презентация только рисует готовый ``Diff``.
 
 Один файл может иметь оба изменения (``MM``/``AM``): ``ChangedFile`` хранит их
 независимо. Неотслеживаемый файл diff не имеет (Git о нём ничего не знает до
@@ -20,6 +20,7 @@ Stage/Unstage не отменяют изменения рабочей дирек
 
 from collections.abc import Sequence
 
+from git_visualizer.application.errors import UntrackedFileDeleteError
 from git_visualizer.application.ports import GitRepositoryFactory
 from git_visualizer.application.services.diff_service import DEFAULT_MAX_DIFF_CHARS
 from git_visualizer.domain.models import ChangedFile, Diff, Repository
@@ -140,6 +141,41 @@ class ChangesService:
             git.unstage_files(_bulk_paths(staged))
             return
         git.unstage_all()
+
+    def discard_file(self, repository: Repository, changed_file: ChangedFile) -> None:
+        """Отменяет все незакоммиченные изменения выбранного файла.
+
+        Отслеживаемый файл восстанавливается к ``HEAD`` сразу в индексе и рабочей
+        директории; при переименовании/копировании передаются оба пути, иначе
+        Git оставил бы половину изменения. Неотслеживаемый файл удаляется с диска:
+        Git не хранит его содержимое, и восстановить файл из коммита невозможно.
+        Другие файлы репозитория не затрагиваются.
+
+        :raises ValueError: файл конфликтует или не имеет незакоммиченных изменений.
+        :raises GitError: команда Git завершилась с ошибкой (пробрасывается без изменений).
+        :raises UntrackedFileDeleteError: файловую систему не удалось изменить
+            (нет прав, файл занят другой программой и т. п.).
+        """
+        if changed_file.is_conflicted:
+            raise ValueError(
+                f"Conflicted file cannot be discarded: {changed_file.path!r}"
+            )
+        if not changed_file.can_discard:
+            raise ValueError(
+                f"File has no changes to discard: {changed_file.path!r}"
+            )
+        git = self._git_repository_factory(repository.path)
+        if changed_file.is_untracked:
+            try:
+                git.delete_untracked_path(changed_file.path)
+            except OSError as error:
+                raise UntrackedFileDeleteError(
+                    f"Failed to delete untracked path: {changed_file.path!r}",
+                    path=changed_file.path,
+                    details=str(error),
+                ) from error
+            return
+        git.restore_files(_operation_paths(changed_file))
 
     def get_file_diff(
         self,

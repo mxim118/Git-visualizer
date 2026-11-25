@@ -282,6 +282,24 @@ def test_can_stage_depends_on_worktree_change_or_untracked_state() -> None:
     assert not ChangedFile(path="clean.txt").can_stage
 
 
+def test_can_discard_covers_tracked_and_untracked_changes() -> None:
+    assert ChangedFile(
+        path="modified.txt", unstaged_change=FileChangeType.MODIFIED
+    ).can_discard
+    assert ChangedFile(
+        path="staged.txt", staged_change=FileChangeType.ADDED
+    ).can_discard
+    assert ChangedFile(
+        path="both.txt",
+        staged_change=FileChangeType.ADDED,
+        unstaged_change=FileChangeType.MODIFIED,
+    ).can_discard
+    assert ChangedFile(path="new.txt", is_untracked=True).can_discard
+    # Конфликт не отменяется: это было бы разрешение конфликта (вне MVP).
+    assert not ChangedFile(path="conflict.txt", is_conflicted=True).can_discard
+    assert not ChangedFile(path="clean.txt").can_discard
+
+
 def test_changed_file_defaults() -> None:
     file = ChangedFile(path="a.py")
 

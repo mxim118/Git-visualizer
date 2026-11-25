@@ -50,6 +50,19 @@ class ChangedFile:
         """
         return not self.is_conflicted and (self.is_unstaged or self.is_untracked)
 
+    @property
+    def can_discard(self) -> bool:
+        """У файла можно отменить незакоммиченные изменения.
+
+        Отмена затрагивает индекс и рабочую директорию (``git restore`` из ``HEAD``),
+        а у неотслеживаемого файла — удаляет сам файл. Конфликтующий файл сюда не
+        входит: его отмена означала бы разрешение конфликта, а разрешение конфликтов
+        в MVP не реализовано. Чистый файл (без изменений) отменять нечего.
+        """
+        return not self.is_conflicted and (
+            self.is_staged or self.is_unstaged or self.is_untracked
+        )
+
 
 @dataclass(frozen=True, kw_only=True)
 class FileChange:

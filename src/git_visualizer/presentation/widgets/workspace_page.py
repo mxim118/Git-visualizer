@@ -47,7 +47,8 @@ class WorkspacePage(QWidget):
     ``commit_selected``; выбор файла коммита сохраняется в ``selected_file`` и
     сообщается сигналом ``file_selected``. Выбор файла в Changes сообщается
     сигналом ``worktree_file_selected`` вместе с секцией (staged/unstaged), а
-    запросы Stage/Unstage, массовых действий и коммита пересылаются из панели
+    запросы Stage/Unstage, массовых действий, необратимой отмены изменений и
+    коммита пересылаются из панели
     Changes. Панель веток сообщает выбранный коммит (для создания от него) и
     запросы создания/переключения веток сигналами ``branch_create_requested`` и
     ``branch_switch_requested``.
@@ -72,6 +73,7 @@ class WorkspacePage(QWidget):
     changes_unstage_requested = Signal(object)  # ChangedFile
     changes_stage_all_requested = Signal()
     changes_unstage_all_requested = Signal()
+    changes_discard_requested = Signal(object)  # ChangedFile
     changes_commit_requested = Signal()  # открыть окно сообщения коммита
     branch_create_requested = Signal(str, object)  # имя, hash коммита или None
     branch_switch_requested = Signal(str)  # имя локальной ветки
@@ -161,6 +163,9 @@ class WorkspacePage(QWidget):
         )
         self.changes_panel.unstage_all_requested.connect(
             self.changes_unstage_all_requested
+        )
+        self.changes_panel.discard_requested.connect(
+            self.changes_discard_requested
         )
         self.changes_panel.commit_requested.connect(
             self.changes_commit_requested

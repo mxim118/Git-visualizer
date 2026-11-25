@@ -4,12 +4,15 @@
 с рабочим каталогом ``path``. Реализованы открытие, история, ветки (включая проверку
 имени, создание и переключение), remote и сетевые операции (fetch, pull только с
 ``--ff-only``, push в upstream и первый push с ``-u``), статус рабочей директории,
-stage/unstage (в том числе массовые), diff рабочей директории, список изменённых файлов
+stage/unstage (в том числе массовые), diff рабочей директории, отмену незакоммиченных
+изменений выбранного файла (``git restore --source=HEAD --staged --worktree`` и
+удаление неотслеживаемого пути), список изменённых файлов
 коммита, diff одного файла коммита и создание коммита из индекса.
 
 Минимальная версия Git: ``switch`` и ``restore`` требуют Git 2.23+.
 """
 
+import shutil
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -253,6 +256,38 @@ def build_unstage_all_arguments(*, has_head: bool) -> list[str]:
     if has_head:
         return ["restore", "--staged", "--", ":/"]
     return ["rm", "-r", "--cached", "--force", "-q", "--", ":/"]
+
+
+def build_restore_arguments(*, paths: Sequence[str], has_head: bool) -> list[str]:
+    """Аргументы отмены всех незакоммиченных изменений выбранных путей.
+
+    При наличии ``HEAD`` — ``git restore --source=HEAD --staged --worktree``:
+    файл возвращается к последнему коммиту сразу в индексе и рабочей директории.
+    Staged-добавленный файл при этом удаляется (в ``HEAD`` его нет), а
+    staged-удалённый — восстанавливается. Без коммитов восстанавливать нечего:
+    ``git rm --cached --force -q`` убирает путь из индекса, оставляя содержимое
+    рабочей директории неотслеживаемым — данные, которые нигде не закоммичены,
+    не теряются. ``--force`` нужен, если содержимое индекса и рабочей директории
+    различаются; ``--cached`` не трогает файл на диске.
+
+    ``--source=HEAD`` и ``restore`` требуют Git 2.23+ (минимальная версия проекта).
+    Пути передаются списком после ``--``, ``--literal-pathspecs`` не даёт
+    трактовать имя файла как wildcard/magic. Для переименования вызывающий
+    передаёт оба пути, иначе Git восстановит только половину изменения.
+    """
+    if not paths:
+        raise ValueError("At least one path is required to discard changes")
+    if has_head:
+        return [
+            "--literal-pathspecs",
+            "restore",
+            "--source=HEAD",
+            "--staged",
+            "--worktree",
+            "--",
+            *paths,
+        ]
+    return ["--literal-pathspecs", "rm", "--cached", "--force", "-q", "--", *paths]
 
 
 def build_commit_arguments() -> list[str]:
@@ -737,6 +772,63 @@ class GitRepository:
         :raises GitError: команда Git завершилась с ошибкой.
         """
         self._run(build_unstage_all_arguments(has_head=self.has_head()))
+
+    def restore_files(self, paths: Sequence[str]) -> None:
+        """Восстанавливает выбранные пути к ``HEAD`` в индексе и рабочей директории.
+
+        Команда выбирается по наличию ``HEAD`` (см. ``build_restore_arguments``).
+        Без коммитов рабочая директория не меняется: путь только убирается из
+        индекса. Затрагиваются исключительно переданные пути.
+
+        :raises ValueError: список путей пуст.
+        :raises GitError: команда Git завершилась с ошибкой.
+        """
+        self._run(
+            build_restore_arguments(paths=paths, has_head=self.has_head())
+        )
+
+    def delete_untracked_path(self, path: str) -> None:
+        """Удаляет неотслеживаемый файл или каталог из рабочей директории.
+
+        У неотслеживаемого пути нет Git-команды отмены: ``git restore`` о нём
+        ничего не знает, а ``git clean`` удаляет файлы по пути, но запрещён
+        правилами проекта как разрушительная команда. Поэтому удаление выполняет
+        файловая система — строго внутри рабочей директории. Путь, выходящий за
+        её пределы (абсолютный, ``..`` или через символическую ссылку), отклоняется
+        ``ValueError``. Каталог (запись ``git status`` с завершающим ``/``)
+        удаляется вместе с содержимым. Уже отсутствующий путь — не ошибка:
+        конечное состояние достигнуто.
+
+        :raises ValueError: путь пуст, абсолютный или выходит за рабочую директорию.
+        :raises OSError: файл или каталог удалить не удалось.
+        """
+        target = self._untracked_target(path)
+        if not target.exists() and not target.is_symlink():
+            return
+        if target.is_symlink() or not target.is_dir():
+            target.unlink()
+            return
+        shutil.rmtree(target)
+
+    def _untracked_target(self, path: str) -> Path:
+        """Путь неотслеживаемой записи внутри рабочей директории (без выхода наружу).
+
+        ``resolve()`` применяется только к родительскому каталогу: последний
+        компонент может быть символической ссылкой, и удалять нужно саму ссылку,
+        а не то, на что она указывает.
+        """
+        relative = Path(path)
+        if relative.is_absolute() or relative.drive:
+            raise ValueError(f"Untracked path must be relative: {path!r}")
+        parts = relative.parts
+        if not parts or any(part in ("", ".", "..") for part in parts):
+            raise ValueError(f"Untracked path escapes the work tree: {path!r}")
+
+        root = self.get_toplevel().resolve()
+        parent = root.joinpath(*parts).parent.resolve()
+        if parent != root and not parent.is_relative_to(root):
+            raise ValueError(f"Untracked path escapes the work tree: {path!r}")
+        return parent / parts[-1]
 
     def commit(self, message: str) -> None:
         """Создаёт коммит из индекса, передавая сообщение через stdin.

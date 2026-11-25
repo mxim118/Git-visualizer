@@ -208,12 +208,14 @@ class FakeChangesService:
         self.after_unstage: tuple[ChangedFile, ...] | None = None
         self.after_stage_all: tuple[ChangedFile, ...] | None = None
         self.after_unstage_all: tuple[ChangedFile, ...] | None = None
+        self.after_discard: tuple[ChangedFile, ...] | None = None
         self.status_requests = 0
         self.diff_requests: list[tuple[str, bool]] = []
         self.stage_requests: list[ChangedFile] = []
         self.unstage_requests: list[ChangedFile] = []
         self.stage_all_requests = 0
         self.unstage_all_requests = 0
+        self.discard_requests: list[ChangedFile] = []
 
     def get_status(self, repository: Repository) -> tuple[ChangedFile, ...]:
         self.status_requests += 1
@@ -261,6 +263,14 @@ class FakeChangesService:
         self._raise_operation_error()
         if self.after_unstage_all is not None:
             self.changes = self.after_unstage_all
+
+    def discard_file(
+        self, repository: Repository, changed_file: ChangedFile
+    ) -> None:
+        self.discard_requests.append(changed_file)
+        self._raise_operation_error()
+        if self.after_discard is not None:
+            self.changes = self.after_discard
 
 
 class FakeCommitService:
@@ -1508,6 +1518,139 @@ def test_stage_operation_failure_is_reported_and_status_is_refreshed(
         assert shown[0][1] is error
         assert window.diff_overlay.isHidden()
         assert not panel.is_busy
+    finally:
+        window.close()
+
+
+# --- Discard Changes через главное окно ---
+
+
+def test_discard_tracked_file_confirms_warns_and_refreshes(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changed = ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED)
+    other = ChangedFile(path="other.txt", unstaged_change=FileChangeType.MODIFIED)
+    diff = Diff(path="file.txt", text="@@ -1 +1 @@\n-old\n+new\n")
+    changes_service = FakeChangesService((changed, other), diff)
+    changes_service.after_discard = (other,)
+
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == (changed, other))
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        panel.diff_button.click()
+        wait_until(qt_app, lambda: not window.diff_overlay.isHidden())
+
+        confirmations: list[tuple[ChangedFile, bool]] = []
+
+        def confirm(changed_file, *, has_head):
+            confirmations.append((changed_file, has_head))
+            return True
+
+        monkeypatch.setattr(window, "_confirm_discard", confirm)
+
+        panel.discard_button.click()
+
+        wait_until(qt_app, lambda: panel.changes == (other,))
+        # Подтверждение показано до запуска Git, для репозитория с HEAD.
+        assert confirmations == [(changed, True)]
+        assert changes_service.discard_requests == [changed]
+        # Открытый diff относился к старому содержимому файла.
+        assert window.diff_overlay.isHidden()
+        assert window._changes_operation is None
+        assert panel.selected_file is None
+        assert not panel.is_busy
+    finally:
+        window.close()
+
+
+def test_discard_cancel_does_not_run_git(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changed = ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED)
+    changes_service = FakeChangesService((changed,))
+
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == (changed,))
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        monkeypatch.setattr(window, "_confirm_discard", lambda *args, **kwargs: False)
+
+        panel.discard_button.click()
+
+        assert changes_service.discard_requests == []
+        assert panel.changes == (changed,)
+        assert panel.selected_file == changed
+    finally:
+        window.close()
+
+
+def test_discard_untracked_file_uses_separate_confirmation(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    untracked = ChangedFile(path="untracked.txt", is_untracked=True)
+    changes_service = FakeChangesService((untracked,))
+    changes_service.after_discard = ()
+
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    try:
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: panel.changes == (untracked,))
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        confirmations: list[tuple[ChangedFile, bool]] = []
+
+        def confirm(changed_file, *, has_head):
+            confirmations.append((changed_file, has_head))
+            return True
+
+        monkeypatch.setattr(window, "_confirm_discard", confirm)
+
+        panel.discard_button.click()
+
+        wait_until(qt_app, lambda: panel.is_clean)
+        # Для untracked готовится отдельное подтверждение удаления самого файла.
+        assert confirmations == [(untracked, True)]
+        assert changes_service.discard_requests == [untracked]
+    finally:
+        window.close()
+
+
+def test_discard_operation_failure_is_reported_and_status_is_refreshed(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changed = ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED)
+    error = GitCommandError(128, command=("git", "restore"), stderr="fatal")
+    changes_service = FakeChangesService((changed,), operation_error=error)
+
+    window, _ = open_workspace_with_changes(
+        qt_app, tmp_path, monkeypatch, changes_service
+    )
+    shown: list[tuple[str, BaseException]] = []
+    try:
+        panel = window.workspace_page.changes_panel
+        monkeypatch.setattr(
+            window, "_show_error", lambda title, exc: shown.append((title, exc))
+        )
+        monkeypatch.setattr(window, "_confirm_discard", lambda *args, **kwargs: True)
+        wait_until(qt_app, lambda: panel.changes == (changed,))
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+
+        panel.discard_button.click()
+
+        wait_until(qt_app, lambda: bool(shown))
+        assert shown[0][0] == "Не удалось отменить изменения файла"
+        assert shown[0][1] is error
+        assert window.diff_overlay.isHidden()
+        assert not panel.is_busy
+        assert window._changes_operation is None
     finally:
         window.close()
 

@@ -531,3 +531,193 @@ def test_stage_treats_pathspec_characters_literally(
     # Без --literal-pathspecs Git принял бы "[ab].txt" за шаблон и добавил a.txt.
     assert changes["a.txt"].is_untracked is True
     assert changes["a.txt"].staged_change is None
+
+
+# --- Discard Changes через реальный Git ---
+
+
+def test_discard_restores_staged_and_unstaged_changes_to_head(
+    make_repo: MakeRepo, git: Git
+) -> None:
+    path = make_repo("discard-tracked", commits=1)
+    file = path / "file0.txt"
+    file.write_text("first\n", encoding="utf-8")
+    git(path, "add", "--", "file0.txt")
+    file.write_text("second\n", encoding="utf-8")
+    repository, service = load(path)
+    change = {item.path: item for item in service.get_status(repository)}["file0.txt"]
+    assert change.staged_change is FileChangeType.MODIFIED
+    assert change.unstaged_change is FileChangeType.MODIFIED
+
+    service.discard_file(repository, change)
+
+    assert file.read_text(encoding="utf-8") == "0\n"
+    assert service.get_status(repository) == ()
+
+
+def test_discard_restores_deleted_file(make_repo: MakeRepo, git: Git) -> None:
+    path = make_repo("discard-deleted", commits=1)
+    file = path / "file0.txt"
+    file.unlink()
+    git(path, "add", "--", "file0.txt")
+    repository, service = load(path)
+    change = {item.path: item for item in service.get_status(repository)}["file0.txt"]
+    assert change.staged_change is FileChangeType.DELETED
+    assert change.unstaged_change is None
+
+    service.discard_file(repository, change)
+
+    assert file.read_text(encoding="utf-8") == "0\n"
+    assert service.get_status(repository) == ()
+
+
+def test_discard_staged_new_file_removes_it(make_repo: MakeRepo, git: Git) -> None:
+    path = make_repo("discard-added", commits=1)
+    file = path / "новый файл.txt"
+    file.write_text("new content\n", encoding="utf-8")
+    git(path, "add", "--", file.name)
+    repository, service = load(path)
+    change = {item.path: item for item in service.get_status(repository)}[file.name]
+    assert change.staged_change is FileChangeType.ADDED
+
+    service.discard_file(repository, change)
+
+    # Файла нет в HEAD: восстановление к коммиту означает удаление.
+    assert not file.exists()
+    assert service.get_status(repository) == ()
+
+
+def test_discard_rename_restores_old_name(make_repo: MakeRepo, git: Git) -> None:
+    path = make_repo("discard-rename", commits=1)
+    old = path / "старое имя.txt"
+    new = path / "новое имя.txt"
+    old.write_text("content\n", encoding="utf-8")
+    commit(git, path, "add rename source")
+    git(path, "mv", "--", old.name, new.name)
+    repository, service = load(path)
+    change = {item.path: item for item in service.get_status(repository)}[new.name]
+    assert change.staged_change is FileChangeType.RENAMED
+    assert change.old_path == old.name
+
+    service.discard_file(repository, change)
+
+    assert old.read_text(encoding="utf-8") == "content\n"
+    assert not new.exists()
+    assert service.get_status(repository) == ()
+
+
+def test_discard_touches_only_the_selected_tracked_file(
+    make_repo: MakeRepo, git: Git
+) -> None:
+    path = make_repo("discard-selected-tracked", commits=1)
+    first = path / "first.txt"
+    second = path / "second.txt"
+    first.write_text("base first\n", encoding="utf-8")
+    second.write_text("base second\n", encoding="utf-8")
+    commit(git, path, "add both")
+    first.write_text("changed first\n", encoding="utf-8")
+    second.write_text("changed second\n", encoding="utf-8")
+    repository, service = load(path)
+    change = {item.path: item for item in service.get_status(repository)}["first.txt"]
+
+    service.discard_file(repository, change)
+
+    assert first.read_text(encoding="utf-8") == "base first\n"
+    assert second.read_text(encoding="utf-8") == "changed second\n"
+    changes = {item.path: item for item in service.get_status(repository)}
+    assert list(changes) == ["second.txt"]
+    assert changes["second.txt"].unstaged_change is FileChangeType.MODIFIED
+
+
+def test_discard_untracked_file_deletes_only_that_file(
+    make_repo: MakeRepo, git: Git
+) -> None:
+    path = make_repo("discard-untracked", commits=1)
+    tracked = path / "file0.txt"
+    tracked.write_text("changed\n", encoding="utf-8")
+    removed = path / "remove me.txt"
+    removed.write_text("remove\n", encoding="utf-8")
+    kept = path / "keep me.txt"
+    kept.write_text("keep\n", encoding="utf-8")
+    repository, service = load(path)
+    change = {item.path: item for item in service.get_status(repository)}["remove me.txt"]
+    assert change.is_untracked
+
+    service.discard_file(repository, change)
+
+    assert not removed.exists()
+    assert kept.read_text(encoding="utf-8") == "keep\n"
+    assert tracked.read_text(encoding="utf-8") == "changed\n"
+    changes = {item.path: item for item in service.get_status(repository)}
+    assert sorted(changes) == ["file0.txt", "keep me.txt"]
+    assert changes["keep me.txt"].is_untracked
+    assert changes["file0.txt"].unstaged_change is FileChangeType.MODIFIED
+
+
+def test_discard_untracked_directory_removes_it_with_contents(
+    make_repo: MakeRepo
+) -> None:
+    path = make_repo("discard-untracked-dir", commits=1)
+    directory = path / "новая папка"
+    directory.mkdir()
+    (directory / "file.txt").write_text("new\n", encoding="utf-8")
+    repository, service = load(path)
+    change = {item.path: item for item in service.get_status(repository)}[
+        "новая папка/"
+    ]
+    assert change.is_untracked
+
+    service.discard_file(repository, change)
+
+    assert not directory.exists()
+    assert service.get_status(repository) == ()
+
+
+def test_discard_in_repository_without_commits_keeps_file(
+    make_repo: MakeRepo, git: Git
+) -> None:
+    path = make_repo("discard-unborn", commits=0)
+    file = path / "первый файл.txt"
+    file.write_text("content\n", encoding="utf-8")
+    git(path, "add", "--", file.name)
+    repository, service = load(path)
+    change = {item.path: item for item in service.get_status(repository)}[file.name]
+    assert change.staged_change is FileChangeType.ADDED
+
+    service.discard_file(repository, change)
+
+    # Восстанавливать из HEAD нечего: содержимое остаётся в рабочей директории.
+    assert file.read_text(encoding="utf-8") == "content\n"
+    changes = {item.path: item for item in service.get_status(repository)}
+    assert changes[file.name].is_untracked is True
+    assert changes[file.name].staged_change is None
+
+
+def test_discard_conflicted_file_is_rejected(make_repo: MakeRepo, git: Git) -> None:
+    path = make_repo("discard-conflict", commits=0)
+    file = path / "conflict.txt"
+    file.write_text("base\n", encoding="utf-8")
+    commit(git, path, "base")
+    git(path, "switch", "-q", "-c", "feature")
+    file.write_text("feature\n", encoding="utf-8")
+    commit(git, path, "feature")
+    git(path, "switch", "-q", "main")
+    file.write_text("main\n", encoding="utf-8")
+    commit(git, path, "main")
+    with pytest.raises(GitCommandError):
+        git(
+            path,
+            "-c", "user.name=Test",
+            "-c", "user.email=test@example.com",
+            "-c", "commit.gpgsign=false",
+            "merge", "feature",
+        )
+    repository, service = load(path)
+    change = {item.path: item for item in service.get_status(repository)}["conflict.txt"]
+
+    with pytest.raises(ValueError):
+        service.discard_file(repository, change)
+
+    # Разрешение конфликтов в MVP не входит: файл и его стадии не тронуты.
+    assert "<<<<<<<" in file.read_text(encoding="utf-8")
+    assert status_by_path(path)["conflict.txt"].is_conflicted

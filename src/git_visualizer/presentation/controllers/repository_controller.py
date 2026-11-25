@@ -356,6 +356,20 @@ class RepositoryController(QObject):
             "unstage-all", self._changes_service.unstage_all
         )
 
+    def discard_file(self, changed_file: ChangedFile) -> bool:
+        """Отменяет незакоммиченные изменения выбранного файла в фоновой задаче.
+
+        Операция необратима; подтверждение запрашивает MainWindow. Делит ключ с
+        stage/unstage, коммитом и сменой HEAD, поэтому не выполняется параллельно
+        с ними. После успеха или ошибки статус запрашивается заново.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или другая операция уже выполняется.
+        """
+        return self._submit_changes_operation(
+            "discard-file", self._changes_service.discard_file, changed_file
+        )
+
     def commit(self, message: str) -> bool:
         """Создаёт коммит из staged changes в фоновой задаче.
 

@@ -8,6 +8,7 @@ from git_visualizer.domain.enums import FileChangeType
 from git_visualizer.domain.models import ChangedFile
 from git_visualizer.presentation.widgets.changes_panel import (
     ChangesPanel,
+    discard_confirmation,
     scope_details,
     scope_summary,
 )
@@ -207,6 +208,7 @@ def test_actions_are_disabled_until_changes_are_loaded(qt_app) -> None:
         panel.unstage_button,
         panel.stage_all_button,
         panel.unstage_all_button,
+        panel.discard_button,
         panel.commit_button,
     ):
         assert not button.isEnabled()
@@ -309,6 +311,7 @@ def test_busy_state_disables_all_actions(qt_app) -> None:
     panel.set_changes(CHANGES)
     panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
     assert panel.stage_button.isEnabled()
+    assert panel.discard_button.isEnabled()
     assert panel.commit_button.isEnabled()
 
     panel.set_busy(True)
@@ -317,6 +320,7 @@ def test_busy_state_disables_all_actions(qt_app) -> None:
     assert not panel.stage_button.isEnabled()
     assert not panel.stage_all_button.isEnabled()
     assert not panel.unstage_all_button.isEnabled()
+    assert not panel.discard_button.isEnabled()
     assert not panel.commit_button.isEnabled()
     assert "операция" in panel.commit_button.toolTip()
 
@@ -325,6 +329,7 @@ def test_busy_state_disables_all_actions(qt_app) -> None:
     assert panel.diff_button.isEnabled()
     assert panel.stage_button.isEnabled()
     assert panel.stage_all_button.isEnabled()
+    assert panel.discard_button.isEnabled()
     assert panel.commit_button.isEnabled()
 
 
@@ -452,3 +457,131 @@ def test_clear_disables_commit_button(qt_app) -> None:
     panel.clear()
 
     assert not panel.commit_button.isEnabled()
+
+
+# --- Discard Changes: кнопка выбранного файла и подтверждение ---
+
+
+def test_discard_button_works_for_both_sections_and_emits_request(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(CHANGES)
+    requests: list[ChangedFile] = []
+    panel.discard_requested.connect(requests.append)
+
+    assert panel.discard_button.text() == "Discard Changes"
+    assert not panel.discard_button.isEnabled()
+    # Кнопка одна (в заголовке), а не по кнопке в каждой секции.
+    assert not hasattr(panel, "staged_discard_button")
+
+    panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+    assert panel.discard_button.isEnabled()
+    panel.discard_button.click()
+    assert requests == [CHANGES[1]]
+
+    panel.staged_tree.setCurrentItem(panel.staged_tree.topLevelItem(0))
+    assert panel.discard_button.isEnabled()
+    panel.discard_button.click()
+    assert requests == [CHANGES[1], CHANGES[0]]
+
+
+def test_discard_is_available_for_untracked_but_not_conflicted_file(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(CHANGES)
+    requests: list[ChangedFile] = []
+    panel.discard_requested.connect(requests.append)
+
+    # Unstaged: unstaged.txt, both.txt, untracked.txt, conflict.txt.
+    panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(2))
+    assert panel.selected_file is CHANGES[4]
+    assert panel.discard_button.isEnabled()
+
+    panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(3))
+    assert panel.selected_file is CHANGES[5]
+    # Конфликт не «отменяется»: это было бы разрешение конфликта (вне MVP).
+    assert not panel.discard_button.isEnabled()
+    panel.discard_button.click()
+    assert requests == []
+
+
+def test_discard_button_is_left_of_diff_and_commit_in_header(qt_app) -> None:
+    panel = ChangesPanel()
+    panel.set_changes(CHANGES)
+    panel.resize(1400, 400)
+    panel.show()
+    qt_app.processEvents()
+
+    assert panel.discard_button.x() < panel.diff_button.x()
+    assert panel.discard_button.x() < panel.commit_button.x()
+    assert panel.discard_button.geometry().center().y() == (
+        panel.diff_button.geometry().center().y()
+    )
+    assert panel.discard_button.geometry().center().y() == (
+        panel.commit_button.geometry().center().y()
+    )
+    panel.close()
+
+
+def test_discard_confirmation_for_tracked_file_is_irreversible() -> None:
+    tracked = ChangedFile(
+        path="src/файл.py", unstaged_change=FileChangeType.MODIFIED
+    )
+
+    confirmation = discard_confirmation(tracked, has_head=True)
+
+    assert confirmation.title == "Discard Changes"
+    assert "src/файл.py" in confirmation.question
+    assert "необратима" in confirmation.warning
+    assert "HEAD" in confirmation.warning
+    assert "git restore" in confirmation.details
+
+
+def test_discard_confirmation_for_staged_new_file_mentions_deletion() -> None:
+    added = ChangedFile(path="новый.txt", staged_change=FileChangeType.ADDED)
+
+    confirmation = discard_confirmation(added, has_head=True)
+
+    assert "нет в последнем коммите" in confirmation.warning
+    assert "удалён из индекса и рабочей директории" in confirmation.warning
+
+
+def test_discard_confirmation_without_commits_keeps_file_in_worktree() -> None:
+    staged = ChangedFile(path="первый.txt", staged_change=FileChangeType.ADDED)
+
+    confirmation = discard_confirmation(staged, has_head=False)
+
+    assert "нет коммитов" in confirmation.warning
+    assert "неотслеживаемый" in confirmation.warning
+
+
+def test_discard_confirmation_for_untracked_file_and_directory() -> None:
+    file = ChangedFile(path="заметки.txt", is_untracked=True)
+
+    file_confirmation = discard_confirmation(file, has_head=True)
+
+    # Для untracked отдельное подтверждение: удаляется сам файл.
+    assert file_confirmation.title == "Discard Changes — удаление"
+    assert "неотслеживаемый файл" in file_confirmation.question
+    assert "необратима" in file_confirmation.warning
+    assert "удалён с диска" in file_confirmation.warning
+
+    directory = ChangedFile(path="new dir/", is_untracked=True)
+
+    directory_confirmation = discard_confirmation(directory, has_head=True)
+
+    assert "неотслеживаемый каталог" in directory_confirmation.question
+    assert "«new dir»" in directory_confirmation.question
+    assert "всё его содержимое" in directory_confirmation.warning
+
+
+def test_discard_confirmation_for_rename_shows_both_paths() -> None:
+    renamed = ChangedFile(
+        path="новый.txt",
+        old_path="старый.txt",
+        staged_change=FileChangeType.RENAMED,
+    )
+
+    confirmation = discard_confirmation(renamed, has_head=True)
+
+    assert "старый.txt → новый.txt" in confirmation.question
+    assert "старый.txt" in confirmation.details
+    assert "новый.txt" in confirmation.details

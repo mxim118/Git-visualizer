@@ -14,6 +14,7 @@ from git_visualizer.application.errors import (
     PathIsNotDirectoryError,
     RepositoryOpenError,
     UnsafeRepositoryError,
+    UntrackedFileDeleteError,
 )
 from git_visualizer.infrastructure.git.git_errors import (
     GitCommandError,
@@ -108,6 +109,12 @@ def user_message(error: BaseException) -> str:
         return unsafe_repository_message(error)
     if isinstance(error, RepositoryOpenError):
         return f"Не удалось открыть репозиторий: «{error.path}»."
+    if isinstance(error, UntrackedFileDeleteError):
+        return (
+            f"Не удалось удалить неотслеживаемый файл «{error.path}». "
+            "Возможно, он уже удалён, занят другой программой или нет прав на "
+            "запись. Технические подробности доступны в разделе «Подробнее»."
+        )
 
     if isinstance(error, GitNotFoundError):
         return _GIT_NOT_FOUND_TEXT

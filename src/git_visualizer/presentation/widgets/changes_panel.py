@@ -12,11 +12,19 @@
 Кнопки ``Stage``/``Unstage`` действуют на выбранный файл, ``Stage All``/
 ``Unstage All`` — на всю секцию. Presentation перед массовой операцией показывает
 её область действия (``scope_summary``/``scope_details``).
+
+``Discard Changes`` — необратимая отмена незакоммиченных изменений выбранного
+файла (``discard_requested``). У отслеживаемого файла отменяются и индексное, и
+рабочее изменение, поэтому кнопка одна для обеих секций: она стоит в заголовке
+слева от ``Diff``/``Commit`` и действует на выбранную строку. Подтверждение с
+предупреждением строит MainWindow по текстам ``discard_confirmation``; у
+неотслеживаемого файла оно другое — удаляется сам файл.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
@@ -70,6 +78,13 @@ _CLEAN_TEXT = "Изменений нет — рабочая директория
 _STAGED_HINT = "В индексе (staged)"
 _UNSTAGED_HINT = "Ещё не в индексе (unstaged)"
 
+_DISCARD_TEXT = "Discard Changes"
+_DISCARD_TOOLTIP = (
+    "Отменить все незакоммиченные изменения выбранного файла (индекс и рабочая "
+    "директория). Действие необратимо и требует подтверждения. У неотслеживаемого "
+    "файла удаляется сам файл. Конфликтующие файлы не затрагиваются."
+)
+
 
 class ChangesPanel(QWidget):
     """Изменения рабочей директории: списки Unstaged/Staged, обновление и действия.
@@ -79,7 +94,9 @@ class ChangesPanel(QWidget):
     ``diff_requested(ChangedFile, staged)`` — открыть diff выбранного файла;
     ``stage_requested(ChangedFile)``/``unstage_requested(ChangedFile)`` — действия с
     выбранным файлом; ``stage_all_requested()``/``unstage_all_requested()`` —
-    массовые действия; ``commit_requested()`` — открыть окно сообщения коммита.
+    массовые действия; ``discard_requested(ChangedFile)`` — отменить все
+    незакоммиченные изменения выбранного файла; ``commit_requested()`` — открыть
+    окно сообщения коммита.
     Кнопка Commit доступна только при наличии staged-файлов; сообщение вводится в
     отдельном окне главного окна, поэтому сама панель его не хранит. Git отсюда
     не запускается.
@@ -92,6 +109,7 @@ class ChangesPanel(QWidget):
     unstage_requested = Signal(object)  # ChangedFile
     stage_all_requested = Signal()
     unstage_all_requested = Signal()
+    discard_requested = Signal(object)  # ChangedFile
     commit_requested = Signal()  # открыть окно сообщения коммита
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -127,6 +145,11 @@ class ChangesPanel(QWidget):
         )
         self.diff_button.clicked.connect(self._request_diff_selected)
 
+        self.discard_button = QPushButton(_DISCARD_TEXT, self)
+        self.discard_button.setObjectName("changes_discard_button")
+        self.discard_button.setToolTip(_DISCARD_TOOLTIP)
+        self.discard_button.clicked.connect(self._request_discard_selected)
+
         self.commit_button = QPushButton("Commit", self)
         self.commit_button.setObjectName("changes_commit_button")
         self.commit_button.clicked.connect(self._request_commit)
@@ -136,6 +159,7 @@ class ChangesPanel(QWidget):
         header.setSpacing(8)
         header.addWidget(title)
         header.addWidget(self.status_label, 1)
+        header.addWidget(self.discard_button)
         header.addWidget(self.diff_button)
         header.addWidget(self.commit_button)
         header.addWidget(self.refresh_button)
@@ -473,6 +497,11 @@ class ChangesPanel(QWidget):
         self.unstage_all_button.setEnabled(
             available and any(change.is_staged for change in self._changes)
         )
+        # Отмена затрагивает файл целиком, а не секцию: одна кнопка в заголовке
+        # действует на выбранную строку в любом из двух списков.
+        self.discard_button.setEnabled(
+            available and selected is not None and selected.can_discard
+        )
         self.commit_button.setEnabled(
             available and any(change.is_staged for change in self._changes)
         )
@@ -547,6 +576,18 @@ class ChangesPanel(QWidget):
     def _request_unstage_all(self) -> None:
         if self._loaded and not self._busy:
             self.unstage_all_requested.emit()
+
+    def _request_discard_selected(self) -> None:
+        """Запрашивает отмену изменений выбранного файла (подтверждает MainWindow)."""
+        selected = self._selected_file
+        if (
+            selected is None
+            or not self._loaded
+            or self._busy
+            or not selected.can_discard
+        ):
+            return
+        self.discard_requested.emit(selected)
 
     @staticmethod
     def _clear_selection(tree: QTreeWidget) -> None:
@@ -644,3 +685,82 @@ def _scope_category(change: ChangedFile, *, staged: bool) -> str | None:
     if change_type is None:
         return None
     return dict(_SCOPE_CATEGORY_ORDER).get(change_type, change_type.value)
+
+
+# --- подтверждение необратимой отмены изменений ---
+
+
+@dataclass(frozen=True, kw_only=True)
+class DiscardConfirmation:
+    """Тексты диалога Discard Changes; сам диалог показывает MainWindow."""
+
+    title: str
+    question: str
+    warning: str
+    details: str
+
+
+def discard_confirmation(
+    change: ChangedFile, *, has_head: bool
+) -> DiscardConfirmation:
+    """Подтверждение отмены изменений выбранного файла (ТЗ-дополнение, Discard).
+
+    У отслеживаемого файла отменяются все незакоммиченные изменения (индекс и
+    рабочая директория), поэтому предупреждение обязательно говорит о
+    необратимости. ``has_head=False`` — в репозитории ещё нет коммитов: отменить
+    рабочее изменение к ``HEAD`` нельзя, файл только убирается из индекса и
+    остаётся неотслеживаемым. Staged-добавленного файла нет в ``HEAD``: при
+    отмене он удаляется из индекса и рабочей директории. У неотслеживаемого файла
+    подтверждение отдельное — удаляется сам файл, а не изменение.
+    """
+    if change.is_untracked:
+        is_directory = change.path.endswith("/")
+        display_path = change.path.removesuffix("/")
+        what = "каталог" if is_directory else "файл"
+        removed = (
+            "Каталог и всё его содержимое будут удалены с диска безвозвратно."
+            if is_directory
+            else "Файл будет удалён с диска безвозвратно."
+        )
+        return DiscardConfirmation(
+            title="Discard Changes — удаление",
+            question=f"Удалить неотслеживаемый {what} «{display_path}»?",
+            warning=(
+                f"Операция необратима: Git не отслеживает этот {what}, поэтому "
+                "восстановить его из коммита невозможно. "
+                f"{removed} Убедитесь, что данные больше не нужны."
+            ),
+            details=f"Путь: {change.path}",
+        )
+
+    warning_lines = [
+        "Операция необратима: приложение не сможет восстановить отменённые "
+        "изменения."
+    ]
+    if not has_head:
+        warning_lines.append(
+            "В репозитории ещё нет коммитов: файл будет убран из индекса и "
+            "останется в рабочей директории как неотслеживаемый."
+        )
+    elif change.staged_change is FileChangeType.ADDED:
+        warning_lines.append(
+            "Файла нет в последнем коммите: он будет удалён из индекса и рабочей "
+            "директории."
+        )
+    else:
+        warning_lines.append(
+            "Все незакоммиченные изменения (в индексе и рабочей директории) будут "
+            "отменены: файл вернётся к состоянию последнего коммита (HEAD)."
+        )
+    details_lines = [f"Текущий путь: {change.path}"]
+    if change.old_path:
+        details_lines.append(f"Прежний путь: {change.old_path}")
+    details_lines.append(
+        "Git: git restore --source=HEAD --staged --worktree -- <путь>"
+    )
+    return DiscardConfirmation(
+        title="Discard Changes",
+        question=f"Отменить все незакоммиченные изменения файла «{_display_path(change)}»?",
+        warning="\n\n".join(warning_lines),
+        details="\n".join(details_lines),
+    )

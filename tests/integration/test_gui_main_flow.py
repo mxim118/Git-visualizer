@@ -350,6 +350,75 @@ def test_gui_stage_and_unstage_flow(
         window.close()
 
 
+def test_gui_discard_changes_flow(
+    qt_app,
+    make_repo,
+    git,
+    monkeypatch,
+    app_settings,
+) -> None:
+    path = make_repo("gui-discard", commits=1)
+    tracked = path / "file0.txt"
+    tracked.write_text("changed\n", encoding="utf-8")
+    untracked = path / "untracked.txt"
+    untracked.write_text("new\n", encoding="utf-8")
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
+    )
+    controller = build_controller()
+    window = MainWindow(controller, app_settings)
+    confirmations: list[tuple[str, bool]] = []
+
+    try:
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None,
+        )
+        panel = window.workspace_page.changes_panel
+        wait_until(qt_app, lambda: len(panel.changes) == 2)
+
+        def confirm(changed_file, *, has_head):
+            confirmations.append((changed_file.path, has_head))
+            return True
+
+        monkeypatch.setattr(window, "_confirm_discard", confirm)
+
+        # Отмена изменений отслеживаемого файла возвращает его к HEAD.
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        panel.diff_button.click()
+        wait_until(
+            qt_app,
+            lambda: not window.diff_overlay.isHidden()
+            and bool(window.diff_overlay.diff_view.text),
+        )
+        assert "+changed" in window.diff_overlay.diff_view.text
+
+        panel.discard_button.click()
+
+        wait_until(
+            qt_app,
+            lambda: [change.path for change in panel.changes] == ["untracked.txt"],
+        )
+        assert tracked.read_text(encoding="utf-8") == "0\n"
+        assert git(path, "status", "--porcelain") == "?? untracked.txt\n"
+        # Открытая панель diff относилась к отменённому содержимому.
+        assert window.diff_overlay.isHidden()
+
+        # Untracked-файл удаляется после отдельного подтверждения.
+        panel.unstaged_tree.setCurrentItem(panel.unstaged_tree.topLevelItem(0))
+        panel.discard_button.click()
+
+        wait_until(qt_app, lambda: panel.is_clean)
+        assert not untracked.exists()
+        assert git(path, "status", "--porcelain") == ""
+        assert "Изменений нет" in window.statusBar().currentMessage()
+        assert panel.staged_files == ()
+        assert confirmations == [("file0.txt", True), ("untracked.txt", True)]
+    finally:
+        window.close()
+
+
 def test_empty_repository_flow_with_real_git(
     qt_app,
     make_repo,
