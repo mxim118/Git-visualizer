@@ -214,6 +214,7 @@ def _metadata_html(commit: Commit) -> str:
     message = html.escape(_full_message(commit)).replace("\n", "<br>")
     comparison = html.escape(_comparison_note(commit))
     return (
+        f"<p><b>Сообщение</b></p><p>{message}</p>"
         f"<p style='color: #475569;'>{comparison}</p>"
         "<p>"
         f"<b>Короткий hash:</b> <code>{html.escape(commit.short_hash)}</code><br>"
@@ -226,7 +227,6 @@ def _metadata_html(commit: Commit) -> str:
         f"&lt;{html.escape(commit.committer_email)}&gt;<br>"
         f"<b>Дата коммита:</b> {html.escape(_format_datetime(commit.committed_at))}<br>"
         f"<b>Refs:</b> {html.escape(refs)}</p>"
-        f"<p><b>Сообщение</b></p><p>{message}</p>"
     )
 
 
