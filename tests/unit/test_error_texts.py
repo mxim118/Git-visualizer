@@ -111,6 +111,84 @@ def test_git_command_error_kinds_have_specific_messages() -> None:
     assert "владельца" in user_message(unsafe)
 
 
+def test_lfs_filter_failure_has_a_clear_russian_message() -> None:
+    error = GitCommandError(
+        128,
+        command=(
+            "git",
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--branch",
+            "--untracked-files=normal",
+        ),
+        stderr=(
+            "Error cleaning Git LFS object: open "
+            r"C:\Users\user\repo\.git\lfs\tmp\2972506489: Access is denied."
+            "\n"
+            "error: external filter 'git-lfs filter-process' failed\n"
+            "fatal: assets/archive.zip: clean filter 'lfs' failed\n"
+        ),
+    )
+
+    message = user_message(error)
+
+    assert error.kind is GitErrorKind.LFS_FILTER_FAILED
+    assert "Git LFS" in message
+    assert ".git/lfs/tmp" in message
+    assert "права" in message
+    assert "Подробнее" in message
+    assert "код 128" not in message
+
+
+def test_index_lock_permission_denied_message_is_clear() -> None:
+    error = GitCommandError(
+        128,
+        command=("git", "switch", "-c", "branch", "a" * 40),
+        stderr=(
+            "fatal: Unable to create "
+            r"'C:/Users/user/repo/.git/index.lock': Permission denied"
+            "\n"
+        ),
+    )
+
+    message = user_message(error)
+    branch_message = branch_user_message(
+        error, operation="create", branch_name="новая-ветка"
+    )
+
+    assert error.kind is GitErrorKind.REPOSITORY_NOT_WRITABLE
+    assert "нет доступа на запись" in message
+    assert "index.lock" in message
+    assert "принадлежит текущему пользователю" in message
+    assert "Подробнее" in message
+    assert "нет доступа на запись" in branch_message
+    assert "код 128" not in message
+
+
+def test_index_lock_busy_message_explains_another_git_process() -> None:
+    error = GitCommandError(
+        128,
+        command=("git", "add", "--", "file.txt"),
+        stderr=(
+            "fatal: Unable to create "
+            r"'C:/Users/user/repo/.git/index.lock': File exists."
+            "\n\n"
+            "Another git process seems to be running in this repository.\n"
+        ),
+    )
+
+    message = user_message(error)
+
+    assert error.kind is GitErrorKind.INDEX_LOCKED
+    assert "index.lock" in message
+    assert "другую операцию" in message
+    assert "Дождитесь завершения другого Git-процесса" in message
+    assert "не делает это автоматически" in message
+    assert "Подробнее" in message
+
+
 def test_technical_details_uses_error_method() -> None:
     error = GitCommandError(
         128, command=("git", "log"), stdout="out", stderr="fatal: bad object"

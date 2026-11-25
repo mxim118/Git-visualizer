@@ -58,6 +58,28 @@ _COMMIT_VALIDATION_TEXT = (
     "Коммит не создан: проверьте сообщение (оно не должно быть пустым или состоять "
     "из пробелов) и наличие staged-изменений в индексе."
 )
+_LFS_FILTER_TEXT = (
+    "Git LFS не смог обработать файл, поэтому Git не смог определить состояние "
+    "репозитория. Обычно это означает, что Git LFS не может записать временный файл "
+    "в каталог «.git/lfs/tmp»: у текущего пользователя нет прав на этот каталог "
+    "либо его блокирует другая программа. Проверьте права на «.git/lfs/tmp» и "
+    "повторите операцию; технические подробности доступны в разделе «Подробнее»."
+)
+_REPOSITORY_NOT_WRITABLE_TEXT = (
+    "Git не может изменить репозиторий: нет доступа на запись в каталог «.git». "
+    "Git не смог создать служебный файл «index.lock» (Permission denied). "
+    "Проверьте, что репозиторий принадлежит текущему пользователю, каталог не "
+    "доступен только для чтения и файлы не блокирует другая программа; технические "
+    "подробности доступны в разделе «Подробнее»."
+)
+_INDEX_LOCKED_TEXT = (
+    "Git уже выполняет другую операцию с этим репозиторием: файл "
+    "«.git/index.lock» занят. Дождитесь завершения другого Git-процесса "
+    "(например, коммита, merge или редактора) и повторите. Если Git завершился "
+    "аварийно, файл блокировки может остаться — удалите его вручную; приложение "
+    "не делает это автоматически. Технические подробности доступны в разделе "
+    "«Подробнее»."
+)
 
 
 def user_message(error: BaseException) -> str:
@@ -110,6 +132,12 @@ def user_message(error: BaseException) -> str:
             return _MISSING_AUTHOR_TEXT
         if error.kind is GitErrorKind.UNMERGED_FILES:
             return _UNMERGED_FILES_TEXT
+        if error.kind is GitErrorKind.LFS_FILTER_FAILED:
+            return _LFS_FILTER_TEXT
+        if error.kind is GitErrorKind.REPOSITORY_NOT_WRITABLE:
+            return _REPOSITORY_NOT_WRITABLE_TEXT
+        if error.kind is GitErrorKind.INDEX_LOCKED:
+            return _INDEX_LOCKED_TEXT
         return (
             f"Git завершился с ошибкой (код {error.returncode}). "
             "Технические подробности доступны в разделе «Подробнее»."

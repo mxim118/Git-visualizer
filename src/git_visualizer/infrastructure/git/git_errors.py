@@ -27,6 +27,9 @@ class GitErrorKind(Enum):
     REF_NOT_FOUND = "ref_not_found"  # ветка или коммит не найдены
     DIRTY_WORKTREE = "dirty_worktree"  # переключение перезаписало бы изменения
     OPERATION_IN_PROGRESS = "operation_in_progress"  # идёт merge/rebase/cherry-pick
+    LFS_FILTER_FAILED = "lfs_filter_failed"  # не сработал фильтр Git LFS
+    REPOSITORY_NOT_WRITABLE = "repository_not_writable"  # нет прав на запись в .git
+    INDEX_LOCKED = "index_locked"  # index.lock занят другим Git-процессом
 
 
 # (вид ошибки, фрагмент stderr в нижнем регистре); побеждает первое совпадение.
@@ -45,6 +48,17 @@ _STDERR_RULES: tuple[tuple[GitErrorKind, str], ...] = (
         GitErrorKind.OPERATION_IN_PROGRESS,
         "cannot switch branch while ",
     ),
+    (GitErrorKind.LFS_FILTER_FAILED, "error cleaning git lfs object"),
+    (GitErrorKind.LFS_FILTER_FAILED, "external filter 'git-lfs filter-process' failed"),
+    (GitErrorKind.LFS_FILTER_FAILED, "clean filter 'lfs' failed"),
+    (
+        GitErrorKind.REPOSITORY_NOT_WRITABLE,
+        "index.lock': permission denied",
+    ),
+    (GitErrorKind.REPOSITORY_NOT_WRITABLE, "index.lock: permission denied"),
+    (GitErrorKind.INDEX_LOCKED, "another git process seems to be running"),
+    (GitErrorKind.INDEX_LOCKED, "index.lock': file exists"),
+    (GitErrorKind.INDEX_LOCKED, "index.lock: file exists"),
     (
         GitErrorKind.UNMERGED_FILES,
         "committing is not possible because you have unmerged files",

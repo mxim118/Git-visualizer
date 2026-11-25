@@ -100,6 +100,28 @@ UNMERGED_INDEX_STDERR = (
     "error: you need to resolve your current index first\n"
     "a.txt: needs merge\n"
 )
+LFS_FILTER_STDERR = (
+    "Error cleaning Git LFS object: open "
+    r"C:\Users\user\repo\.git\lfs\tmp\2972506489: Access is denied."
+    "\n"
+    "error: external filter 'git-lfs filter-process' failed\n"
+    "fatal: assets/archive.zip: clean filter 'lfs' failed\n"
+)
+INDEX_LOCK_PERMISSION_STDERR = (
+    "fatal: Unable to create "
+    r"'C:/Users/user/repo/.git/index.lock': Permission denied"
+    "\n"
+)
+INDEX_LOCK_EXISTS_STDERR = (
+    "fatal: Unable to create "
+    r"'C:/Users/user/repo/.git/index.lock': File exists."
+    "\n\n"
+    "Another git process seems to be running in this repository, e.g.\n"
+    "an editor opened by 'git commit'. Please make sure all processes\n"
+    "are terminated then try again. If it still fails, a git process\n"
+    "may have crashed in this repository earlier:\n"
+    "remove the file manually to continue.\n"
+)
 
 
 @pytest.mark.parametrize(
@@ -115,6 +137,9 @@ UNMERGED_INDEX_STDERR = (
         (DIRTY_WORKTREE_STDERR, GitErrorKind.DIRTY_WORKTREE),
         (OPERATION_IN_PROGRESS_STDERR, GitErrorKind.OPERATION_IN_PROGRESS),
         (UNMERGED_INDEX_STDERR, GitErrorKind.UNMERGED_FILES),
+        (LFS_FILTER_STDERR, GitErrorKind.LFS_FILTER_FAILED),
+        (INDEX_LOCK_PERMISSION_STDERR, GitErrorKind.REPOSITORY_NOT_WRITABLE),
+        (INDEX_LOCK_EXISTS_STDERR, GitErrorKind.INDEX_LOCKED),
         ("FATAL: NOT A GIT REPOSITORY", GitErrorKind.NOT_A_REPOSITORY),  # регистр не важен
         ("fatal: pathspec 'x' did not match any files\n", GitErrorKind.UNKNOWN),
         ("", GitErrorKind.UNKNOWN),
@@ -134,4 +159,13 @@ def test_command_error_kind_is_derived_from_stderr() -> None:
     assert GitCommandError(128, stderr=REF_NOT_FOUND_STDERR).kind is GitErrorKind.REF_NOT_FOUND
     assert GitCommandError(1, stderr=DIRTY_WORKTREE_STDERR).kind is GitErrorKind.DIRTY_WORKTREE
     assert GitCommandError(128, stderr=OPERATION_IN_PROGRESS_STDERR).kind is GitErrorKind.OPERATION_IN_PROGRESS
+    assert GitCommandError(128, stderr=LFS_FILTER_STDERR).kind is GitErrorKind.LFS_FILTER_FAILED
+    assert (
+        GitCommandError(128, stderr=INDEX_LOCK_PERMISSION_STDERR).kind
+        is GitErrorKind.REPOSITORY_NOT_WRITABLE
+    )
+    assert (
+        GitCommandError(128, stderr=INDEX_LOCK_EXISTS_STDERR).kind
+        is GitErrorKind.INDEX_LOCKED
+    )
     assert GitCommandError(1).kind is GitErrorKind.UNKNOWN
