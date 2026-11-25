@@ -2,9 +2,10 @@
 
 Скрывает конкретные команды Git от сервисов. Все команды выполняются через ``GitRunner``
 с рабочим каталогом ``path``. Реализованы открытие, история, ветки (включая проверку
-имени, создание и переключение), remote, статус рабочей директории, stage/unstage
-(в том числе массовые), diff рабочей директории, список изменённых файлов коммита,
-diff одного файла коммита и создание коммита из индекса.
+имени, создание и переключение), remote и сетевые операции (fetch, pull только с
+``--ff-only``, push в upstream и первый push с ``-u``), статус рабочей директории,
+stage/unstage (в том числе массовые), diff рабочей директории, список изменённых файлов
+коммита, diff одного файла коммита и создание коммита из индекса.
 
 Минимальная версия Git: ``switch`` и ``restore`` требуют Git 2.23+.
 """
@@ -32,6 +33,7 @@ from git_visualizer.infrastructure.git.git_parser import (
     parse_name_status,
     parse_remotes,
     parse_status,
+    parse_upstream,
 )
 from git_visualizer.infrastructure.git.git_runner import GitResult, GitRunner
 
@@ -307,6 +309,58 @@ def build_switch_branch_arguments(name: str) -> list[str]:
     return ["switch", "--no-guess", name]
 
 
+def build_fetch_arguments(remote_name: str) -> list[str]:
+    """Аргументы Fetch выбранного remote: ``git fetch <remote>``.
+
+    Remote передаётся по имени, а не по URL: авторизация и URL остаются делом
+    конфигурации Git. ``--prune`` не используется — удаление remote-tracking refs
+    не входит в задачу и меняло бы историю без явной команды пользователя.
+    """
+    name = remote_name.strip()
+    if not name:
+        raise ValueError("Remote name must not be empty")
+    return ["fetch", name]
+
+
+def build_pull_ff_only_arguments() -> list[str]:
+    """Аргументы безопасного Pull текущей ветки из настроенного upstream.
+
+    ``--ff-only`` — при расхождении веток Git ничего не меняет и завершается ошибкой
+    (FR-REMOTE-03): merge и rebase в MVP не выполняются. ``--no-rebase`` отменяет
+    пользовательские настройки ``pull.rebase`` / ``branch.<имя>.rebase``, которые
+    иначе могли бы включить rebase вместо fast-forward. ``--autostash`` и прочие
+    опции, скрыто меняющие рабочую директорию, не передаются.
+    """
+    return ["pull", "--ff-only", "--no-rebase"]
+
+
+def build_push_arguments() -> list[str]:
+    """Аргументы Push текущей ветки в настроенный upstream: ``git push``.
+
+    Без явного remote/refspec Git отправляет текущую ветку туда, куда указывает её
+    upstream (``branch.<имя>.remote``/``merge``), и соблюдает ``push.default``.
+    ``--force`` и его варианты не передаются никогда.
+    """
+    return ["push"]
+
+
+def build_push_set_upstream_arguments(remote_name: str, branch_name: str) -> list[str]:
+    """Аргументы первого Push с настройкой upstream: ``git push -u <remote> <branch>``.
+
+    Используется только когда у ветки ещё нет upstream и пользователь явно выбрал
+    remote. ``--set-upstream`` (``-u``) записывает ``branch.<имя>.remote`` и
+    ``branch.<имя>.merge``, поэтому последующие Pull и Push работают без аргументов.
+    Принудительных опций нет.
+    """
+    remote = remote_name.strip()
+    branch = branch_name.strip()
+    if not remote:
+        raise ValueError("Remote name must not be empty")
+    if not branch:
+        raise ValueError("Branch name must not be empty")
+    return ["push", "--set-upstream", remote, branch]
+
+
 class GitRepository:
     """Запросы к репозиторию, расположенному в каталоге ``path`` или внутри него."""
 
@@ -449,6 +503,82 @@ class GitRepository:
         """Настроенные remote; пустой кортеж, если их нет."""
         result = self._run(["remote", "-v"])
         return parse_remotes(result.stdout)
+
+    def get_branch_upstream(self, branch_name: str) -> str | None:
+        """Короткое имя upstream ветки (например, ``origin/main``) или ``None``.
+
+        Используется ``git for-each-ref --format=%(upstream) refs/heads/<ветка>``:
+        Git отдаёт **настроенный** upstream даже если remote-tracking ref уже удалён
+        («gone»), тогда как ``rev-parse @{upstream}`` в этом случае завершается ошибкой
+        «unknown revision». Полное имя сокращается тем же ``parse_upstream``, что и в
+        списке веток.
+        """
+        name = branch_name.strip()
+        if not name:
+            raise ValueError("Branch name must not be empty")
+        result = self._run(
+            ["for-each-ref", "--format=%(upstream)", f"refs/heads/{name}"]
+        )
+        for line in result.stdout.split("\n"):
+            upstream = line.removesuffix("\r")
+            if upstream:
+                return parse_upstream(upstream)
+        return None
+
+    def fetch(self, remote_name: str, *, timeout: float) -> str:
+        """Получает изменения выбранного remote (``git fetch <remote>``).
+
+        Авторизация — стандартная для Git (SSH-ключи, credential helpers); приложение
+        не передаёт и не хранит пароли. ``GIT_TERMINAL_PROMPT=0`` в ``GitRunner``
+        не даёт процессу зависнуть в ожидании ввода. ``timeout`` обязателен: сетевые
+        команды могут выполняться дольше локальных.
+
+        :return: вывод Git (stdout и stderr) для показа результата.
+        :raises ValueError: пустое имя remote.
+        :raises GitError: Git завершился с ошибкой; ``kind`` уточняет причину.
+        """
+        result = self._run(build_fetch_arguments(remote_name), timeout=timeout)
+        return _combined_output(result)
+
+    def pull_ff_only(self, *, timeout: float) -> str:
+        """Pull текущей ветки только fast-forward (``git pull --ff-only --no-rebase``).
+
+        При расхождении веток Git ничего не меняет и завершается ошибкой
+        (``GitErrorKind.NON_FAST_FORWARD``); merge, rebase и force-обновление не
+        выполняются никогда.
+
+        :return: вывод Git (stdout и stderr) для показа результата.
+        :raises GitError: Git завершился с ошибкой.
+        """
+        result = self._run(build_pull_ff_only_arguments(), timeout=timeout)
+        return _combined_output(result)
+
+    def push(self, *, timeout: float) -> str:
+        """Отправляет текущую ветку в настроенный upstream (``git push``).
+
+        :return: вывод Git (stdout и stderr) для показа результата.
+        :raises GitError: Git завершился с ошибкой (нет upstream, non-fast-forward,
+            отказ авторизации или прав и т. п.).
+        """
+        result = self._run(build_push_arguments(), timeout=timeout)
+        return _combined_output(result)
+
+    def push_set_upstream(
+        self, remote_name: str, branch_name: str, *, timeout: float
+    ) -> str:
+        """Первый push ветки с явным remote и настройкой upstream (``git push -u``).
+
+        Вызывается только по явному выбору пользователя, когда upstream отсутствует.
+
+        :return: вывод Git (stdout и stderr) для показа результата.
+        :raises ValueError: пустое имя remote или ветки.
+        :raises GitError: Git завершился с ошибкой.
+        """
+        result = self._run(
+            build_push_set_upstream_arguments(remote_name, branch_name),
+            timeout=timeout,
+        )
+        return _combined_output(result)
 
     def get_commit_files(
         self, *, commit_hash: str, parent_hash: str | None
@@ -628,11 +758,20 @@ class GitRepository:
         *,
         check: bool = True,
         stdin_data: str | None = None,
+        timeout: float | None = None,
     ) -> GitResult:
         kwargs: dict[str, object] = {"cwd": self._path, "check": check}
         if stdin_data is not None:
             kwargs["stdin_data"] = stdin_data
+        if timeout is not None:
+            kwargs["timeout"] = timeout
         return self._runner.run(args, **kwargs)
+
+
+def _combined_output(result: GitResult) -> str:
+    """Объединяет stdout и stderr сетевой команды: Git пишет прогресс в stderr."""
+    parts = [part.rstrip() for part in (result.stdout, result.stderr) if part.strip()]
+    return "\n".join(parts)
 
 
 def _truncate_diff(text: str, max_chars: int) -> tuple[str, bool]:

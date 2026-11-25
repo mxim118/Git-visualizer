@@ -8,9 +8,13 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from git_visualizer.application.errors import NotAGitRepositoryError
+from git_visualizer.application.errors import (
+    NotAGitRepositoryError,
+    UpstreamNotConfiguredError,
+)
 from git_visualizer.application.services.git_environment_service import GitEnvironment
 from git_visualizer.application.services.graph_service import GraphService
+from git_visualizer.application.services.remote_service import RemoteOperationResult
 from git_visualizer.domain.enums import FileChangeType
 from git_visualizer.domain.models import (
     Branch,
@@ -137,9 +141,19 @@ class FakeHistoryService:
 class FakeBranchService:
     def __init__(self, branches: tuple[Branch, ...]) -> None:
         self.branches = branches
+        self.created: list[tuple[str, str | None]] = []
+        self.switched: list[str] = []
 
     def get_branches(self, repository: Repository) -> tuple[Branch, ...]:
         return self.branches
+
+    def create_branch(
+        self, repository: Repository, name: str, *, start_point: str | None = None
+    ) -> None:
+        self.created.append((name, start_point))
+
+    def switch_branch(self, repository: Repository, name: str) -> None:
+        self.switched.append(name)
 
 
 class FakeDiffService:
@@ -261,6 +275,72 @@ class FakeCommitService:
             raise self.error
 
 
+class FakeRemoteService:
+    def __init__(
+        self,
+        *,
+        error: BaseException | None = None,
+        gate: threading.Event | None = None,
+        started: threading.Event | None = None,
+    ) -> None:
+        self.error = error
+        self._gate = gate
+        self._started = started
+        self.fetch_requests: list[str] = []
+        self.pull_requests = 0
+        self.push_requests = 0
+        self.initial_push_requests: list[str] = []
+
+    def _wait(self) -> None:
+        if self._started is not None:
+            self._started.set()
+        if self._gate is not None:
+            assert self._gate.wait(5.0)
+
+    def fetch(self, repository: Repository, remote_name: str) -> RemoteOperationResult:
+        self.fetch_requests.append(remote_name)
+        self._wait()
+        if self.error is not None:
+            raise self.error
+        return RemoteOperationResult(operation="fetch", remote=remote_name)
+
+    def pull(self, repository: Repository) -> RemoteOperationResult:
+        self.pull_requests += 1
+        self._wait()
+        if self.error is not None:
+            raise self.error
+        return RemoteOperationResult(
+            operation="pull",
+            branch=repository.current_branch,
+            upstream="origin/main",
+        )
+
+    def push(self, repository: Repository) -> RemoteOperationResult:
+        self.push_requests += 1
+        self._wait()
+        if self.error is not None:
+            raise self.error
+        return RemoteOperationResult(
+            operation="push",
+            branch=repository.current_branch,
+            upstream="origin/main",
+        )
+
+    def push_initial(
+        self, repository: Repository, remote_name: str
+    ) -> RemoteOperationResult:
+        self.initial_push_requests.append(remote_name)
+        self._wait()
+        if self.error is not None:
+            raise self.error
+        return RemoteOperationResult(
+            operation="push",
+            remote=remote_name,
+            branch=repository.current_branch,
+            upstream=f"{remote_name}/{repository.current_branch}",
+        )
+
+
 def build_controller(
     *,
     repository: Repository,
@@ -277,6 +357,7 @@ def build_controller(
     environment_error: BaseException | None = None,
     changes_service: FakeChangesService | None = None,
     commit_service: FakeCommitService | None = None,
+    remote_service: FakeRemoteService | None = None,
 ) -> tuple[
     RepositoryController,
     FakeRepositoryService,
@@ -298,6 +379,7 @@ def build_controller(
         diff_service=diff_service,
         changes_service=changes_service or FakeChangesService(),
         commit_service=commit_service or FakeCommitService(),
+        remote_service=remote_service or FakeRemoteService(),
         git_environment_service=FakeEnvironmentService(
             environment=environment, error=environment_error
         ),
@@ -955,3 +1037,192 @@ def test_commit_is_blocked_while_another_index_operation_runs(
     gate.set()
     wait_until(qt_app, lambda: bool(succeeded))
     controller.wait_for_done()
+
+
+# --- сетевые операции через контроллер ---
+
+
+def test_fetch_runs_in_background_and_reloads_workspace(
+    qt_app, tmp_path: Path
+) -> None:
+    started = threading.Event()
+    gate = threading.Event()
+    remote_service = FakeRemoteService(gate=gate, started=started)
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        remote_service=remote_service,
+    )
+    contexts = []
+    results = []
+    loaded: list[WorkspaceData] = []
+    controller.remote_operation_started.connect(contexts.append)
+    controller.remote_operation_succeeded.connect(results.append)
+    controller.repository_loaded.connect(loaded.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert len(loaded) == 1
+
+    assert controller.fetch("origin") is True
+    wait_until(qt_app, started.is_set)
+    assert contexts[0].operation == "fetch"
+    assert contexts[0].remote == "origin"
+    assert remote_service.fetch_requests == ["origin"]
+    assert results == []
+    assert len(loaded) == 1
+
+    gate.set()
+    wait_until(qt_app, lambda: bool(results))
+    wait_until(qt_app, lambda: len(loaded) == 2)
+    assert results[0].operation == "fetch"
+    assert results[0].remote == "origin"
+    controller.wait_for_done()
+
+
+def test_remote_operations_do_not_run_in_parallel(qt_app, tmp_path: Path) -> None:
+    started = threading.Event()
+    gate = threading.Event()
+    remote_service = FakeRemoteService(gate=gate, started=started)
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        remote_service=remote_service,
+    )
+    succeeded: list[object] = []
+    controller.remote_operation_succeeded.connect(succeeded.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert controller.fetch("origin") is True
+    wait_until(qt_app, started.is_set)
+
+    assert controller.pull() is False
+    assert controller.push() is False
+    assert controller.push_initial("origin") is False
+    # Сетевые операции делят ключ с индексом, коммитом и ветками: параллельно
+    # они не запускаются, иначе возможны гонки за refs/HEAD/рабочую директорию.
+    changed = ChangedFile(path="file.txt", unstaged_change=FileChangeType.MODIFIED)
+    assert controller.stage_file(changed) is False
+    assert controller.commit("message") is False
+    assert controller.create_branch("feature") is False
+    assert controller.switch_branch("dev") is False
+    assert remote_service.pull_requests == 0
+
+    gate.set()
+    wait_until(qt_app, lambda: bool(succeeded))
+    controller.wait_for_done()
+
+
+def test_remote_failure_is_reported_and_workspace_is_reread(
+    qt_app, tmp_path: Path
+) -> None:
+    error = GitCommandError(
+        128,
+        command=("git", "fetch", "origin"),
+        stderr="fatal: unable to access 'https://example.com/r.git': "
+        "Could not resolve host: example.com\n",
+    )
+    remote_service = FakeRemoteService(error=error)
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        remote_service=remote_service,
+    )
+    failures = []
+    loaded: list[WorkspaceData] = []
+    succeeded: list[object] = []
+    controller.remote_operation_failed.connect(
+        lambda context, failure: failures.append((context, failure))
+    )
+    controller.remote_operation_succeeded.connect(succeeded.append)
+    controller.repository_loaded.connect(loaded.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert len(loaded) == 1
+
+    assert controller.fetch("origin") is True
+    wait_until(qt_app, lambda: bool(failures))
+    assert failures[0][1].exception is error
+    assert succeeded == []
+    # После ошибки сетевой команды состояние перечитывается: Git мог обновить refs.
+    wait_until(qt_app, lambda: len(loaded) == 2)
+    controller.wait_for_done()
+
+
+def test_remote_validation_failure_does_not_reload_workspace(
+    qt_app, tmp_path: Path
+) -> None:
+    error = UpstreamNotConfiguredError("main")
+    remote_service = FakeRemoteService(error=error)
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        remote_service=remote_service,
+    )
+    failures: list[TaskFailure] = []
+    loaded: list[WorkspaceData] = []
+    controller.remote_operation_failed.connect(
+        lambda context, failure: failures.append(failure)
+    )
+    controller.repository_loaded.connect(loaded.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert controller.pull() is True
+    wait_until(qt_app, lambda: bool(failures))
+
+    assert failures[0].exception is error
+    assert len(loaded) == 1
+    controller.wait_for_done()
+
+
+def test_push_initial_uses_explicit_remote(qt_app, tmp_path: Path) -> None:
+    remote_service = FakeRemoteService()
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        remote_service=remote_service,
+    )
+    results: list[object] = []
+    controller.remote_operation_succeeded.connect(results.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert controller.push_initial("fork") is True
+    wait_until(qt_app, lambda: bool(results))
+
+    assert remote_service.initial_push_requests == ["fork"]
+    controller.wait_for_done()
+
+
+def test_remote_operations_require_open_repository(qt_app) -> None:
+    controller, _, _, _ = build_controller(
+        repository=make_repository(Path("repo"), head_commit=None)
+    )
+
+    assert controller.fetch("origin") is False
+    assert controller.pull() is False
+    assert controller.push() is False
+    assert controller.push_initial("origin") is False

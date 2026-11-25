@@ -30,11 +30,65 @@ class GitErrorKind(Enum):
     LFS_FILTER_FAILED = "lfs_filter_failed"  # не сработал фильтр Git LFS
     REPOSITORY_NOT_WRITABLE = "repository_not_writable"  # нет прав на запись в .git
     INDEX_LOCKED = "index_locked"  # index.lock занят другим Git-процессом
+    REMOTE_NOT_FOUND = "remote_not_found"  # remote недоступен / не является репозиторием
+    AUTHENTICATION_FAILED = "authentication_failed"  # Git не смог авторизоваться
+    PERMISSION_DENIED = "permission_denied"  # remote отклонил операцию: нет прав
+    NON_FAST_FORWARD = "non_fast_forward"  # fast-forward невозможен, ветки разошлись
+    MERGE_CONFLICT = "merge_conflict"  # конфликт слияния, автоматически не разрешается
+    NETWORK_ERROR = "network_error"  # сетевой сбой: хост, соединение, TLS
 
 
 # (вид ошибки, фрагмент stderr в нижнем регистре); побеждает первое совпадение.
+# Порядок важен: например «does not appear to be a git repository» (remote не найден)
+# содержит «not a git repository», поэтому проверяется раньше NOT_A_REPOSITORY, а
+# «permission denied (publickey)» — это ошибка авторизации, а не прав на remote.
 _STDERR_RULES: tuple[tuple[GitErrorKind, str], ...] = (
     (GitErrorKind.UNSAFE_REPOSITORY, "detected dubious ownership"),
+    (GitErrorKind.REMOTE_NOT_FOUND, "does not appear to be a git repository"),
+    (GitErrorKind.REMOTE_NOT_FOUND, "repository not found"),
+    (GitErrorKind.AUTHENTICATION_FAILED, "authentication failed"),
+    (GitErrorKind.AUTHENTICATION_FAILED, "could not read username"),
+    (GitErrorKind.AUTHENTICATION_FAILED, "could not read password"),
+    (GitErrorKind.AUTHENTICATION_FAILED, "terminal prompts disabled"),
+    (GitErrorKind.AUTHENTICATION_FAILED, "permission denied (publickey"),
+    (GitErrorKind.AUTHENTICATION_FAILED, "invalid username or password"),
+    (GitErrorKind.AUTHENTICATION_FAILED, "the requested url returned error: 401"),
+    (
+        GitErrorKind.AUTHENTICATION_FAILED,
+        "support for password authentication was removed",
+    ),
+    (GitErrorKind.PERMISSION_DENIED, "remote: permission to"),
+    (GitErrorKind.PERMISSION_DENIED, "access denied"),
+    (GitErrorKind.PERMISSION_DENIED, "the requested url returned error: 403"),
+    (GitErrorKind.PERMISSION_DENIED, "pre-receive hook declined"),
+    (GitErrorKind.PERMISSION_DENIED, "refusing to update checked out branch"),
+    (GitErrorKind.PERMISSION_DENIED, "protected branch"),
+    (GitErrorKind.PERMISSION_DENIED, "not allowed to push"),
+    (GitErrorKind.PERMISSION_DENIED, "remote rejected"),
+    (GitErrorKind.NON_FAST_FORWARD, "non-fast-forward"),
+    (GitErrorKind.NON_FAST_FORWARD, "not possible to fast-forward"),
+    (
+        GitErrorKind.NON_FAST_FORWARD,
+        "updates were rejected because the tip of your current branch is behind",
+    ),
+    (GitErrorKind.NON_FAST_FORWARD, "failed to push some refs"),
+    (GitErrorKind.NON_FAST_FORWARD, "fetch first"),
+    (GitErrorKind.MERGE_CONFLICT, "automatic merge failed"),
+    (GitErrorKind.MERGE_CONFLICT, "conflict (content)"),
+    (GitErrorKind.MERGE_CONFLICT, "merge conflict"),
+    (GitErrorKind.NETWORK_ERROR, "could not resolve host"),
+    (GitErrorKind.NETWORK_ERROR, "connection timed out"),
+    (GitErrorKind.NETWORK_ERROR, "connection refused"),
+    (GitErrorKind.NETWORK_ERROR, "failed to connect"),
+    (GitErrorKind.NETWORK_ERROR, "could not connect"),
+    (GitErrorKind.NETWORK_ERROR, "network is unreachable"),
+    (GitErrorKind.NETWORK_ERROR, "recv failure"),
+    (GitErrorKind.NETWORK_ERROR, "rpc failed"),
+    (GitErrorKind.NETWORK_ERROR, "the remote end hung up unexpectedly"),
+    (GitErrorKind.NETWORK_ERROR, "ssl certificate problem"),
+    (GitErrorKind.NETWORK_ERROR, "early eof"),
+    (GitErrorKind.NETWORK_ERROR, "operation timed out"),
+    (GitErrorKind.NETWORK_ERROR, "unable to access"),
     (GitErrorKind.NOT_A_REPOSITORY, "not a git repository"),
     (GitErrorKind.MISSING_AUTHOR, "author identity unknown"),
     (GitErrorKind.MISSING_AUTHOR, "unable to auto-detect email address"),
@@ -44,6 +98,7 @@ _STDERR_RULES: tuple[tuple[GitErrorKind, str], ...] = (
     (GitErrorKind.REF_NOT_FOUND, "invalid reference:"),
     (GitErrorKind.REF_NOT_FOUND, "not a valid object name"),
     (GitErrorKind.DIRTY_WORKTREE, "would be overwritten by checkout"),
+    (GitErrorKind.DIRTY_WORKTREE, "would be overwritten by merge"),
     (
         GitErrorKind.OPERATION_IN_PROGRESS,
         "cannot switch branch while ",

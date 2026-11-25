@@ -23,7 +23,12 @@ from PySide6.QtWidgets import (
 )
 
 from git_visualizer.application.services.changes_service import ChangesService
+from git_visualizer.application.services.remote_service import (
+    RemoteOperationContext,
+    RemoteOperationResult,
+)
 from git_visualizer.domain.models import (
+    Branch,
     ChangedFile,
     Commit,
     Diff,
@@ -39,6 +44,12 @@ from git_visualizer.presentation.error_texts import (
     commit_user_message,
     technical_details,
     user_message,
+)
+from git_visualizer.presentation.remote_texts import (
+    remote_error_title,
+    remote_progress_text,
+    remote_result_text,
+    remote_user_message,
 )
 from git_visualizer.presentation.widgets.changes_panel import (
     scope_details,
@@ -114,6 +125,9 @@ class MainWindow(QMainWindow):
         self._branch_start_point: str | None = None
         # Сообщение, которое нужно показать после перезагрузки после смены HEAD.
         self._pending_workspace_status: str | None = None
+        # Контекст и результат последней сетевой операции.
+        self._remote_context: RemoteOperationContext | None = None
+        self._pending_remote_result: RemoteOperationResult | None = None
 
         self._connect_signals()
         self.statusBar().showMessage("Проверка Git…")
@@ -145,6 +159,9 @@ class MainWindow(QMainWindow):
         self.start_screen.open_repository_requested.connect(self._choose_repository)
         self.workspace_page.refresh_requested.connect(self._refresh_history)
         self.workspace_page.close_repository_requested.connect(self._close_repository)
+        self.workspace_page.fetch_requested.connect(self._on_fetch_requested)
+        self.workspace_page.pull_requested.connect(self._on_pull_requested)
+        self.workspace_page.push_requested.connect(self._on_push_requested)
         self.workspace_page.commit_selected.connect(self._on_commit_selected)
         self.workspace_page.file_selected.connect(self._on_file_selected)
         self.workspace_page.worktree_file_selected.connect(
@@ -216,6 +233,15 @@ class MainWindow(QMainWindow):
         )
         self._controller.branch_operation_failed.connect(
             self._on_branch_operation_failed
+        )
+        self._controller.remote_operation_started.connect(
+            self._on_remote_operation_started
+        )
+        self._controller.remote_operation_succeeded.connect(
+            self._on_remote_operation_succeeded
+        )
+        self._controller.remote_operation_failed.connect(
+            self._on_remote_operation_failed
         )
         self._controller.worktree_diff_loading.connect(
             self._on_worktree_diff_loading
@@ -292,6 +318,7 @@ class MainWindow(QMainWindow):
         self._changes_operation = None
         self._reset_branch_operation()
         self._pending_workspace_status = None
+        self._reset_remote_operation()
         self.workspace_page.clear()
         self.stack.setCurrentWidget(self.start_screen)
         self.start_screen.set_open_enabled(False)
@@ -317,6 +344,7 @@ class MainWindow(QMainWindow):
         self._changes_operation = None
         self._reset_branch_operation()
         self._pending_workspace_status = None
+        self._reset_remote_operation()
         self.workspace_page.clear()
         self.stack.setCurrentWidget(self.start_screen)
         self.start_screen.set_open_enabled(True)
@@ -347,6 +375,7 @@ class MainWindow(QMainWindow):
                 "В репозитории пока нет коммитов. Создайте первый коммит в Git, "
                 "затем обновите историю."
             )
+        self._apply_pending_remote_result()
 
     def _on_load_failed(self, failure: TaskFailure) -> None:
         self._pending_workspace_status = None
@@ -828,6 +857,216 @@ class MainWindow(QMainWindow):
 
     def _reset_branch_operation(self) -> None:
         self._branch_start_point = None
+
+    # --- сетевые операции: Fetch, Pull, Push ---
+
+    def _on_fetch_requested(self) -> None:
+        """Fetch выбранного в верхней панели remote."""
+        if self._controller.repository is None:
+            return
+        remote = self.workspace_page.top_bar.selected_remote
+        if remote is None:
+            self._show_notice(
+                "Fetch невозможен",
+                "В репозитории не настроен ни один remote. Добавьте remote в Git "
+                "и обновите данные репозитория.",
+            )
+            return
+        if not self._controller.fetch(remote):
+            self._announce_remote_busy()
+
+    def _on_pull_requested(self) -> None:
+        """Pull текущей ветки только fast-forward (--ff-only)."""
+        branch = self._current_branch()
+        if not self._check_remote_operation_ready(branch, action="Pull"):
+            return
+        assert branch is not None
+        if branch.upstream is None:
+            message = (
+                f"У ветки «{branch.name}» не настроен upstream. Pull только "
+                "fast-forward невозможен. Настройте upstream (например, выполните "
+                "первый Push с параметром -u) и повторите."
+            )
+            self.workspace_page.top_bar.show_remote_result(
+                "Pull невозможен: upstream не настроен.", error=True, details=message
+            )
+            self._show_notice("Pull невозможен", message)
+            return
+        if not self._controller.pull():
+            self._announce_remote_busy()
+
+    def _on_push_requested(self) -> None:
+        """Push текущей ветки в upstream или первый Push с явным выбором remote."""
+        branch = self._current_branch()
+        if not self._check_remote_operation_ready(branch, action="Push"):
+            return
+        assert branch is not None
+        if branch.upstream is None:
+            remote = self.workspace_page.top_bar.selected_remote
+            if remote is None:
+                self._show_notice(
+                    "Push невозможен",
+                    "В репозитории не настроен ни один remote. Добавьте remote, "
+                    "чтобы отправить ветку.",
+                )
+                return
+            if not self._confirm_initial_push(branch.name, remote):
+                return
+            if not self._controller.push_initial(remote):
+                self._announce_remote_busy()
+            return
+        if not self._controller.push():
+            self._announce_remote_busy()
+
+    def _current_branch(self) -> Branch | None:
+        """Текущая локальная ветка по загруженным данным."""
+        data = self.workspace_page.workspace_data
+        if data is None:
+            return None
+        return next(
+            (
+                branch
+                for branch in data.branches
+                if branch.is_current and not branch.is_remote
+            ),
+            None,
+        )
+
+    def _check_remote_operation_ready(
+        self, branch: Branch | None, *, action: str
+    ) -> bool:
+        """Общие проверки перед сетевой операцией, не запуская Git."""
+        data = self.workspace_page.workspace_data
+        if data is None or self._controller.repository is None:
+            return False
+        if data.repository.is_unborn:
+            self._show_notice(
+                f"{action} невозможен",
+                "В репозитории ещё нет коммитов: отправлять и получать нечего.",
+            )
+            return False
+        if data.repository.is_detached or branch is None:
+            self._show_notice(
+                f"{action} невозможен",
+                "HEAD не указывает на локальную ветку (detached HEAD). "
+                "Переключитесь на локальную ветку и повторите.",
+            )
+            return False
+        if not data.remotes:
+            self._show_notice(
+                f"{action} невозможен",
+                "В репозитории не настроен ни один remote. Добавьте remote в Git "
+                "и обновите данные репозитория.",
+            )
+            return False
+        return True
+
+    def _announce_remote_busy(self) -> None:
+        self.statusBar().showMessage(
+            "Другая сетевая операция уже выполняется…"
+        )
+
+    def _confirm_initial_push(self, branch_name: str, remote: str) -> bool:
+        """Спрашивает подтверждение первого Push с настройкой upstream (-u)."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Первый Push")
+        box.setText(f"У ветки «{branch_name}» не настроен upstream.")
+        box.setInformativeText(
+            f"Выполнить первый Push в remote «{remote}» с параметром -u?\n\n"
+            f"git push --set-upstream {remote} {branch_name}\n\n"
+            "После этого Pull и Push будут работать без аргументов. Force push "
+            "не выполняется."
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _on_remote_operation_started(self, context: RemoteOperationContext) -> None:
+        self._remote_context = context
+        self._pending_remote_result = None
+        # Pull меняет рабочую директорию, Fetch — remote-tracking refs: открытый diff
+        # и незавершённый ввод коммита относятся к прежнему состоянию.
+        self._hide_diff_overlay()
+        self.commit_overlay.hide_overlay()
+        self._pending_worktree_diff_refresh = None
+        self._changes_operation = None
+        text = remote_progress_text(context)
+        self.workspace_page.set_busy(True, text)
+        self.workspace_page.changes_panel.set_busy(True)
+        self.workspace_page.top_bar.show_remote_progress(text)
+        self.statusBar().showMessage(text)
+
+    def _on_remote_operation_succeeded(
+        self, result: RemoteOperationResult
+    ) -> None:
+        # Контроллер сразу перечитывает репозиторий; результат показываем после
+        # загрузки, чтобы сообщение не затёрлось счётчиками коммитов.
+        self._pending_remote_result = result
+
+    def _on_remote_operation_failed(
+        self, context: RemoteOperationContext, failure: TaskFailure
+    ) -> None:
+        self._remote_context = None
+        self._pending_remote_result = None
+        self.workspace_page.set_busy(False)
+        self.workspace_page.changes_panel.set_busy(False)
+        title = remote_error_title(context.operation)
+        branch = self._current_branch()
+        message = remote_user_message(
+            failure.exception,
+            operation=context.operation,
+            remote_name=context.remote,
+            remote_url=self._remote_url(
+                context.remote, push=context.operation == "push"
+            ),
+            branch_name=branch.name if branch is not None else None,
+            upstream=branch.upstream if branch is not None else None,
+        )
+        self.statusBar().showMessage(f"{title}.")
+        self.workspace_page.top_bar.show_remote_result(
+            f"{title}.", details=message, error=True
+        )
+        self._show_error(title, failure.exception, message=message)
+
+    def _apply_pending_remote_result(self) -> None:
+        """Показывает итог сетевой операции после перезагрузки данных."""
+        result = self._pending_remote_result
+        self._pending_remote_result = None
+        self._remote_context = None
+        if result is None:
+            return
+        text = remote_result_text(result)
+        self.workspace_page.top_bar.show_remote_result(text, details=result.output)
+        self.statusBar().showMessage(text)
+
+    def _remote_url(self, remote_name: str | None, *, push: bool) -> str | None:
+        data = self.workspace_page.workspace_data
+        if data is None or remote_name is None:
+            return None
+        remote = next(
+            (item for item in data.remotes if item.name == remote_name), None
+        )
+        if remote is None:
+            return None
+        if push:
+            return remote.push_url or remote.fetch_url
+        return remote.fetch_url or remote.push_url
+
+    def _reset_remote_operation(self) -> None:
+        self._remote_context = None
+        self._pending_remote_result = None
+
+    def _show_notice(self, title: str, message: str) -> None:
+        """Информационное сообщение: действие не запущено."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle(title)
+        box.setText(message)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
 
     def _apply_pending_diff_refresh(self) -> None:
         """После операции выбирает файл в новой секции и перезагружает его diff."""

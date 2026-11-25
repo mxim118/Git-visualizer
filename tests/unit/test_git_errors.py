@@ -122,6 +122,67 @@ INDEX_LOCK_EXISTS_STDERR = (
     "may have crashed in this repository earlier:\n"
     "remove the file manually to continue.\n"
 )
+# Реальные сообщения Git 2.54.0 (LC_ALL=C) при сетевых операциях.
+REMOTE_NOT_FOUND_STDERR = (
+    "fatal: '/tmp/missing.git' does not appear to be a git repository\n"
+    "fatal: Could not read from remote repository.\n\n"
+    "Please make sure you have the correct access rights\n"
+    "and the repository exists.\n"
+)
+AUTHENTICATION_STDERR = (
+    "fatal: could not read Username for 'https://example.com': "
+    "terminal prompts disabled\n"
+)
+PUBLICKEY_AUTH_STDERR = (
+    "git@example.com: Permission denied (publickey).\n"
+    "fatal: Could not read from remote repository.\n"
+)
+PERMISSION_STDERR = (
+    "remote: Permission to user/repo.git denied to other.\n"
+    "fatal: unable to access 'https://example.com/r.git/': "
+    "The requested URL returned error: 403\n"
+)
+PRE_RECEIVE_STDERR = (
+    "remote: access denied\n"
+    "To /tmp/remote.git\n"
+    " ! [remote rejected] main -> main (pre-receive hook declined)\n"
+    "error: failed to push some refs to '/tmp/remote.git'\n"
+)
+NON_FAST_FORWARD_STDERR = (
+    "To /tmp/remote.git\n"
+    " ! [rejected]        main -> main (non-fast-forward)\n"
+    "error: failed to push some refs to '/tmp/remote.git'\n"
+)
+FETCH_FIRST_STDERR = (
+    "To /tmp/remote.git\n"
+    " ! [rejected]        main -> main (fetch first)\n"
+    "error: failed to push some refs to '/tmp/remote.git'\n"
+    "hint: Updates were rejected because the remote contains work that you do not\n"
+)
+PULL_NOT_FAST_FORWARD_STDERR = (
+    "From /tmp/remote.git\n"
+    " * branch            main       -> FETCH_HEAD\n"
+    "fatal: Not possible to fast-forward, aborting.\n"
+)
+MERGE_CONFLICT_STDERR = (
+    "Auto-merging file.txt\n"
+    "CONFLICT (content): Merge conflict in file.txt\n"
+    "Automatic merge failed; fix conflicts and then commit the result.\n"
+)
+NETWORK_STDERR = (
+    "fatal: unable to access 'https://example.com/r.git/': "
+    "Could not resolve host: example.com\n"
+)
+CONNECTION_REFUSED_STDERR = (
+    "fatal: unable to access 'http://127.0.0.1:1/r.git/': "
+    "Failed to connect to 127.0.0.1 port 1 after 0 ms: Could not connect to server\n"
+)
+PULL_DIRTY_WORKTREE_STDERR = (
+    "error: Your local changes to the following files would be overwritten by merge:\n"
+    "\tfile.txt\n"
+    "Please commit your changes or stash them before you merge.\n"
+    "Aborting\n"
+)
 
 
 @pytest.mark.parametrize(
@@ -140,6 +201,18 @@ INDEX_LOCK_EXISTS_STDERR = (
         (LFS_FILTER_STDERR, GitErrorKind.LFS_FILTER_FAILED),
         (INDEX_LOCK_PERMISSION_STDERR, GitErrorKind.REPOSITORY_NOT_WRITABLE),
         (INDEX_LOCK_EXISTS_STDERR, GitErrorKind.INDEX_LOCKED),
+        (REMOTE_NOT_FOUND_STDERR, GitErrorKind.REMOTE_NOT_FOUND),
+        (AUTHENTICATION_STDERR, GitErrorKind.AUTHENTICATION_FAILED),
+        (PUBLICKEY_AUTH_STDERR, GitErrorKind.AUTHENTICATION_FAILED),
+        (PERMISSION_STDERR, GitErrorKind.PERMISSION_DENIED),
+        (PRE_RECEIVE_STDERR, GitErrorKind.PERMISSION_DENIED),
+        (NON_FAST_FORWARD_STDERR, GitErrorKind.NON_FAST_FORWARD),
+        (FETCH_FIRST_STDERR, GitErrorKind.NON_FAST_FORWARD),
+        (PULL_NOT_FAST_FORWARD_STDERR, GitErrorKind.NON_FAST_FORWARD),
+        (MERGE_CONFLICT_STDERR, GitErrorKind.MERGE_CONFLICT),
+        (NETWORK_STDERR, GitErrorKind.NETWORK_ERROR),
+        (CONNECTION_REFUSED_STDERR, GitErrorKind.NETWORK_ERROR),
+        (PULL_DIRTY_WORKTREE_STDERR, GitErrorKind.DIRTY_WORKTREE),
         ("FATAL: NOT A GIT REPOSITORY", GitErrorKind.NOT_A_REPOSITORY),  # регистр не важен
         ("fatal: pathspec 'x' did not match any files\n", GitErrorKind.UNKNOWN),
         ("", GitErrorKind.UNKNOWN),

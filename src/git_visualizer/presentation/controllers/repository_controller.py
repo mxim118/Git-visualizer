@@ -26,6 +26,11 @@ from git_visualizer.application.services.git_environment_service import (
 from git_visualizer.application.services.graph_service import GraphService
 from git_visualizer.application.services.history_service import HistoryService
 from git_visualizer.application.services.repository_service import RepositoryService
+from git_visualizer.application.services.remote_service import (
+    RemoteOperationContext,
+    RemoteOperationResult,
+    RemoteService,
+)
 from git_visualizer.domain.models import (
     Branch,
     ChangedFile,
@@ -95,6 +100,10 @@ class RepositoryController(QObject):
     branch_operation_succeeded = Signal(str, str)  # операция, имя ветки
     branch_operation_failed = Signal(str, str, object)  # операция, имя, TaskFailure
 
+    remote_operation_started = Signal(object)  # RemoteOperationContext
+    remote_operation_succeeded = Signal(object)  # RemoteOperationResult
+    remote_operation_failed = Signal(object, object)  # контекст, TaskFailure
+
     worktree_diff_loading = Signal(str, bool)  # path, staged
     worktree_diff_loaded = Signal(str, bool, object)  # path, staged, Diff
     worktree_diff_failed = Signal(str, bool, object)  # path, staged, TaskFailure
@@ -111,6 +120,7 @@ class RepositoryController(QObject):
         diff_service: DiffService,
         changes_service: ChangesService,
         commit_service: CommitService,
+        remote_service: RemoteService,
         git_environment_service: GitEnvironmentService,
         task_runner: TaskRunner | None = None,
         parent: QObject | None = None,
@@ -123,6 +133,7 @@ class RepositoryController(QObject):
         self._diff_service = diff_service
         self._changes_service = changes_service
         self._commit_service = commit_service
+        self._remote_service = remote_service
         self._git_environment_service = git_environment_service
         self._runner = task_runner or TaskRunner(self)
 
@@ -391,6 +402,105 @@ class RepositoryController(QObject):
             name,
             partial(self._branch_service.switch_branch, repository, name),
         )
+
+    def fetch(self, remote_name: str) -> bool:
+        """Запускает Fetch выбранного remote в фоновой задаче.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или другая сетевая операция уже выполняется.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+        return self._submit_remote_operation(
+            RemoteOperationContext(
+                operation="fetch",
+                remote=remote_name,
+                branch=repository.current_branch,
+            ),
+            partial(self._remote_service.fetch, repository, remote_name),
+        )
+
+    def pull(self) -> bool:
+        """Запускает Pull текущей ветки только с ``--ff-only`` в фоновой задаче.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или другая сетевая операция уже выполняется.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+        return self._submit_remote_operation(
+            RemoteOperationContext(
+                operation="pull", branch=repository.current_branch
+            ),
+            partial(self._remote_service.pull, repository),
+        )
+
+    def push(self) -> bool:
+        """Запускает Push текущей ветки в настроенный upstream в фоновой задаче.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или другая сетевая операция уже выполняется.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+        return self._submit_remote_operation(
+            RemoteOperationContext(
+                operation="push", branch=repository.current_branch
+            ),
+            partial(self._remote_service.push, repository),
+        )
+
+    def push_initial(self, remote_name: str) -> bool:
+        """Запускает первый Push с ``-u`` и явным remote в фоновой задаче.
+
+        Вызывается только после явного подтверждения пользователя: когда upstream
+        отсутствует, приложение не выбирает remote молча.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или другая сетевая операция уже выполняется.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+        return self._submit_remote_operation(
+            RemoteOperationContext(
+                operation="push",
+                remote=remote_name,
+                branch=repository.current_branch,
+            ),
+            partial(self._remote_service.push_initial, repository, remote_name),
+        )
+
+    def _submit_remote_operation(
+        self,
+        context: RemoteOperationContext,
+        work: Callable[[], object],
+    ) -> bool:
+        """Запускает одну сетевую операцию; повторные запуски блокируются ключом.
+
+        Ключ общий с операциями с индексом, коммитом и ветками: Fetch мог бы
+        обновить refs, а Pull — HEAD и рабочую директорию параллельно с ними.
+        Пока сетевая операция выполняется, конфликтующие действия не запускаются.
+        """
+        session = self._session
+        task = self._runner.submit(
+            work,
+            name=f"remote-{context.operation}",
+            key=f"changes-operation:{session}",
+        )
+        if task is None:
+            return False
+        self.remote_operation_started.emit(context)
+        task.succeeded.connect(
+            partial(self._handle_remote_operation_succeeded, session)
+        )
+        task.failed.connect(
+            partial(self._handle_remote_operation_failed, session, context)
+        )
+        return True
 
     def _submit_branch_operation(
         self,
@@ -671,6 +781,31 @@ class RepositoryController(QObject):
         # Git отказывает до изменения refs и не трогает рабочую директорию:
         # состояние не перезагружаем и не «исправляем», только сообщаем причину.
         self.branch_operation_failed.emit(operation, name, failure)
+
+    def _handle_remote_operation_succeeded(
+        self, session: int, result: RemoteOperationResult
+    ) -> None:
+        if session != self._session:
+            return
+        self.remote_operation_succeeded.emit(result)
+        # Fetch обновил remote-tracking refs, Pull сдвинул HEAD и рабочую директорию,
+        # Push мог настроить upstream: снимок Repository устарел. Перечитываем
+        # историю, граф, ветки/refs, текущую ветку и remote.
+        self._reload_after_head_change("reload-after-remote")
+
+    def _handle_remote_operation_failed(
+        self, session: int, context: RemoteOperationContext, failure: TaskFailure
+    ) -> None:
+        if session != self._session:
+            return
+        self.remote_operation_failed.emit(context, failure)
+        # Отказ до запуска Git (неизвестный remote, нет upstream, detached HEAD)
+        # состояние не менял — перечитывать нечего. После ошибки самой сетевой
+        # команды Git мог успеть обновить remote-tracking refs (фаза fetch в Pull)
+        # или настройки upstream, поэтому состояние перечитывается.
+        if isinstance(failure.exception, ValueError):
+            return
+        self._reload_after_head_change("reload-after-remote-failure")
 
     def _reload_after_head_change(self, task_name: str) -> bool:
         """Переоткрывает репозиторий и загружает данные после смены HEAD."""

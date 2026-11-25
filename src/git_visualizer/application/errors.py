@@ -45,3 +45,32 @@ class BareRepositoryNotSupportedError(RepositoryOpenError):
 
 class UnsafeRepositoryError(RepositoryOpenError):
     """Git отказался работать с каталогом из-за владельца (safe.directory, «dubious ownership»)."""
+
+
+class RemoteOperationValidationError(ValueError):
+    """Операция с remote отклонена до запуска Git: состояние не менялось."""
+
+
+class UnknownRemoteError(RemoteOperationValidationError):
+    """Запрошенный remote не настроен в репозитории."""
+
+    def __init__(self, remote_name: str) -> None:
+        super().__init__(f"Remote is not configured: {remote_name!r}")
+        self.remote_name = remote_name
+
+
+class NoCurrentBranchError(RemoteOperationValidationError):
+    """HEAD не указывает на локальную ветку (detached HEAD или нет коммитов)."""
+
+    def __init__(
+        self, message: str = "Current HEAD does not point to a local branch"
+    ) -> None:
+        super().__init__(message)
+
+
+class UpstreamNotConfiguredError(RemoteOperationValidationError):
+    """У текущей ветки нет настроенного upstream."""
+
+    def __init__(self, branch_name: str) -> None:
+        super().__init__(f"Branch has no configured upstream: {branch_name!r}")
+        self.branch_name = branch_name

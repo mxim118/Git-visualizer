@@ -60,6 +60,9 @@ class WorkspacePage(QWidget):
 
     refresh_requested = Signal()
     close_repository_requested = Signal()
+    fetch_requested = Signal()
+    pull_requested = Signal()
+    push_requested = Signal()
     commit_selected = Signal(str)
     file_selected = Signal(str, object)  # commit hash, FileChange
     worktree_file_selected = Signal(object, bool)  # ChangedFile, staged
@@ -143,6 +146,9 @@ class WorkspacePage(QWidget):
         self.top_bar.close_repository_requested.connect(
             self.close_repository_requested
         )
+        self.top_bar.fetch_requested.connect(self.fetch_requested)
+        self.top_bar.pull_requested.connect(self.pull_requested)
+        self.top_bar.push_requested.connect(self.push_requested)
         self.graph_view.commit_selected.connect(self._on_commit_selected)
         self.details_panel.file_selected.connect(self._on_file_selected)
         self.changes_panel.file_selected.connect(self.worktree_file_selected)
@@ -187,6 +193,7 @@ class WorkspacePage(QWidget):
         self._selected_file = None
 
         self.top_bar.set_repository(data.repository)
+        self.top_bar.set_remotes(data.remotes)
         self.graph_view.set_graph(
             data.layout,
             commits=data.commits,
@@ -200,8 +207,8 @@ class WorkspacePage(QWidget):
         else:
             self.details_panel.show_empty_repository()
 
-    def set_busy(self, busy: bool) -> None:
-        self.top_bar.set_busy(busy)
+    def set_busy(self, busy: bool, message: str | None = None) -> None:
+        self.top_bar.set_busy(busy, message)
         self.branches_panel.set_busy(busy)
 
     def clear(self) -> None:

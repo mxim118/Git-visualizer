@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import QFileDialog, QFrame, QLabel
 from git_visualizer.application.errors import NotAGitRepositoryError
 from git_visualizer.application.services.git_environment_service import GitEnvironment
 from git_visualizer.application.services.graph_service import GraphService
+from git_visualizer.application.services.remote_service import RemoteOperationResult
 from git_visualizer.domain.enums import FileChangeType
 from git_visualizer.domain.models import (
     Branch,
@@ -264,6 +266,71 @@ class FakeCommitService:
             raise self.error
 
 
+class FakeRemoteService:
+    def __init__(
+        self,
+        *,
+        error: BaseException | None = None,
+        gate: threading.Event | None = None,
+        started: threading.Event | None = None,
+    ) -> None:
+        self.error = error
+        self._gate = gate
+        self._started = started
+        self.fetch_requests: list[str] = []
+        self.pull_requests = 0
+        self.push_requests = 0
+        self.initial_push_requests: list[str] = []
+
+    def _wait(self) -> None:
+        if self._started is not None:
+            self._started.set()
+        if self._gate is not None:
+            assert self._gate.wait(5.0)
+
+    def fetch(self, repository: Repository, remote_name: str):
+        self.fetch_requests.append(remote_name)
+        self._wait()
+        if self.error is not None:
+            raise self.error
+        return RemoteOperationResult(operation="fetch", remote=remote_name)
+
+    def pull(self, repository: Repository):
+        self.pull_requests += 1
+        self._wait()
+        if self.error is not None:
+            raise self.error
+        return RemoteOperationResult(
+            operation="pull",
+            branch=repository.current_branch,
+            upstream="origin/main",
+            output="Already up to date.",
+        )
+
+    def push(self, repository: Repository):
+        self.push_requests += 1
+        self._wait()
+        if self.error is not None:
+            raise self.error
+        return RemoteOperationResult(
+            operation="push",
+            branch=repository.current_branch,
+            upstream="origin/main",
+        )
+
+    def push_initial(self, repository: Repository, remote_name: str):
+        self.initial_push_requests.append(remote_name)
+        self._wait()
+        if self.error is not None:
+            raise self.error
+        return RemoteOperationResult(
+            operation="push",
+            remote=remote_name,
+            branch=repository.current_branch,
+            upstream=f"{remote_name}/{repository.current_branch}",
+        )
+
+
 def build_controller(
     *,
     repository: Repository,
@@ -280,6 +347,7 @@ def build_controller(
     environment_error: BaseException | None = None,
     changes_service: FakeChangesService | None = None,
     commit_service: FakeCommitService | None = None,
+    remote_service: FakeRemoteService | None = None,
 ) -> tuple[RepositoryController, FakeHistoryService]:
     history = FakeHistoryService(commits, error=history_error)
     controller = RepositoryController(
@@ -294,6 +362,7 @@ def build_controller(
         ),
         changes_service=changes_service or FakeChangesService(),
         commit_service=commit_service or FakeCommitService(),
+        remote_service=remote_service or FakeRemoteService(),
         git_environment_service=FakeEnvironmentService(
             environment=environment, error=environment_error
         ),
@@ -485,9 +554,11 @@ def test_open_repository_through_folder_dialog_shows_workspace(
         assert workspace.top_bar.branch_label.text() == "Ветка: main"
         assert workspace.top_bar.refresh_button.isEnabled()
         assert workspace.top_bar.close_button.isEnabled()
-        assert not workspace.top_bar.fetch_button.isEnabled()
-        assert not workspace.top_bar.pull_button.isEnabled()
-        assert not workspace.top_bar.push_button.isEnabled()
+        assert workspace.top_bar.remote_combo.count() == 1
+        assert workspace.top_bar.selected_remote == "origin"
+        assert workspace.top_bar.fetch_button.isEnabled()
+        assert workspace.top_bar.pull_button.isEnabled()
+        assert workspace.top_bar.push_button.isEnabled()
         assert workspace.graph_view.commit_count == 2
         assert workspace.main_splitter.count() == 2
         assert workspace.body_splitter.count() == 3
@@ -1634,3 +1705,216 @@ def test_close_repository_returns_to_start_screen(
 
 def test_entry_point_is_callable() -> None:
     assert callable(main)
+
+
+# --- сетевые операции через главное окно ---
+
+
+def open_workspace_with_remote(
+    qt_app,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remote_service: FakeRemoteService,
+    *,
+    upstream: str | None = "origin/main",
+) -> MainWindow:
+    commit = make_commit("only")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(
+                name="main",
+                is_remote=False,
+                is_current=True,
+                commit_hash=commit.hash,
+                upstream=upstream,
+            ),
+            Branch(
+                name="origin/main",
+                is_remote=True,
+                is_current=False,
+                commit_hash=commit.hash,
+            ),
+        ),
+        remotes=(Remote(name="origin", fetch_url="https://example.com/r.git"),),
+        remote_service=remote_service,
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+    window = MainWindow(controller)
+    window.start_screen.open_button.click()
+    wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
+    return window
+
+
+def test_fetch_shows_progress_and_result(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    gate = threading.Event()
+    remote_service = FakeRemoteService(gate=gate, started=started)
+    window = open_workspace_with_remote(
+        qt_app, tmp_path, monkeypatch, remote_service
+    )
+    shown: list[tuple[str, BaseException]] = []
+    monkeypatch.setattr(window, "_show_error", lambda title, exc: shown.append((title, exc)))
+    try:
+        bar = window.workspace_page.top_bar
+        bar.fetch_button.click()
+        wait_until(qt_app, started.is_set)
+
+        assert remote_service.fetch_requests == ["origin"]
+        assert not bar.fetch_button.isEnabled()
+        assert not bar.pull_button.isEnabled()
+        assert "получение изменений" in bar.remote_status_label.text()
+        assert "Fetch" in window.statusBar().currentMessage()
+
+        gate.set()
+        wait_until(
+            qt_app,
+            lambda: "выполнено" in bar.remote_status_label.text(),
+        )
+        assert bar.remote_status_label.text() == "Fetch «origin»: выполнено."
+        assert bar.fetch_button.isEnabled()
+        assert shown == []
+    finally:
+        gate.set()
+        window.close()
+
+
+def test_pull_uses_upstream_and_reports_result(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote_service = FakeRemoteService()
+    window = open_workspace_with_remote(
+        qt_app, tmp_path, monkeypatch, remote_service
+    )
+    try:
+        window.workspace_page.top_bar.pull_button.click()
+        wait_until(qt_app, lambda: remote_service.pull_requests == 1)
+        wait_until(
+            qt_app,
+            lambda: "уже актуально" in window.workspace_page.top_bar.remote_status_label.text(),
+        )
+        assert "Pull «main»" in window.workspace_page.top_bar.remote_status_label.text()
+    finally:
+        window.close()
+
+
+def test_push_uses_upstream_and_reports_result(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote_service = FakeRemoteService()
+    window = open_workspace_with_remote(
+        qt_app, tmp_path, monkeypatch, remote_service
+    )
+    try:
+        window.workspace_page.top_bar.push_button.click()
+        wait_until(qt_app, lambda: remote_service.push_requests == 1)
+        wait_until(
+            qt_app,
+            lambda: "Push «main»" in window.workspace_page.top_bar.remote_status_label.text(),
+        )
+        assert remote_service.initial_push_requests == []
+    finally:
+        window.close()
+
+
+def test_push_without_upstream_offers_explicit_initial_push(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote_service = FakeRemoteService()
+    window = open_workspace_with_remote(
+        qt_app, tmp_path, monkeypatch, remote_service, upstream=None
+    )
+    confirmations: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_confirm_initial_push",
+        lambda branch, remote: confirmations.append((branch, remote)) or True,
+    )
+    try:
+        window.workspace_page.top_bar.push_button.click()
+        wait_until(qt_app, lambda: remote_service.initial_push_requests == ["origin"])
+        wait_until(
+            qt_app,
+            lambda: "Upstream: origin/main" in window.workspace_page.top_bar.remote_status_label.text(),
+        )
+        assert confirmations == [("main", "origin")]
+        assert remote_service.push_requests == 0
+    finally:
+        window.close()
+
+
+def test_push_without_upstream_cancel_does_not_run_git(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote_service = FakeRemoteService()
+    window = open_workspace_with_remote(
+        qt_app, tmp_path, monkeypatch, remote_service, upstream=None
+    )
+    monkeypatch.setattr(window, "_confirm_initial_push", lambda *args: False)
+    try:
+        window.workspace_page.top_bar.push_button.click()
+        qt_app.processEvents()
+        assert remote_service.initial_push_requests == []
+        assert remote_service.push_requests == 0
+    finally:
+        window.close()
+
+
+def test_pull_without_upstream_shows_notice_and_runs_nothing(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote_service = FakeRemoteService()
+    window = open_workspace_with_remote(
+        qt_app, tmp_path, monkeypatch, remote_service, upstream=None
+    )
+    notices: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window, "_show_notice", lambda title, message: notices.append((title, message))
+    )
+    try:
+        window.workspace_page.top_bar.pull_button.click()
+        qt_app.processEvents()
+        assert notices
+        assert notices[0][0] == "Pull невозможен"
+        assert "upstream" in notices[0][1]
+        assert remote_service.pull_requests == 0
+        assert "upstream" in window.workspace_page.top_bar.remote_status_label.text()
+    finally:
+        window.close()
+
+
+def test_network_failure_is_reported_and_ui_is_not_busy(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = GitCommandError(
+        128,
+        command=("git", "fetch", "origin"),
+        stderr="fatal: unable to access 'https://example.com/r.git/': "
+        "Could not resolve host: example.com\n",
+    )
+    remote_service = FakeRemoteService(error=error)
+    window = open_workspace_with_remote(
+        qt_app, tmp_path, monkeypatch, remote_service
+    )
+    shown: list[tuple[str, BaseException]] = []
+    reloaded: list[object] = []
+    window.controller.repository_loaded.connect(reloaded.append)
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, exc, **kwargs: shown.append((title, exc)),
+    )
+    try:
+        window.workspace_page.top_bar.fetch_button.click()
+        wait_until(qt_app, lambda: bool(shown))
+        assert shown[0][0] == "Не удалось выполнить Fetch"
+        assert shown[0][1] is error
+        assert "Сетевая ошибка" in window.workspace_page.top_bar.remote_status_label.toolTip()
+        # После ошибки контроллер перечитывает состояние Git и снимает блокировку.
+        wait_until(qt_app, lambda: bool(reloaded))
+        wait_until(qt_app, lambda: not window.workspace_page.top_bar.is_busy)
+    finally:
+        window.close()

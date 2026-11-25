@@ -19,6 +19,7 @@ from git_visualizer.application.services.git_environment_service import (
 from git_visualizer.application.services.graph_service import GraphService
 from git_visualizer.application.services.history_service import HistoryService
 from git_visualizer.application.services.repository_service import RepositoryService
+from git_visualizer.application.services.remote_service import RemoteService
 from git_visualizer.domain.models import Repository
 from git_visualizer.infrastructure.git.git_errors import GitCommandError, GitErrorKind
 from git_visualizer.infrastructure.git.git_repository import GitRepository
@@ -67,6 +68,7 @@ def build_controller() -> RepositoryController:
         diff_service=DiffService(factory),
         changes_service=ChangesService(factory),
         commit_service=CommitService(factory),
+        remote_service=RemoteService(factory),
         git_environment_service=GitEnvironmentService(runner),
     )
 
