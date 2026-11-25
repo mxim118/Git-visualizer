@@ -2,11 +2,12 @@
 
 Здесь хранится только состояние интерфейса и предпочтения пользователя: список
 недавних репозиториев, размер и положение главного окна, состояние сплиттеров,
-предпочтительный масштаб графа и лимит первоначальной загрузки коммитов.
+положение графа каждого репозитория (масштаб и центр видимой области) и лимит
+первоначальной загрузки коммитов.
 
 Никаких учётных данных здесь нет и быть не должно: пути к локальным каталогам,
 числа и состояние Qt-виджетов. Пароли, токены, URL с логином/паролем и приватные
-ключи в настройки не попадают (см. ``SETTINGS_KEYS`` — полный перечень ключей).
+ключи в настройки не попадают (см. ``SETTINGS_KEYS`` и группу ``graph_views``).
 
 Все значения имеют значения по умолчанию; повреждённые значения читаются как
 значения по умолчанию, а не приводят к падению.
@@ -14,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 from collections.abc import Iterable, Sequence
@@ -21,7 +23,11 @@ from collections.abc import Iterable, Sequence
 from PySide6.QtCore import QByteArray, QSettings
 
 from git_visualizer.application.services.history_service import DEFAULT_HISTORY_LIMIT
-from git_visualizer.presentation.widgets.graph_view import MAX_ZOOM, MIN_ZOOM
+from git_visualizer.presentation.widgets.graph_view import (
+    MAX_ZOOM,
+    MIN_ZOOM,
+    GraphViewState,
+)
 
 # Сколько недавних репозиториев хранится: список не должен расти бесконечно.
 MAX_RECENT_REPOSITORIES = 10
@@ -31,13 +37,13 @@ MIN_HISTORY_LIMIT = 100
 MAX_HISTORY_LIMIT = 20_000
 HISTORY_LIMIT_STEP = 100
 
-# Полный перечень ключей QSettings, которые использует приложение. Тест проверяет,
-# что ничего другого не сохраняется: учётных данных в настройках нет.
+# Полный перечень постоянных ключей QSettings. Положение графа хранится отдельно,
+# группами по репозиториям (см. ``GRAPH_VIEW_GROUP``): тест проверяет, что ничего
+# другого приложение не сохраняет и учётных данных там нет.
 _KEY_RECENT_REPOSITORIES = "recent/repositories"
 _KEY_WINDOW_GEOMETRY = "window/geometry"
 _KEY_MAIN_SPLITTER_STATE = "window/main_splitter_state"
 _KEY_BODY_SPLITTER_STATE = "window/body_splitter_state"
-_KEY_GRAPH_ZOOM = "graph/zoom"
 _KEY_HISTORY_LIMIT = "history/limit"
 
 SETTINGS_KEYS = (
@@ -45,14 +51,37 @@ SETTINGS_KEYS = (
     _KEY_WINDOW_GEOMETRY,
     _KEY_MAIN_SPLITTER_STATE,
     _KEY_BODY_SPLITTER_STATE,
-    _KEY_GRAPH_ZOOM,
     _KEY_HISTORY_LIMIT,
+)
+
+# Группа с положениями графа: graph_views/<sha1 пути>/path|zoom|center_x|center_y.
+GRAPH_VIEW_GROUP = "graph_views"
+_KEY_VIEW_PATH = "path"
+_KEY_VIEW_ZOOM = "zoom"
+_KEY_VIEW_CENTER_X = "center_x"
+_KEY_VIEW_CENTER_Y = "center_y"
+
+# Ключи прежней версии: один масштаб/центр на всё приложение. Читаются при
+# обновлении и переносятся в настройки самого свежего репозитория.
+_LEGACY_KEY_GRAPH_ZOOM = "graph/zoom"
+_LEGACY_KEY_GRAPH_CENTER_X = "graph/center_x"
+_LEGACY_KEY_GRAPH_CENTER_Y = "graph/center_y"
+LEGACY_GRAPH_VIEW_KEYS = (
+    _LEGACY_KEY_GRAPH_ZOOM,
+    _LEGACY_KEY_GRAPH_CENTER_X,
+    _LEGACY_KEY_GRAPH_CENTER_Y,
 )
 
 
 def normalize_path_key(path: str) -> str:
     """Ключ сравнения путей: регистр и разделители зависят от ОС."""
     return os.path.normcase(os.path.normpath(path))
+
+
+def graph_view_group(path: str) -> str:
+    """Группа QSettings с положением графа конкретного репозитория."""
+    digest = hashlib.sha1(normalize_path_key(path).encode("utf-8")).hexdigest()
+    return f"{GRAPH_VIEW_GROUP}/{digest}"
 
 
 def _clean_paths(paths: Iterable[str]) -> list[str]:
@@ -110,6 +139,17 @@ def _read_byte_array(value: object) -> QByteArray | None:
     return None
 
 
+def _read_float(value: object) -> float | None:
+    """Значение QSettings как конечное число; иначе ``None``."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _valid_history_limit(value: object) -> int:
     """Значение лимита из настроек: неверный тип — умолчание, выход за диапазон — clamp."""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -142,10 +182,10 @@ class AppSettings:
         )[:MAX_RECENT_REPOSITORIES]
 
     def set_recent_repositories(self, paths: Sequence[str]) -> None:
-        self._settings.setValue(
-            _KEY_RECENT_REPOSITORIES,
-            list(_clean_paths(paths)[:MAX_RECENT_REPOSITORIES]),
-        )
+        cleaned = _clean_paths(paths)[:MAX_RECENT_REPOSITORIES]
+        self._settings.setValue(_KEY_RECENT_REPOSITORIES, cleaned)
+        # Для репозиториев вне «Недавних» положения графа больше не нужны.
+        self.prune_graph_view_states(cleaned)
 
     def add_recent_repository(self, path: str) -> tuple[str, ...]:
         """Добавляет путь первым и сохраняет; возвращает обновлённый список."""
@@ -184,24 +224,123 @@ class AppSettings:
 
     # --- граф ---
 
-    def graph_zoom(self) -> float | None:
-        """Предпочтительный масштаб графа или ``None`` — вписывать автоматически."""
-        value = self._settings.value(_KEY_GRAPH_ZOOM)
-        if value is None or isinstance(value, bool):
-            return None
-        try:
-            zoom = float(value)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(zoom) or not (MIN_ZOOM <= zoom <= MAX_ZOOM):
-            return None
-        return zoom
+    def graph_view_state(self, repository_path: str) -> GraphViewState | None:
+        """Положение графа конкретного репозитория или ``None``.
 
-    def set_graph_zoom(self, zoom: float | None) -> None:
-        if zoom is None:
-            self._settings.remove(_KEY_GRAPH_ZOOM)
+        У каждого репозитория своё положение: маленький и большой графы не должны
+        делить масштаб и сдвиг. Повреждённый масштаб означает «вписать граф
+        автоматически», а не падение.
+        """
+        group = graph_view_group(repository_path)
+        self._settings.beginGroup(group)
+        try:
+            zoom = _read_float(self._settings.value(_KEY_VIEW_ZOOM))
+            if zoom is None or not (MIN_ZOOM <= zoom <= MAX_ZOOM):
+                return None
+            center_x = _read_float(self._settings.value(_KEY_VIEW_CENTER_X))
+            center_y = _read_float(self._settings.value(_KEY_VIEW_CENTER_Y))
+        finally:
+            self._settings.endGroup()
+        if center_x is None or center_y is None:
+            return GraphViewState(zoom=zoom)
+        return GraphViewState(zoom=zoom, center_x=center_x, center_y=center_y)
+
+    def set_graph_view_state(
+        self, repository_path: str, state: GraphViewState | None
+    ) -> None:
+        """Сохраняет положение графа репозитория; ``None`` удаляет запись.
+
+        Для репозиториев вне «Недавних» настройки не сохраняются: такие записи
+        удаляются, даже если репозиторий был в списке раньше.
+        """
+        group = graph_view_group(repository_path)
+        if state is None:
+            self._settings.remove(group)
             return
-        self._settings.setValue(_KEY_GRAPH_ZOOM, float(zoom))
+        recent = {
+            normalize_path_key(path) for path in self.recent_repositories()
+        }
+        if normalize_path_key(repository_path) not in recent:
+            self._settings.remove(group)
+            return
+        self._settings.beginGroup(group)
+        try:
+            self._settings.setValue(
+                _KEY_VIEW_PATH, normalize_path_key(repository_path)
+            )
+            self._settings.setValue(_KEY_VIEW_ZOOM, float(state.zoom))
+            if state.center_x is None or state.center_y is None:
+                # Центра нет — удаляем неполную пару, чтобы не смешивать записи.
+                self._settings.remove(_KEY_VIEW_CENTER_X)
+                self._settings.remove(_KEY_VIEW_CENTER_Y)
+            else:
+                self._settings.setValue(
+                    _KEY_VIEW_CENTER_X, float(state.center_x)
+                )
+                self._settings.setValue(
+                    _KEY_VIEW_CENTER_Y, float(state.center_y)
+                )
+        finally:
+            self._settings.endGroup()
+
+    def prune_graph_view_states(self, recent_paths: Sequence[str]) -> None:
+        """Удаляет положения графов репозиториев, которых нет в «Недавних»."""
+        recent = {normalize_path_key(path) for path in _clean_paths(recent_paths)}
+        for group in self._graph_view_groups():
+            full_group = f"{GRAPH_VIEW_GROUP}/{group}"
+            self._settings.beginGroup(full_group)
+            try:
+                stored_path = self._settings.value(_KEY_VIEW_PATH)
+            finally:
+                self._settings.endGroup()
+            if (
+                not isinstance(stored_path, str)
+                or normalize_path_key(stored_path) not in recent
+            ):
+                self._settings.remove(full_group)
+
+    def clean_up_graph_view_states(self, recent_paths: Sequence[str]) -> None:
+        """Переносит прежние общие настройки графа и чистит записи вне «Недавних».
+
+        Прежняя версия хранила один масштаб/центр на всё приложение. Переносим его
+        самому свежему репозиторию из «Недавних» (последний, с которым работали),
+        а затем удаляем записи репозиториев, которых в списке уже нет.
+        """
+        self._migrate_legacy_graph_view(recent_paths)
+        self.prune_graph_view_states(recent_paths)
+
+    def _graph_view_groups(self) -> list[str]:
+        self._settings.beginGroup(GRAPH_VIEW_GROUP)
+        try:
+            return list(self._settings.childGroups())
+        finally:
+            self._settings.endGroup()
+
+    def _migrate_legacy_graph_view(self, recent_paths: Sequence[str]) -> None:
+        if not any(
+            self._settings.contains(key) for key in LEGACY_GRAPH_VIEW_KEYS
+        ):
+            return
+        zoom = _read_float(self._settings.value(_LEGACY_KEY_GRAPH_ZOOM))
+        center_x = _read_float(self._settings.value(_LEGACY_KEY_GRAPH_CENTER_X))
+        center_y = _read_float(self._settings.value(_LEGACY_KEY_GRAPH_CENTER_Y))
+        repositories = _clean_paths(recent_paths)
+
+        if (
+            repositories
+            and zoom is not None
+            and MIN_ZOOM <= zoom <= MAX_ZOOM
+            and self.graph_view_state(repositories[0]) is None
+        ):
+            state = GraphViewState(zoom=zoom)
+            if center_x is not None and center_y is not None:
+                state = GraphViewState(
+                    zoom=zoom, center_x=center_x, center_y=center_y
+                )
+            self.set_graph_view_state(repositories[0], state)
+
+        for key in LEGACY_GRAPH_VIEW_KEYS:
+            self._settings.remove(key)
 
     # --- история ---
 

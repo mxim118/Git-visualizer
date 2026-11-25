@@ -76,13 +76,24 @@ class _LabelSpec:
     is_current: bool
 
 
+@dataclass(frozen=True, kw_only=True)
+class GraphViewState:
+    """Положение графа в окне: масштаб и центр видимой области в координатах сцены.
+
+    Центр необязателен: в настройках прежней версии сохранялся только масштаб.
+    В таком случае восстанавливается масштаб вокруг центра вписанного графа, а
+    после следующего закрытия сохраняется уже точное положение.
+    """
+
+    zoom: float
+    center_x: float | None = None
+    center_y: float | None = None
+
+
 class GraphView(QGraphicsView):
     """Отображает готовую раскладку истории; выбранный hash сообщается сигналом."""
 
     commit_selected = Signal(str)
-    # Пользователь изменил масштаб (колесо или кнопки меню). MainWindow сохраняет
-    # последнее значение как предпочтение; автоматический fit сигнал не даёт.
-    zoom_changed = Signal(float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -234,19 +245,54 @@ class GraphView(QGraphicsView):
     def zoom_out(self) -> None:
         self._zoom_by(1.0 / ZOOM_STEP)
 
-    def set_zoom_factor(self, factor: float) -> None:
-        """Устанавливает масштаб в тех же пределах, что и зум колесом.
+    def view_state(self) -> GraphViewState | None:
+        """Сохраняемое положение графа: масштаб и центр окна.
 
-        Используется для восстановления предпочтительного масштаба после загрузки
-        графа. Масштабируется центр окна; если граф не загружен, ничего не меняется.
+        ``None`` — граф не загружен, запоминать нечего. Центр берётся в
+        координатах сцены, поэтому состояние не зависит от размера окна.
         """
         if not self._node_items:
-            return
-        target = max(MIN_ZOOM, min(MAX_ZOOM, float(factor)))
-        current = self.zoom_factor
-        if current <= 0:
-            return
-        self._zoom_by(target / current)
+            return None
+        center = self.mapToScene(self.viewport().rect().center())
+        return GraphViewState(
+            zoom=self.zoom_factor,
+            center_x=center.x(),
+            center_y=center.y(),
+        )
+
+    def restore_view_state(self, state: GraphViewState) -> bool:
+        """Восстанавливает масштаб и центр окна из прошлого запуска.
+
+        Если в сохранённом состоянии нет центра (настройки прежней версии
+        хранили только масштаб), применяется масштаб вокруг центра вписанного
+        графа: точного положения там нет. Иначе положение могло быть получено
+        на другом графе (другой репозиторий) или при другом размере окна,
+        поэтому после установки оно ограничивается теми же пределами, что и
+        перетаскивание мышью: граф не уходит из окна. ``False`` — граф не загружен.
+        """
+        if not self._node_items:
+            return False
+        zoom = max(MIN_ZOOM, min(MAX_ZOOM, float(state.zoom)))
+        if state.center_x is None or state.center_y is None:
+            current = self.zoom_factor
+            if current > 0:
+                self._zoom_by(zoom / current)
+            return True
+        self.setTransform(QTransform().scale(zoom, zoom))
+        self._update_scene_rect()
+        self.centerOn(state.center_x, state.center_y)
+        # centerOn двигает полосы прокрутки целыми пикселями и теряет доли
+        # координаты сцены. Доводим центр субпиксельным translate, как при зуме
+        # колесом, чтобы позиция восстанавливалась точнее.
+        anchor = self.viewport().rect().center()
+        current = self.mapToScene(anchor)
+        self.translate(
+            current.x() - state.center_x, current.y() - state.center_y
+        )
+        # Положение с другого графа не должно уводить узлы из окна.
+        self._apply_origin(self.mapToScene(QPoint(0, 0)), strict=True)
+        self.viewport().update()
+        return True
 
     def select_commit(self, commit_hash: str, *, emit_signal: bool = False) -> bool:
         """Выбирает узел по hash; возвращает ``False``, если такого узла нет."""
@@ -522,7 +568,6 @@ class GraphView(QGraphicsView):
         if not on_content:
             # Точка вне содержимого: якорить нечего, зато граф нельзя потерять.
             self._apply_origin(self.mapToScene(QPoint(0, 0)), strict=True)
-        self.zoom_changed.emit(self.zoom_factor)
 
     def _add_ref_labels(
         self,

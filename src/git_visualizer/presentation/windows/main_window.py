@@ -10,8 +10,8 @@ MainWindow не содержит бизнес-логики: открытие р�
 
 Локальные настройки (``AppSettings`` на ``QSettings``) окно читает при создании и
 сохраняет при закрытии: недавние репозитории, геометрию, состояние сплиттеров,
-предпочтительный масштаб графа и лимит загрузки коммитов. Пароли, токены и прочие
-учётные данные в настройки не попадают.
+точное положение графа (масштаб и центр) и лимит загрузки коммитов. Пароли,
+токены и прочие учётные данные в настройки не попадают.
 """
 
 from __future__ import annotations
@@ -65,6 +65,7 @@ from git_visualizer.presentation.widgets.changes_panel import (
 )
 from git_visualizer.presentation.widgets.commit_overlay import CommitOverlay
 from git_visualizer.presentation.widgets.diff_overlay import DiffOverlay
+from git_visualizer.presentation.widgets.graph_view import GraphViewState
 from git_visualizer.presentation.widgets.start_screen import StartScreen
 from git_visualizer.presentation.widgets.workspace_page import WorkspacePage
 from git_visualizer.presentation.workers.task_runner import TaskFailure
@@ -107,8 +108,9 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self._controller = controller
         self._settings = settings
-        # Предпочтительный масштаб графа: None — вписывать историю автоматически.
-        self._preferred_graph_zoom = settings.graph_zoom()
+        # Положение графа текущего репозитория; None — вписывать автоматически.
+        self._current_repository_path: str | None = None
+        self._preferred_graph_view = None
 
         self.setWindowTitle(_WINDOW_TITLE)
         self.resize(1280, 800)
@@ -122,7 +124,12 @@ class MainWindow(QMainWindow):
             main_state=settings.main_splitter_state(),
             body_state=settings.body_splitter_state(),
         )
-        self.start_screen.set_recent_repositories(settings.recent_repositories())
+        # При запуске: переносим настройки прежней версии и убираем положения
+        # графов репозиториев, которых больше нет в «Недавних».
+        recent_repositories = settings.recent_repositories()
+        settings.clean_up_graph_view_states(recent_repositories)
+        settings.sync()
+        self.start_screen.set_recent_repositories(recent_repositories)
         # Лимит загрузки коммитов — пользовательская настройка Application-сервиса.
         self._controller.set_history_limit(settings.history_limit())
 
@@ -184,12 +191,6 @@ class MainWindow(QMainWindow):
             self._open_recent_repository
         )
         self.start_screen.settings_requested.connect(self._open_settings_dialog)
-        self.workspace_page.graph_view.zoom_changed.connect(
-            self._on_graph_zoom_changed
-        )
-        self.workspace_page.graph_view.fit_graph_action.triggered.connect(
-            self._on_graph_fit_requested
-        )
         self.workspace_page.refresh_requested.connect(self._refresh_history)
         self.workspace_page.close_repository_requested.connect(self._close_repository)
         self.workspace_page.fetch_requested.connect(self._on_fetch_requested)
@@ -343,29 +344,45 @@ class MainWindow(QMainWindow):
         self._controller.set_history_limit(limit)
         self.statusBar().showMessage(f"Лимит загрузки коммитов: {limit}.")
 
-    # --- предпочтительный масштаб графа ---
+    # --- положение графа ---
 
-    def _on_graph_zoom_changed(self, zoom: float) -> None:
-        """Запоминает масштаб, выбранный пользователем; сохраняется при закрытии."""
-        self._preferred_graph_zoom = zoom
+    def _apply_preferred_graph_view(
+        self, previous: GraphViewState | None = None
+    ) -> None:
+        """Восстанавливает положение графа после загрузки истории.
 
-    def _on_graph_fit_requested(self) -> None:
-        """«Вписать граф» сбрасывает предпочтение: дальше история вписывается сама."""
-        self._preferred_graph_zoom = None
-
-    def _apply_preferred_graph_zoom(self) -> None:
-        zoom = self._preferred_graph_zoom
-        if zoom is None:
+        ``previous`` — положение до перезагрузки данных в текущей сессии: оно
+        важнее сохранённого при запуске, чтобы обновление истории, коммит или
+        смена ветки не сбрасывали вид. При открытии нового репозитория
+        ``previous`` нет, и применяется положение из прошлого запуска.
+        """
+        state = previous or self._preferred_graph_view
+        if state is None:
             return
-        self.workspace_page.graph_view.set_zoom_factor(zoom)
+        if not self.workspace_page.graph_view.restore_view_state(state):
+            return
+        self._preferred_graph_view = self.workspace_page.graph_view.view_state()
+
+    def _remember_graph_view(self) -> None:
+        """Сохраняет положение графа текущего репозитория; без графа — ничего."""
+        repository_path = self._current_repository_path
+        if repository_path is None:
+            return
+        view_state = self.workspace_page.graph_view.view_state()
+        if view_state is None:
+            return
+        self._preferred_graph_view = view_state
+        self._settings.set_graph_view_state(repository_path, view_state)
 
     def _save_settings(self) -> None:
-        """Сохраняет геометрию окна, панели и масштаб графа при закрытии."""
+        """Сохраняет геометрию, панели и точное положение графа при закрытии."""
         self._settings.set_window_geometry(self.saveGeometry())
         main_state, body_state = self.workspace_page.panel_state()
         self._settings.set_main_splitter_state(main_state)
         self._settings.set_body_splitter_state(body_state)
-        self._settings.set_graph_zoom(self._preferred_graph_zoom)
+        # Положение снимается при закрытии: панорамирование не испускает сигналов,
+        # поэтому отдельное отслеживание каждого сдвига не нужно (и было бы шумным).
+        self._remember_graph_view()
         self._settings.sync()
 
     def _refresh_history(self) -> None:
@@ -423,17 +440,29 @@ class MainWindow(QMainWindow):
         self._reset_branch_operation()
         self._pending_workspace_status = None
         self._reset_remote_operation()
+        # Запоминаем вид до очистки: пользователь мог закрыть/сменить репозиторий,
+        # а затем выйти из приложения — положение графа не должно потеряться.
+        self._remember_graph_view()
+        self._settings.sync()
+        self._current_repository_path = None
+        self._preferred_graph_view = None
         self.workspace_page.clear()
         self.stack.setCurrentWidget(self.start_screen)
         self.start_screen.set_open_enabled(False)
         self.statusBar().showMessage(f"Открытие репозитория: {path}…")
 
     def _on_repository_opened(self, repository: Repository) -> None:
+        self._current_repository_path = str(repository.path)
         self.setWindowTitle(f"{_WINDOW_TITLE} — {repository.name}")
         self.workspace_page.set_repository(repository)
         self.stack.setCurrentWidget(self.workspace_page)
         self.start_screen.set_open_enabled(True)
-        self._remember_recent_repository(str(repository.path))
+        # Недавние обновляются первыми: это заодно чистит положения графов,
+        # выпавших из списка, после чего читаем положение текущего репозитория.
+        self._remember_recent_repository(self._current_repository_path)
+        self._preferred_graph_view = self._settings.graph_view_state(
+            self._current_repository_path
+        )
         self.statusBar().showMessage("Загрузка истории…")
 
     def _on_open_failed(self, failure: TaskFailure) -> None:
@@ -450,6 +479,12 @@ class MainWindow(QMainWindow):
         self._reset_branch_operation()
         self._pending_workspace_status = None
         self._reset_remote_operation()
+        # Закрытие репозитория не должно стирать положение графа: при следующем
+        # открытии картинка восстанавливается такой же, как была.
+        self._remember_graph_view()
+        self._settings.sync()
+        self._current_repository_path = None
+        self._preferred_graph_view = None
         self.workspace_page.clear()
         self.stack.setCurrentWidget(self.start_screen)
         self.start_screen.set_open_enabled(True)
@@ -463,9 +498,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Загрузка истории…")
 
     def _on_workspace_loaded(self, data: WorkspaceData) -> None:
+        # Положение графа до перезагрузки: сохраняем его, чтобы обновление истории
+        # или смена HEAD не сбрасывали вид на «вписать заново».
+        previous_view = self.workspace_page.graph_view.view_state()
         self.workspace_page.set_workspace_data(data)
         self.workspace_page.set_busy(False)
-        self._apply_preferred_graph_zoom()
+        self._apply_preferred_graph_view(previous_view)
         # Статус рабочей директории — отдельный запрос: он меняется независимо от HEAD.
         self._controller.load_changes()
         if self._pending_workspace_status is not None:

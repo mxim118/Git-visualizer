@@ -21,6 +21,7 @@ from git_visualizer.presentation.widgets.graph_view import (
     MIN_VISIBLE_SHARE,
     MIN_ZOOM,
     GraphView,
+    GraphViewState,
 )
 
 NOW = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
@@ -233,31 +234,59 @@ def test_wheel_zoom_uses_the_same_limits(qt_app) -> None:
     view.close()
 
 
-def test_set_zoom_factor_restores_preferred_scale(qt_app) -> None:
+def test_view_state_round_trip_restores_exact_position(qt_app) -> None:
     view = make_view(qt_app)
-    emitted: list[float] = []
-    view.zoom_changed.connect(emitted.append)
+    assert view.restore_view_state(
+        GraphViewState(zoom=0.7, center_x=48.0, center_y=24.0)
+    )
+    saved = view.view_state()
+    assert saved is not None
+    view.close()
 
-    view.set_zoom_factor(2.0)
+    restored = make_view(qt_app)
+    assert restored.restore_view_state(saved)
+    current = restored.view_state()
+    assert current is not None
+    assert abs(current.zoom - saved.zoom) < 1e-9
+    # Позиция восстанавливается субпиксельно, без округления полос прокрутки.
+    assert abs(current.center_x - saved.center_x) < 1e-6
+    assert abs(current.center_y - saved.center_y) < 1e-6
+    restored.close()
+
+
+def test_restore_view_state_keeps_legacy_zoom_without_center(qt_app) -> None:
+    view = make_view(qt_app)
+    center_before = view.mapToScene(view.viewport().rect().center())
+
+    assert view.restore_view_state(GraphViewState(zoom=2.0))
 
     assert abs(view.zoom_factor - 2.0) < 1e-9
-    assert emitted and abs(emitted[-1] - 2.0) < 1e-9
+    # Центр вписанного графа не сдвигается: в старых настройках его не было.
+    center_after = view.mapToScene(view.viewport().rect().center())
+    assert abs(center_after.x() - center_before.x()) < 1e-6
+    assert abs(center_after.y() - center_before.y()) < 1e-6
     view.close()
 
 
-def test_set_zoom_factor_is_clamped_and_ignored_without_graph(qt_app) -> None:
+def test_restore_view_state_is_clamped_and_ignored_without_graph(qt_app) -> None:
     view = make_view(qt_app)
 
-    view.set_zoom_factor(100.0)
-    assert abs(view.zoom_factor - MAX_ZOOM) < 1e-9
-
-    view.set_zoom_factor(0.0)
-    assert abs(view.zoom_factor - MIN_ZOOM) < 1e-9
+    assert view.restore_view_state(
+        GraphViewState(zoom=100.0, center_x=100_000.0, center_y=-100_000.0)
+    )
+    clamped = view.view_state()
+    assert clamped is not None
+    assert clamped.zoom <= MAX_ZOOM + 1e-9
+    # Сохранённое положение другого графа не уводит узлы из окна.
+    visible = view.mapToScene(view.viewport().rect()).boundingRect()
+    assert visible.intersects(view.scene().itemsBoundingRect())
     view.close()
 
     empty = GraphView()
-    empty.set_zoom_factor(2.0)
-    assert abs(empty.zoom_factor - 1.0) < 1e-9
+    assert empty.view_state() is None
+    assert not empty.restore_view_state(
+        GraphViewState(zoom=1.0, center_x=0.0, center_y=0.0)
+    )
     empty.close()
 
 

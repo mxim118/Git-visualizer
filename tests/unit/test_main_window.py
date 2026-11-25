@@ -46,6 +46,7 @@ from git_visualizer.presentation.widgets.diff_view import (
     DiffView,
     classify_diff_line,
 )
+from git_visualizer.presentation.widgets.graph_view import GraphViewState
 from git_visualizer.presentation.windows.main_window import MainWindow
 
 NOW = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
@@ -392,19 +393,60 @@ def wait_until(
 
 
 class MemorySettingsStorage:
-    """Замена ``QSettings`` для тестов, которым не важно сохранение на диск."""
+    """Замена ``QSettings`` для тестов, которым не важно сохранение на диск.
+
+    Поддерживает используемую приложением часть API: группы, ``contains`` и
+    ``remove`` вместе с вложенными ключами.
+    """
 
     def __init__(self) -> None:
         self._values: dict[str, object] = {}
+        self._prefix = ""
+
+    def _key(self, key: str) -> str:
+        key = key.strip("/")
+        if not self._prefix:
+            return key
+        return f"{self._prefix}/{key}" if key else self._prefix
+
+    def beginGroup(self, prefix: str) -> None:  # noqa: N802 (QSettings API)
+        self._prefix = self._key(prefix)
+
+    def endGroup(self) -> None:  # noqa: N802 (QSettings API)
+        self._prefix = (
+            self._prefix.rsplit("/", 1)[0] if "/" in self._prefix else ""
+        )
 
     def value(self, key: str, default: object = None) -> object:
-        return self._values.get(key, default)
+        return self._values.get(self._key(key), default)
 
     def setValue(self, key: str, value: object) -> None:  # noqa: N802 (QSettings API)
-        self._values[key] = value
+        self._values[self._key(key)] = value
 
     def remove(self, key: str) -> None:
-        self._values.pop(key, None)
+        full_key = self._key(key)
+        self._values.pop(full_key, None)
+        nested_prefix = f"{full_key}/"
+        for nested in [
+            item for item in self._values if item.startswith(nested_prefix)
+        ]:
+            self._values.pop(nested, None)
+
+    def contains(self, key: str) -> bool:
+        return self._key(key) in self._values
+
+    def childGroups(self) -> list[str]:  # noqa: N802 (QSettings API)
+        prefix = f"{self._prefix}/" if self._prefix else ""
+        return sorted(
+            {
+                item[len(prefix):].split("/", 1)[0]
+                for item in self._values
+                if item.startswith(prefix) and "/" in item[len(prefix):]
+            }
+        )
+
+    def allKeys(self) -> list[str]:  # noqa: N802 (QSettings API)
+        return list(self._values)
 
     def sync(self) -> None:
         pass
@@ -435,6 +477,18 @@ def make_settings(tmp_path: Path) -> AppSettings:
             QSettings.Format.IniFormat,
         )
     )
+
+
+def assert_view_state_close(
+    actual: GraphViewState | None,
+    expected: GraphViewState,
+    *,
+    tolerance: float = 1e-6,
+) -> None:
+    assert actual is not None
+    assert abs(actual.zoom - expected.zoom) < 1e-9
+    assert abs(actual.center_x - expected.center_x) < tolerance
+    assert abs(actual.center_y - expected.center_y) < tolerance
 
 
 def patch_folder_dialog(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
@@ -2051,7 +2105,7 @@ def test_opened_repository_becomes_the_first_recent(
         )
 
 
-def test_window_panel_zoom_and_history_settings_survive_restart(
+def test_window_panel_graph_position_and_history_settings_survive_restart(
     qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     commit = make_commit("head")
@@ -2072,14 +2126,17 @@ def test_window_panel_zoom_and_history_settings_survive_restart(
         qt_app.processEvents()
         window.workspace_page.main_splitter.setSizes([420, 210])
         window.workspace_page.body_splitter.setSizes([220, 560, 400])
-        window.workspace_page.graph_view.zoom_in()
+        window.workspace_page.graph_view.restore_view_state(
+            GraphViewState(zoom=0.7, center_x=48.0, center_y=24.0)
+        )
         qt_app.processEvents()
 
         expected_size = window.size()
         workspace = window.workspace_page
         expected_main = workspace.main_splitter.sizes()
         expected_body = workspace.body_splitter.sizes()
-        expected_zoom = workspace.graph_view.zoom_factor
+        expected_view = workspace.graph_view.view_state()
+        assert expected_view is not None
     finally:
         window.close()
 
@@ -2099,9 +2156,13 @@ def test_window_panel_zoom_and_history_settings_survive_restart(
         assert window.size() == QSize(expected_size)
         assert window.workspace_page.main_splitter.sizes() == expected_main
         assert window.workspace_page.body_splitter.sizes() == expected_body
-        assert abs(
-            window.workspace_page.graph_view.zoom_factor - expected_zoom
-        ) < 1e-6
+        restored_view = window.workspace_page.graph_view.view_state()
+        assert restored_view is not None
+        assert abs(restored_view.zoom - expected_view.zoom) < 1e-9
+        assert abs(restored_view.center_x - expected_view.center_x) < 1e-6
+        assert abs(restored_view.center_y - expected_view.center_y) < 1e-6
+        # Восстановленное положение сохраняется и в самом файле настроек.
+        assert second_settings.graph_view_state(str(tmp_path)) == expected_view
         # Лимит истории применился к открытию репозитория во втором запуске.
         assert history.limits == [700]
     finally:
@@ -2154,7 +2215,7 @@ def test_settings_dialog_returns_selected_history_limit(qt_app) -> None:
         dialog.close()
 
 
-def test_fit_graph_clears_preferred_zoom(
+def test_graph_position_survives_history_refresh(
     qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     commit = make_commit("head")
@@ -2169,8 +2230,177 @@ def test_fit_graph_clears_preferred_zoom(
         wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
 
         graph = window.workspace_page.graph_view
-        graph.zoom_in()
-        assert window._preferred_graph_zoom is not None
+        graph.restore_view_state(
+            GraphViewState(zoom=0.7, center_x=48.0, center_y=24.0)
+        )
+        expected = graph.view_state()
+        assert expected is not None
+        reloaded: list[object] = []
+        controller.repository_loaded.connect(reloaded.append)
 
-        graph.fit_graph_action.trigger()
-        assert window._preferred_graph_zoom is None
+        window.workspace_page.refresh_requested.emit()
+        wait_until(qt_app, lambda: bool(reloaded))
+        qt_app.processEvents()
+
+        current = graph.view_state()
+        assert current is not None
+        assert abs(current.zoom - expected.zoom) < 1e-9
+        assert abs(current.center_x - expected.center_x) < 1e-6
+        assert abs(current.center_y - expected.center_y) < 1e-6
+
+
+def test_closing_on_start_screen_keeps_saved_graph_position(
+    qt_app, tmp_path: Path, app_settings
+) -> None:
+    saved = GraphViewState(zoom=0.8, center_x=20.0, center_y=-10.0)
+    app_settings.add_recent_repository(str(tmp_path))
+    app_settings.set_graph_view_state(str(tmp_path), saved)
+    app_settings.sync()
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=None)
+    )
+
+    with opened_window(controller, app_settings) as window:
+        assert window.workspace_page.graph_view.view_state() is None
+
+    # Графа не было: сохранённое положение не затёрто пустым значением.
+    assert make_settings(tmp_path).graph_view_state(str(tmp_path)) == saved
+
+
+def test_legacy_zoom_only_settings_restore_zoom_on_open(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Настройки прежней версии хранили только масштаб — он не должен теряться."""
+    commit = make_commit("head")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+    )
+    storage = QSettings(
+        str(tmp_path / "git-visualizer-settings.ini"),
+        QSettings.Format.IniFormat,
+    )
+    storage.setValue("recent/repositories", [str(tmp_path)])
+    storage.setValue("graph/zoom", 0.75)
+    storage.sync()
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller, AppSettings(storage)) as window:
+        window.start_screen.open_button.click()
+        wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
+        qt_app.processEvents()
+
+        assert abs(window.workspace_page.graph_view.zoom_factor - 0.75) < 1e-6
+
+    # После закрытия сохраняется уже полное положение — с центром.
+    saved = make_settings(tmp_path).graph_view_state(str(tmp_path))
+    assert saved is not None
+    assert saved.center_x is not None
+    assert saved.center_y is not None
+
+
+def test_graph_position_is_saved_when_repository_is_closed(
+    qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = make_commit("head")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller, app_settings) as window:
+        window.start_screen.open_button.click()
+        wait_until(qt_app, lambda: window.workspace_page.workspace_data is not None)
+
+        graph = window.workspace_page.graph_view
+        graph.restore_view_state(
+            GraphViewState(zoom=0.7, center_x=48.0, center_y=24.0)
+        )
+        expected = graph.view_state()
+        assert expected is not None
+
+        window.workspace_page.top_bar.close_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.stack.currentWidget() is window.start_screen,
+        )
+
+    # Выход из приложения уже на стартовом экране не должен терять положение.
+    saved = make_settings(tmp_path).graph_view_state(str(tmp_path))
+    assert saved is not None
+    assert abs(saved.zoom - expected.zoom) < 1e-9
+    assert saved.center_x == expected.center_x
+    assert saved.center_y == expected.center_y
+
+
+def test_graph_view_settings_are_independent_for_each_repository(
+    qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Вид большого и маленького графа хранится отдельно и не переносится."""
+    big_path = tmp_path / "big-repo"
+    small_path = tmp_path / "small-repo"
+    big_path.mkdir()
+    small_path.mkdir()
+    commit = make_commit("head")
+    selected_path = {"value": big_path}
+    monkeypatch.setattr(
+        QFileDialog,
+        "getExistingDirectory",
+        lambda *args, **kwargs: str(selected_path["value"]),
+    )
+
+    def open_repository(window: MainWindow, path: Path) -> None:
+        selected_path["value"] = path
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None
+            and window.workspace_page.workspace_data.repository.path == path,
+        )
+        qt_app.processEvents()
+
+    def build_window(path: Path) -> MainWindow:
+        controller, _ = build_controller(
+            repository=make_repository(path, head_commit=commit.hash),
+            commits=(commit,),
+        )
+        window = MainWindow(controller, app_settings)
+        window.show()
+        return window
+
+    big_view = GraphViewState(zoom=0.2, center_x=120.0, center_y=240.0)
+    window = build_window(big_path)
+    try:
+        open_repository(window, big_path)
+        window.workspace_page.graph_view.restore_view_state(big_view)
+        saved_big = window.workspace_page.graph_view.view_state()
+    finally:
+        window.close()
+
+    small_view = GraphViewState(zoom=3.0, center_x=-10.0, center_y=-20.0)
+    window = build_window(small_path)
+    try:
+        open_repository(window, small_path)
+        initial = window.workspace_page.graph_view.view_state()
+        # В маленьком репозитории нет вида большого графа: граф вписан заново.
+        assert initial is not None
+        assert abs(initial.zoom - big_view.zoom) > 1e-6
+        window.workspace_page.graph_view.restore_view_state(small_view)
+        saved_small = window.workspace_page.graph_view.view_state()
+    finally:
+        window.close()
+
+    # Повторное открытие большого репозитория возвращает именно его вид.
+    window = build_window(big_path)
+    try:
+        open_repository(window, big_path)
+        assert_view_state_close(
+            window.workspace_page.graph_view.view_state(), saved_big
+        )
+    finally:
+        window.close()
+
+    stored = make_settings(tmp_path)
+    assert_view_state_close(stored.graph_view_state(str(big_path)), saved_big)
+    assert_view_state_close(stored.graph_view_state(str(small_path)), saved_small)
