@@ -22,6 +22,11 @@ class GitErrorKind(Enum):
     UNSAFE_REPOSITORY = "unsafe_repository"  # «dubious ownership»: чужой владелец каталога
     MISSING_AUTHOR = "missing_author"  # не настроены user.name / user.email
     UNMERGED_FILES = "unmerged_files"  # коммит при неразрешённых конфликтах
+    BRANCH_ALREADY_EXISTS = "branch_already_exists"  # имя ветки уже занято
+    INVALID_BRANCH_NAME = "invalid_branch_name"  # git check-ref-format отклонил имя
+    REF_NOT_FOUND = "ref_not_found"  # ветка или коммит не найдены
+    DIRTY_WORKTREE = "dirty_worktree"  # переключение перезаписало бы изменения
+    OPERATION_IN_PROGRESS = "operation_in_progress"  # идёт merge/rebase/cherry-pick
 
 
 # (вид ошибки, фрагмент stderr в нижнем регистре); побеждает первое совпадение.
@@ -31,11 +36,21 @@ _STDERR_RULES: tuple[tuple[GitErrorKind, str], ...] = (
     (GitErrorKind.MISSING_AUTHOR, "author identity unknown"),
     (GitErrorKind.MISSING_AUTHOR, "unable to auto-detect email address"),
     (GitErrorKind.MISSING_AUTHOR, "please tell me who you are"),
+    (GitErrorKind.INVALID_BRANCH_NAME, "is not a valid branch name"),
+    (GitErrorKind.BRANCH_ALREADY_EXISTS, "a branch named"),
+    (GitErrorKind.REF_NOT_FOUND, "invalid reference:"),
+    (GitErrorKind.REF_NOT_FOUND, "not a valid object name"),
+    (GitErrorKind.DIRTY_WORKTREE, "would be overwritten by checkout"),
+    (
+        GitErrorKind.OPERATION_IN_PROGRESS,
+        "cannot switch branch while ",
+    ),
     (
         GitErrorKind.UNMERGED_FILES,
         "committing is not possible because you have unmerged files",
     ),
     (GitErrorKind.UNMERGED_FILES, "exiting because of an unresolved conflict"),
+    (GitErrorKind.UNMERGED_FILES, "you need to resolve your current index first"),
 )
 
 

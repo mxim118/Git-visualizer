@@ -1,9 +1,10 @@
 """Координация Application Services для главного окна.
 
 Контроллер выполняет открытие репозитория, проверку Git, загрузку данных истории,
-состояния рабочей директории, diff файла и создание коммита в фоновых задачах
-``TaskRunner``. Он не знает о виджетах: результат сообщается сигналами, которые
-MainWindow связывает с интерфейсом. Бизнес-логика остаётся в Application Services.
+состояния рабочей директории, diff файла, создание коммита и операции с ветками в
+фоновых задачах ``TaskRunner``. Он не знает о виджетах: результат сообщается
+сигналами, которые MainWindow связывает с интерфейсом. Бизнес-логика остаётся в
+Application Services.
 """
 
 from __future__ import annotations
@@ -89,6 +90,10 @@ class RepositoryController(QObject):
     commit_started = Signal()
     commit_succeeded = Signal()
     commit_failed = Signal(object)  # TaskFailure
+
+    branch_operation_started = Signal(str, str)  # операция, имя ветки
+    branch_operation_succeeded = Signal(str, str)  # операция, имя ветки
+    branch_operation_failed = Signal(str, str, object)  # операция, имя, TaskFailure
 
     worktree_diff_loading = Signal(str, bool)  # path, staged
     worktree_diff_loaded = Signal(str, bool, object)  # path, staged, Diff
@@ -346,6 +351,81 @@ class RepositoryController(QObject):
         task.failed.connect(partial(self._handle_commit_failed, session))
         return True
 
+    def create_branch(self, name: str, *, start_point: str | None = None) -> bool:
+        """Создаёт локальную ветку в фоновой задаче.
+
+        ``start_point=None`` — от текущего HEAD, иначе от выбранного коммита.
+        Делит ключ с операциями с индексом и коммитом: смена HEAD/рабочей
+        директории не должна происходить параллельно с ними. После успеха
+        контроллер переоткрывает репозиторий и заново загружает историю, граф,
+        ветки/refs и remote; Changes обновляет MainWindow по ``repository_loaded``.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или другая операция уже выполняется.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+        return self._submit_branch_operation(
+            "create",
+            name,
+            partial(
+                self._branch_service.create_branch,
+                repository,
+                name,
+                start_point=start_point,
+            ),
+        )
+
+    def switch_branch(self, name: str) -> bool:
+        """Переключается на существующую локальную ветку в фоновой задаче.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или другая операция уже выполняется.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+        return self._submit_branch_operation(
+            "switch",
+            name,
+            partial(self._branch_service.switch_branch, repository, name),
+        )
+
+    def _submit_branch_operation(
+        self,
+        operation: str,
+        name: str,
+        work: Callable[[], object],
+    ) -> bool:
+        """Запускает операцию с ветками; не параллелит её с индексом и коммитом."""
+        session = self._session
+        task = self._runner.submit(
+            work,
+            name=f"branch-{operation}",
+            key=f"changes-operation:{session}",
+        )
+        if task is None:
+            return False
+        self.branch_operation_started.emit(operation, name)
+        task.succeeded.connect(
+            partial(
+                self._handle_branch_operation_succeeded,
+                session,
+                operation,
+                name,
+            )
+        )
+        task.failed.connect(
+            partial(
+                self._handle_branch_operation_failed,
+                session,
+                operation,
+                name,
+            )
+        )
+        return True
+
     def _submit_changes_operation(
         self, name: str, operation: Callable[..., object], *args
     ) -> bool:
@@ -562,7 +642,7 @@ class RepositoryController(QObject):
         # Коммит сдвинул HEAD: снимок Repository устарел (он описывает HEAD на момент
         # открытия). Переоткрываем репозиторий и загружаем всё состояние заново —
         # историю, граф, ветки, refs и remote; Changes обновит MainWindow.
-        self._reload_after_commit()
+        self._reload_after_head_change("reload-after-commit")
 
     def _handle_commit_failed(self, session: int, failure: TaskFailure) -> None:
         if session != self._session:
@@ -572,8 +652,28 @@ class RepositoryController(QObject):
         # затронут: показываем фактическое состояние, чтобы пользователь мог повторить.
         self.load_changes()
 
-    def _reload_after_commit(self) -> bool:
-        """Переоткрывает репозиторий и загружает данные после успешного коммита."""
+    def _handle_branch_operation_succeeded(
+        self, session: int, operation: str, name: str, _result: object = None
+    ) -> None:
+        if session != self._session:
+            return
+        self.branch_operation_succeeded.emit(operation, name)
+        # Создание или переключение сдвинуло HEAD (и, возможно, рабочую директорию):
+        # снимок Repository устарел. Переоткрываем репозиторий и загружаем HEAD,
+        # историю, граф, ветки/refs и remote; Changes обновит MainWindow.
+        self._reload_after_head_change("reload-after-branch")
+
+    def _handle_branch_operation_failed(
+        self, session: int, operation: str, name: str, failure: TaskFailure
+    ) -> None:
+        if session != self._session:
+            return
+        # Git отказывает до изменения refs и не трогает рабочую директорию:
+        # состояние не перезагружаем и не «исправляем», только сообщаем причину.
+        self.branch_operation_failed.emit(operation, name, failure)
+
+    def _reload_after_head_change(self, task_name: str) -> bool:
+        """Переоткрывает репозиторий и загружает данные после смены HEAD."""
         repository = self._repository
         if repository is None:
             return False
@@ -583,7 +683,7 @@ class RepositoryController(QObject):
         session = self._session
         task = self._runner.submit(
             partial(self._open_and_load, repository.path),
-            name="reload-after-commit",
+            name=task_name,
             key=f"load:{session}",
         )
         if task is None:

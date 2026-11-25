@@ -1,6 +1,12 @@
-"""Сценарии получения веток и меток refs.
+"""Сценарии получения, создания и переключения веток и меток refs.
 
-Создание и переключение веток (ТЗ, итерация 6) здесь пока не реализованы.
+Создание и переключение выполняются через ``git switch``. Перед созданием имя
+проверяется по правилам Git (``check-ref-format --branch``); собственная проверка
+Application отсекает только заведомо недопустимые значения (пустое имя, дефис в
+начале, shorthand ``@{...}``). Принудительных опций нет: если незакоммиченные
+изменения конфликтуют с переключением, Git отказывает и репозиторий остаётся
+неизменённым. После успешной операции снимок ``Repository`` устаревает (он
+описывает HEAD на момент открытия) — Presentation переоткрывает репозиторий.
 """
 
 from collections.abc import Iterable, Mapping
@@ -42,6 +48,76 @@ class BranchService:
     def get_ref_labels(self, repository: Repository) -> Mapping[str, tuple[RefLabel, ...]]:
         """Метки для графа: hash коммита → все ссылки, указывающие на него."""
         return build_ref_labels(repository, self.get_branches(repository))
+
+    @staticmethod
+    def validate_branch_name(name: str) -> str:
+        """Проверяет заведомо недопустимое имя до запуска Git.
+
+        Обрезает окружающие пробельные символы ASCII (пробел, табуляция, переводы
+        строк): они не могут входить в имя ветки, а случайно введённые в начале или
+        конце не должны мешать. Полная проверка синтаксиса refs остаётся за Git
+        (``check-ref-format``); здесь отсекаются случаи, на которых Git отвечает
+        ошибкой использования или разрешает неоднозначный shorthand:
+
+        * пустое имя или имя только из пробельных символов;
+        * имя, начинающееся с дефиса (его легко спутать с опцией команды);
+        * ``@{...}`` — Git трактует это как ссылку на прошлое состояние HEAD, а не
+          как имя новой ветки.
+
+        :return: имя без окружающих ASCII-пробелов.
+        :raises ValueError: имя пустое или заведомо недопустимо.
+        """
+        name = name.strip(" \t\r\n")
+        if not name:
+            raise ValueError("Branch name must not be empty or whitespace-only")
+        if name.startswith("-"):
+            raise ValueError("Branch name must not start with '-'")
+        if "@{" in name:
+            raise ValueError("Branch name must not contain '@{'")
+        return name
+
+    def create_branch(
+        self,
+        repository: Repository,
+        name: str,
+        *,
+        start_point: str | None = None,
+    ) -> None:
+        """Создаёт локальную ветку и переключается на неё.
+
+        ``start_point=None`` — от текущего ``HEAD``; иначе от выбранного коммита
+        (передаётся hash). Существующая ветка не перезаписывается, а незакоммиченные
+        изменения не удаляются: Git либо переносит их безопасно, либо отказывает,
+        оставляя рабочую директорию и refs как были.
+
+        :raises ValueError: пустое или заведомо недопустимое имя.
+        :raises GitError: Git отклонил имя, ветка уже существует, коммит не найден
+            или переключение небезопасно (пробрасывается без изменений).
+        """
+        name = self.validate_branch_name(name)
+        if start_point is not None:
+            start_point = start_point.strip()
+            if not start_point:
+                raise ValueError("Branch start point must not be empty")
+
+        git = self._git_repository_factory(repository.path)
+        git.validate_branch_name(name)
+        git.create_branch(name, start_point=start_point)
+
+    def switch_branch(self, repository: Repository, name: str) -> None:
+        """Переключается на существующую локальную ветку через ``git switch``.
+
+        Безопасность рабочей директории обеспечивает Git: приложение не передаёт
+        опций принудительного переключения и не удаляет изменения. Если Git отказывает,
+        причина приходит типизированной ошибкой, а репозиторий остаётся неизменным.
+
+        :raises ValueError: пустое или заведомо недопустимое имя.
+        :raises GitError: ветка не найдена, переключение перезаписало бы изменения
+            или идёт незавершённая операция (пробрасывается без изменений).
+        """
+        name = self.validate_branch_name(name)
+        git = self._git_repository_factory(repository.path)
+        git.switch_branch(name)
 
 
 def build_ref_labels(

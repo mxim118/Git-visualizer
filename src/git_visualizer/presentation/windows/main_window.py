@@ -1,12 +1,12 @@
 """Главное окно: стартовый экран, рабочая область и координация с контроллером.
 
 MainWindow не содержит бизнес-логики: открытие репозитория, проверка Git, загрузка
-истории, списка файлов, diff, состояния рабочей директории, операции stage/unstage и
-создание коммита выполняются Application Services через ``RepositoryController``. Здесь —
-только диалоги, переключение экранов, фильтрация устаревших результатов по выбранному
-коммиту/файлу, подтверждение области действия массовой операции и передача данных
-виджетам. Diff файла коммита показывается в большой панели ``DiffOverlay`` поверх
-всего окна.
+истории, списка файлов, diff, состояния рабочей директории, операции stage/unstage,
+создание коммита и операции с ветками выполняются Application Services через
+``RepositoryController``. Здесь — только диалоги, переключение экранов, фильтрация
+устаревших результатов по выбранному коммиту/файлу, подтверждение области действия
+массовой операции и передачи данных виджетам. Diff файла коммита показывается в
+большой панели ``DiffOverlay`` поверх всего окна.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from git_visualizer.presentation.controllers.repository_controller import (
     WorkspaceData,
 )
 from git_visualizer.presentation.error_texts import (
+    branch_user_message,
     commit_user_message,
     technical_details,
     user_message,
@@ -62,6 +63,14 @@ _OPERATION_ERROR_TITLES: dict[str, str] = {
     "unstage-file": "Не удалось убрать файл из индекса",
     "stage-all": "Не удалось добавить изменения в индекс",
     "unstage-all": "Не удалось убрать изменения из индекса",
+}
+_BRANCH_PROGRESS: dict[str, str] = {
+    "create": "Создание ветки…",
+    "switch": "Переключение ветки…",
+}
+_BRANCH_ERROR_TITLES: dict[str, str] = {
+    "create": "Не удалось создать ветку",
+    "switch": "Не удалось переключить ветку",
 }
 
 
@@ -101,6 +110,10 @@ class MainWindow(QMainWindow):
         self._changes_operation: str | None = None
         # Diff какого файла обновить после операции: (путь, секция после операции).
         self._pending_worktree_diff_refresh: tuple[str, bool] | None = None
+        # Начальная точка создаваемой ветки для текста ошибки, если Git не нашёл коммит.
+        self._branch_start_point: str | None = None
+        # Сообщение, которое нужно показать после перезагрузки после смены HEAD.
+        self._pending_workspace_status: str | None = None
 
         self._connect_signals()
         self.statusBar().showMessage("Проверка Git…")
@@ -156,6 +169,12 @@ class MainWindow(QMainWindow):
         self.workspace_page.changes_commit_requested.connect(
             self._open_commit_overlay
         )
+        self.workspace_page.branch_create_requested.connect(
+            self._on_branch_create_requested
+        )
+        self.workspace_page.branch_switch_requested.connect(
+            self._on_branch_switch_requested
+        )
         self.commit_overlay.submitted.connect(self._on_commit_submitted)
         self.diff_overlay.close_requested.connect(self._close_file_diff)
 
@@ -189,6 +208,15 @@ class MainWindow(QMainWindow):
         self._controller.commit_started.connect(self._on_commit_started)
         self._controller.commit_succeeded.connect(self._on_commit_succeeded)
         self._controller.commit_failed.connect(self._on_commit_failed)
+        self._controller.branch_operation_started.connect(
+            self._on_branch_operation_started
+        )
+        self._controller.branch_operation_succeeded.connect(
+            self._on_branch_operation_succeeded
+        )
+        self._controller.branch_operation_failed.connect(
+            self._on_branch_operation_failed
+        )
         self._controller.worktree_diff_loading.connect(
             self._on_worktree_diff_loading
         )
@@ -262,6 +290,8 @@ class MainWindow(QMainWindow):
         self.commit_overlay.hide_overlay()
         self._pending_worktree_diff_refresh = None
         self._changes_operation = None
+        self._reset_branch_operation()
+        self._pending_workspace_status = None
         self.workspace_page.clear()
         self.stack.setCurrentWidget(self.start_screen)
         self.start_screen.set_open_enabled(False)
@@ -285,6 +315,8 @@ class MainWindow(QMainWindow):
         self.commit_overlay.hide_overlay()
         self._pending_worktree_diff_refresh = None
         self._changes_operation = None
+        self._reset_branch_operation()
+        self._pending_workspace_status = None
         self.workspace_page.clear()
         self.stack.setCurrentWidget(self.start_screen)
         self.start_screen.set_open_enabled(True)
@@ -302,7 +334,10 @@ class MainWindow(QMainWindow):
         self.workspace_page.set_busy(False)
         # Статус рабочей директории — отдельный запрос: он меняется независимо от HEAD.
         self._controller.load_changes()
-        if data.commits:
+        if self._pending_workspace_status is not None:
+            self.statusBar().showMessage(self._pending_workspace_status)
+            self._pending_workspace_status = None
+        elif data.commits:
             self.statusBar().showMessage(
                 f"Коммитов загружено: {len(data.commits)}. "
                 f"Веток: {len(data.branches)}."
@@ -314,6 +349,8 @@ class MainWindow(QMainWindow):
             )
 
     def _on_load_failed(self, failure: TaskFailure) -> None:
+        self._pending_workspace_status = None
+        self._reset_branch_operation()
         self.workspace_page.set_busy(False)
         self.statusBar().showMessage("Не удалось загрузить историю.")
         self._show_error("Не удалось загрузить историю", failure.exception)
@@ -651,6 +688,146 @@ class MainWindow(QMainWindow):
             failure.exception,
             message=commit_user_message(failure.exception),
         )
+
+    # --- создание и переключение веток ---
+
+    def _on_branch_create_requested(
+        self, name: str, start_point: object
+    ) -> None:
+        """Создаёт ветку от текущего HEAD или от выбранного коммита."""
+        if self._controller.repository is None:
+            return
+        start_hash = start_point if isinstance(start_point, str) else None
+        if start_hash is not None:
+            commit = self._find_commit(start_hash)
+            if commit is None:
+                self.statusBar().showMessage(
+                    "Выбранный коммит больше не найден: обновите историю."
+                )
+                return
+            if not self._confirm_branch_head_change("create", name, commit):
+                return
+
+        self._reset_branch_operation()
+        self._branch_start_point = start_hash
+        if not self._controller.create_branch(name, start_point=start_hash):
+            self._reset_branch_operation()
+            self.statusBar().showMessage(
+                "Другая операция с индексом или смена HEAD уже выполняется…"
+            )
+
+    def _on_branch_switch_requested(self, name: str) -> None:
+        """Переключает на существующую локальную ветку."""
+        data = self.workspace_page.workspace_data
+        if data is None or self._controller.repository is None:
+            return
+        branch = next(
+            (
+                candidate
+                for candidate in data.branches
+                if candidate.name == name and not candidate.is_remote
+            ),
+            None,
+        )
+        if branch is None or branch.is_current:
+            self.statusBar().showMessage(
+                "Ветка не найдена или уже текущая: обновите список веток."
+            )
+            return
+        if not self._confirm_branch_head_change("switch", name, None):
+            return
+
+        self._reset_branch_operation()
+        if not self._controller.switch_branch(name):
+            self._reset_branch_operation()
+            self.statusBar().showMessage(
+                "Другая операция с индексом или смена HEAD уже выполняется…"
+            )
+
+    def _confirm_branch_head_change(
+        self, operation: str, name: str, commit: Commit | None
+    ) -> bool:
+        """Предупреждает о незакоммиченных изменениях перед сменой HEAD.
+
+        Приложение не удаляет и не перезаписывает их: Git либо безопасно перенесёт
+        изменения на другую ветку, либо откажет. Подтверждение показывает, что
+        операция это учитывает, но не заменяет проверку Git.
+        """
+        changes = self.workspace_page.changes_panel.changes
+        if not changes:
+            return True
+        title = "Создание ветки" if operation == "create" else "Переключение ветки"
+        if operation == "create" and commit is not None:
+            question = (
+                f"Создать ветку «{name}» от коммита {commit.short_hash}?"
+            )
+        else:
+            question = f"Переключиться на ветку «{name}»?"
+        informative = (
+            "В рабочей директории есть незакоммиченные изменения: "
+            f"{len(changes)}. Git перенесёт их только если это безопасно, а при "
+            "конфликте откажет в операции. Изменения не будут удалены или "
+            "перезаписаны приложением."
+        )
+        details = "\n".join(change.path for change in changes)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(title)
+        box.setText(question)
+        box.setInformativeText(informative)
+        box.setDetailedText(details)
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _on_branch_operation_started(self, operation: str, _name: str) -> None:
+        self.workspace_page.set_busy(True)
+        # Операции с индексом делят с ветками ключ в контроллере, но и в UI они
+        # недоступны, пока Git меняет HEAD/рабочую директорию.
+        self.workspace_page.changes_panel.set_busy(True)
+        self._hide_diff_overlay()
+        self._pending_worktree_diff_refresh = None
+        self._changes_operation = None
+        message = _BRANCH_PROGRESS.get(operation, "Операция с веткой…")
+        self.statusBar().showMessage(message)
+
+    def _on_branch_operation_succeeded(self, operation: str, name: str) -> None:
+        if operation == "create":
+            self.workspace_page.branches_panel.clear_branch_name()
+            self._pending_workspace_status = (
+                f"Ветка «{name}» создана и стала текущей."
+            )
+        else:
+            self._pending_workspace_status = (
+                f"Переключение на ветку «{name}» выполнено."
+            )
+        self._reset_branch_operation()
+
+    def _on_branch_operation_failed(
+        self, operation: str, name: str, failure: TaskFailure
+    ) -> None:
+        start_point = self._branch_start_point
+        self._reset_branch_operation()
+        self._pending_workspace_status = None
+        self.workspace_page.set_busy(False)
+        self.workspace_page.changes_panel.set_busy(False)
+        title = _BRANCH_ERROR_TITLES.get(operation, "Не удалось изменить ветку")
+        self.statusBar().showMessage(f"{title}.")
+        self._show_error(
+            title,
+            failure.exception,
+            message=branch_user_message(
+                failure.exception,
+                operation=operation,
+                branch_name=name,
+                start_point=start_point,
+            ),
+        )
+
+    def _reset_branch_operation(self) -> None:
+        self._branch_start_point = None
 
     def _apply_pending_diff_refresh(self) -> None:
         """После операции выбирает файл в новой секции и перезагружает его diff."""

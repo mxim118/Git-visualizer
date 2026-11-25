@@ -19,6 +19,7 @@ from git_visualizer.infrastructure.git.git_errors import (
 )
 from git_visualizer.presentation.error_texts import (
     GIT_INSTALL_URL,
+    branch_user_message,
     commit_user_message,
     technical_details,
     user_message,
@@ -196,3 +197,124 @@ def test_commit_validation_error_message_is_russian() -> None:
 
     assert "staged-изменений" in message
     assert "сообщение" in message
+
+
+# --- тексты ошибок создания и переключения веток (FR-BRANCH-03/06) ---
+
+
+def test_invalid_branch_name_message_explains_git_rules() -> None:
+    error = GitCommandError(
+        128,
+        command=("git", "check-ref-format", "--branch", "bad name"),
+        stderr="fatal: 'bad name' is not a valid branch name\n",
+    )
+
+    message = branch_user_message(
+        error, operation="create", branch_name="bad name"
+    )
+
+    assert error.kind is GitErrorKind.INVALID_BRANCH_NAME
+    assert "Git отклонил имя" in message
+    assert "«bad name»" in message
+    assert "пробелы" in message
+    assert "«..»" in message
+
+
+def test_branch_already_exists_message_suggests_switching() -> None:
+    error = GitCommandError(
+        128, stderr="fatal: a branch named 'feature' already exists\n"
+    )
+
+    message = branch_user_message(
+        error, operation="create", branch_name="feature"
+    )
+
+    assert error.kind is GitErrorKind.BRANCH_ALREADY_EXISTS
+    assert "«feature» уже существует" in message
+    assert "переключитесь" in message
+
+
+def test_missing_branch_message_differs_for_create_from_commit() -> None:
+    switch_error = GitCommandError(128, stderr="fatal: invalid reference: dev\n")
+    create_error = GitCommandError(128, stderr="fatal: invalid reference: deadbeef\n")
+
+    switch_message = branch_user_message(
+        switch_error, operation="switch", branch_name="dev"
+    )
+    create_message = branch_user_message(
+        create_error,
+        operation="create",
+        branch_name="from-old",
+        start_point="deadbeef" * 5,
+    )
+
+    assert "ветка «dev» не найдена" in switch_message
+    assert "обновите список веток" in switch_message.lower()
+    assert "коммит «deadbeefdead»" in create_message
+    assert "обновите историю" in create_message.lower()
+
+
+def test_dirty_worktree_message_keeps_git_explanation_and_files() -> None:
+    error = GitCommandError(
+        1,
+        command=("git", "switch", "other"),
+        stderr=(
+            "error: Your local changes to the following files would be overwritten by checkout:\n"
+            "\ta.txt\n"
+            "Please commit your changes or stash them before you switch branches.\n"
+            "Aborting\n"
+        ),
+    )
+
+    message = branch_user_message(
+        error, operation="switch", branch_name="other"
+    )
+
+    assert error.kind is GitErrorKind.DIRTY_WORKTREE
+    assert "Переключение отменено" in message
+    assert "незакоммиченные изменения" in message
+    assert "не тронуты" in message
+    assert "a.txt" in message
+    assert "Закоммитьте" in message
+    assert "Подробнее" not in message  # причина уже в основном тексте
+
+
+def test_operation_in_progress_and_unmerged_messages_are_russian() -> None:
+    in_progress = GitCommandError(
+        128, stderr="fatal: cannot switch branch while merging\n"
+    )
+    unmerged = GitCommandError(
+        128, stderr="error: you need to resolve your current index first\n"
+    )
+
+    assert "незавершённая операция" in branch_user_message(
+        in_progress, operation="switch", branch_name="dev"
+    )
+    assert "неразрешённые конфликты" in branch_user_message(
+        unmerged, operation="switch", branch_name="dev"
+    )
+
+
+def test_unknown_branch_error_shows_git_output_excerpt() -> None:
+    error = GitCommandError(
+        128,
+        command=("git", "switch", "-c", "feature/x"),
+        stderr="fatal: cannot lock ref 'refs/heads/feature/x'\n",
+    )
+
+    message = branch_user_message(
+        error, operation="create", branch_name="feature/x"
+    )
+
+    assert "Git не смог создать ветку (код 128)" in message
+    assert "cannot lock ref" in message
+    assert "Подробнее" in message
+
+
+def test_branch_validation_value_error_is_russian() -> None:
+    assert "имя недопустимо" in branch_user_message(
+        ValueError("Branch name must not be empty"), operation="create"
+    )
+    assert "Переключение отменено" in branch_user_message(
+        ValueError("Branch name must not be empty"), operation="switch"
+    )

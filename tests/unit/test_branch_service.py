@@ -29,14 +29,43 @@ def make_repository(
 
 
 class FakeGit:
-    def __init__(self, branches: tuple[Branch, ...] = (), error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        branches: tuple[Branch, ...] = (),
+        error: Exception | None = None,
+        *,
+        validation_error: Exception | None = None,
+        create_error: Exception | None = None,
+        switch_error: Exception | None = None,
+    ) -> None:
         self.branches = branches
         self.error = error
+        self.validation_error = validation_error
+        self.create_error = create_error
+        self.switch_error = switch_error
+        self.validated: list[str] = []
+        self.created: list[tuple[str, str | None]] = []
+        self.switched: list[str] = []
 
     def get_branches(self) -> tuple[Branch, ...]:
         if self.error is not None:
             raise self.error
         return self.branches
+
+    def validate_branch_name(self, name: str) -> None:
+        self.validated.append(name)
+        if self.validation_error is not None:
+            raise self.validation_error
+
+    def create_branch(self, name: str, *, start_point: str | None = None) -> None:
+        self.created.append((name, start_point))
+        if self.create_error is not None:
+            raise self.create_error
+
+    def switch_branch(self, name: str) -> None:
+        self.switched.append(name)
+        if self.switch_error is not None:
+            raise self.switch_error
 
 
 def service_for(fake: FakeGit, requested: list[Path] | None = None) -> BranchService:
@@ -276,3 +305,115 @@ def test_local_and_remote_branches_with_similar_names_stay_distinct(tmp_path: Pa
 
     assert names(labels[H1]) == ["refs/heads/origin/main", "refs/remotes/origin/main"]
     assert [label.kind for label in labels[H1]] == [RefKind.LOCAL_BRANCH, RefKind.REMOTE_BRANCH]
+
+
+# --- validate_branch_name ---
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("feature/x", "feature/x"),
+        ("  feature/x\t", "feature/x"),
+        ("ветка/ё", "ветка/ё"),
+        ("release-1.0", "release-1.0"),
+    ],
+)
+def test_validate_branch_name_returns_trimmed_name(raw: str, expected: str) -> None:
+    assert BranchService.validate_branch_name(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["", "   ", "\t\r\n", "-bad", "@{-1}", "feature@{1}"],
+)
+def test_validate_branch_name_rejects_obviously_invalid_names(name: str) -> None:
+    with pytest.raises(ValueError):
+        BranchService.validate_branch_name(name)
+
+
+# --- create_branch / switch_branch ---
+
+
+def test_create_branch_validates_with_git_and_uses_current_head(tmp_path: Path) -> None:
+    fake = FakeGit()
+    requested: list[Path] = []
+
+    service_for(fake, requested).create_branch(make_repository(tmp_path), " feature/new ")
+
+    assert requested == [tmp_path]
+    assert fake.validated == ["feature/new"]
+    assert fake.created == [("feature/new", None)]
+    assert fake.switched == []
+
+
+def test_create_branch_from_selected_commit_forwards_start_point(tmp_path: Path) -> None:
+    fake = FakeGit()
+
+    service_for(fake).create_branch(
+        make_repository(tmp_path), "from-old", start_point=H2
+    )
+
+    assert fake.validated == ["from-old"]
+    assert fake.created == [("from-old", H2)]
+
+
+@pytest.mark.parametrize("name", ["", "   ", "-bad", "@{-1}"])
+def test_create_branch_does_not_touch_git_for_invalid_name(
+    tmp_path: Path, name: str
+) -> None:
+    fake = FakeGit()
+
+    with pytest.raises(ValueError):
+        service_for(fake).create_branch(make_repository(tmp_path), name)
+
+    assert fake.validated == []
+    assert fake.created == []
+
+
+def test_create_branch_stops_when_git_rejects_name(tmp_path: Path) -> None:
+    error = GitCommandError(
+        128,
+        command=("git", "check-ref-format", "--branch", "bad name"),
+        stderr="fatal: 'bad name' is not a valid branch name\n",
+    )
+    fake = FakeGit(validation_error=error)
+
+    with pytest.raises(GitCommandError) as info:
+        service_for(fake).create_branch(make_repository(tmp_path), "bad name")
+
+    assert info.value is error
+    assert fake.created == []
+
+
+def test_switch_branch_uses_port(tmp_path: Path) -> None:
+    fake = FakeGit()
+
+    service_for(fake).switch_branch(make_repository(tmp_path), "dev")
+
+    assert fake.switched == ["dev"]
+    assert fake.validated == []  # существующую ветку не нужно проверять check-ref-format
+
+
+def test_switch_branch_does_not_touch_git_for_invalid_name(tmp_path: Path) -> None:
+    fake = FakeGit()
+
+    with pytest.raises(ValueError):
+        service_for(fake).switch_branch(make_repository(tmp_path), "  ")
+
+    assert fake.switched == []
+
+
+def test_create_and_switch_errors_are_propagated_unchanged(tmp_path: Path) -> None:
+    create_error = GitCommandError(128, stderr="fatal: a branch named 'x' already exists\n")
+    switch_error = GitCommandError(1, stderr="error: Your local changes would be overwritten\n")
+    fake = FakeGit(create_error=create_error, switch_error=switch_error)
+    service = service_for(fake)
+
+    with pytest.raises(GitCommandError) as created:
+        service.create_branch(make_repository(tmp_path), "x")
+    with pytest.raises(GitCommandError) as switched:
+        service.switch_branch(make_repository(tmp_path), "dev")
+
+    assert created.value is create_error
+    assert switched.value is switch_error

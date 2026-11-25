@@ -48,7 +48,9 @@ class WorkspacePage(QWidget):
     сообщается сигналом ``file_selected``. Выбор файла в Changes сообщается
     сигналом ``worktree_file_selected`` вместе с секцией (staged/unstaged), а
     запросы Stage/Unstage, массовых действий и коммита пересылаются из панели
-    Changes.
+    Changes. Панель веток сообщает выбранный коммит (для создания от него) и
+    запросы создания/переключения веток сигналами ``branch_create_requested`` и
+    ``branch_switch_requested``.
 
     Ручку ``main_splitter`` можно утянуть до края: верхняя область (граф с боковыми
     панелями) или нижняя панель Changes исчезают. Тогда на месте исчезнувшей панели
@@ -68,6 +70,8 @@ class WorkspacePage(QWidget):
     changes_stage_all_requested = Signal()
     changes_unstage_all_requested = Signal()
     changes_commit_requested = Signal()  # открыть окно сообщения коммита
+    branch_create_requested = Signal(str, object)  # имя, hash коммита или None
+    branch_switch_requested = Signal(str)  # имя локальной ветки
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -155,6 +159,12 @@ class WorkspacePage(QWidget):
         self.changes_panel.commit_requested.connect(
             self.changes_commit_requested
         )
+        self.branches_panel.create_branch_requested.connect(
+            self.branch_create_requested
+        )
+        self.branches_panel.switch_branch_requested.connect(
+            self.branch_switch_requested
+        )
         # Сворачивание меняет размеры панелей: при перетаскивании ручки, при
         # изменении размеров окна и программном setSizes. Уведомителем служит
         # resize любого из трех виджетов, поэтому свернутая в ноль панель тоже
@@ -183,6 +193,7 @@ class WorkspacePage(QWidget):
             ref_labels=data.ref_labels,
         )
         self.branches_panel.set_branches(data.branches, data.remotes)
+        self.branches_panel.set_selected_commit(None)
 
         if data.commits:
             self.details_panel.clear()
@@ -191,6 +202,7 @@ class WorkspacePage(QWidget):
 
     def set_busy(self, busy: bool) -> None:
         self.top_bar.set_busy(busy)
+        self.branches_panel.set_busy(busy)
 
     def clear(self) -> None:
         """Сбрасывает рабочую область (закрытие репозитория или ошибка открытия)."""
@@ -227,6 +239,7 @@ class WorkspacePage(QWidget):
         self._selected_commit_hash = commit_hash
         self._selected_file = None
         commit = self._commits_by_hash.get(commit_hash)
+        self.branches_panel.set_selected_commit(commit)
         if commit is None:
             self.details_panel.clear()
         else:

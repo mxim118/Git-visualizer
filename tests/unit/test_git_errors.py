@@ -79,6 +79,27 @@ UNMERGED_FILES_STDERR = (
     "hint: as appropriate to mark resolution and make a commit.\n"
     "fatal: Exiting because of an unresolved conflict.\n"
 )
+# Реальные сообщения Git 2.54.0 (LC_ALL=C) при работе с ветками.
+INVALID_BRANCH_NAME_STDERR = (
+    "fatal: 'bad name' is not a valid branch name\n"
+    "hint: See 'git help check-ref-format'\n"
+)
+BRANCH_ALREADY_EXISTS_STDERR = "fatal: a branch named 'feature' already exists\n"
+REF_NOT_FOUND_STDERR = "fatal: invalid reference: nope\n"
+DIRTY_WORKTREE_STDERR = (
+    "error: Your local changes to the following files would be overwritten by checkout:\n"
+    "\ta.txt\n"
+    "Please commit your changes or stash them before you switch branches.\n"
+    "Aborting\n"
+)
+OPERATION_IN_PROGRESS_STDERR = (
+    'fatal: cannot switch branch while merging\n'
+    'Consider "git merge --quit" or "git worktree add".\n'
+)
+UNMERGED_INDEX_STDERR = (
+    "error: you need to resolve your current index first\n"
+    "a.txt: needs merge\n"
+)
 
 
 @pytest.mark.parametrize(
@@ -88,6 +109,12 @@ UNMERGED_FILES_STDERR = (
         (DUBIOUS_OWNERSHIP_STDERR, GitErrorKind.UNSAFE_REPOSITORY),
         (MISSING_AUTHOR_STDERR, GitErrorKind.MISSING_AUTHOR),
         (UNMERGED_FILES_STDERR, GitErrorKind.UNMERGED_FILES),
+        (INVALID_BRANCH_NAME_STDERR, GitErrorKind.INVALID_BRANCH_NAME),
+        (BRANCH_ALREADY_EXISTS_STDERR, GitErrorKind.BRANCH_ALREADY_EXISTS),
+        (REF_NOT_FOUND_STDERR, GitErrorKind.REF_NOT_FOUND),
+        (DIRTY_WORKTREE_STDERR, GitErrorKind.DIRTY_WORKTREE),
+        (OPERATION_IN_PROGRESS_STDERR, GitErrorKind.OPERATION_IN_PROGRESS),
+        (UNMERGED_INDEX_STDERR, GitErrorKind.UNMERGED_FILES),
         ("FATAL: NOT A GIT REPOSITORY", GitErrorKind.NOT_A_REPOSITORY),  # регистр не важен
         ("fatal: pathspec 'x' did not match any files\n", GitErrorKind.UNKNOWN),
         ("", GitErrorKind.UNKNOWN),
@@ -102,4 +129,9 @@ def test_command_error_kind_is_derived_from_stderr() -> None:
     assert GitCommandError(128, stderr=DUBIOUS_OWNERSHIP_STDERR).kind is GitErrorKind.UNSAFE_REPOSITORY
     assert GitCommandError(128, stderr=MISSING_AUTHOR_STDERR).kind is GitErrorKind.MISSING_AUTHOR
     assert GitCommandError(128, stderr=UNMERGED_FILES_STDERR).kind is GitErrorKind.UNMERGED_FILES
+    assert GitCommandError(128, stderr=INVALID_BRANCH_NAME_STDERR).kind is GitErrorKind.INVALID_BRANCH_NAME
+    assert GitCommandError(128, stderr=BRANCH_ALREADY_EXISTS_STDERR).kind is GitErrorKind.BRANCH_ALREADY_EXISTS
+    assert GitCommandError(128, stderr=REF_NOT_FOUND_STDERR).kind is GitErrorKind.REF_NOT_FOUND
+    assert GitCommandError(1, stderr=DIRTY_WORKTREE_STDERR).kind is GitErrorKind.DIRTY_WORKTREE
+    assert GitCommandError(128, stderr=OPERATION_IN_PROGRESS_STDERR).kind is GitErrorKind.OPERATION_IN_PROGRESS
     assert GitCommandError(1).kind is GitErrorKind.UNKNOWN

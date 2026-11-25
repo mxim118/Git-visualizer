@@ -147,8 +147,109 @@ def commit_user_message(error: BaseException) -> str:
     return user_message(error)
 
 
+_BRANCH_NAME_RULES_TEXT = (
+    "В имени ветки нельзя использовать пробелы и символы ~ ^ : ? * [ \\, "
+    "последовательность «..» и «@{», имя не может начинаться с «-», "
+    "заканчиваться точкой или «.lock»."
+)
+
+
+def branch_user_message(
+    error: BaseException,
+    *,
+    operation: str,
+    branch_name: str | None = None,
+    start_point: str | None = None,
+) -> str:
+    """Понятное сообщение для отказа при создании или переключении ветки.
+
+    ``operation`` — ``"create"`` или ``"switch"``. Для грязной рабочей директории
+    (``DIRTY_WORKTREE``) в основной текст добавляется начало вывода Git: там Git
+    перечисляет файлы, из-за которых переключение было бы небезопасным. Полные
+    stdout/stderr и команда остаются в ``technical_details``.
+    """
+    quoted = f"«{branch_name}»" if branch_name else "ветки"
+    is_create = operation == "create"
+    action = "создать ветку" if is_create else "переключить ветку"
+    failed_title = "Ветка не создана" if is_create else "Переключение отменено"
+
+    if isinstance(error, ValueError):
+        if is_create:
+            return (
+                "Ветка не создана: имя недопустимо. Оно не должно быть пустым или "
+                "состоять из пробелов, начинаться с «-» или содержать «@{». "
+                f"{_BRANCH_NAME_RULES_TEXT}"
+            )
+        return (
+            "Переключение отменено: имя ветки не указано или недопустимо. "
+            "Выберите ветку в списке ещё раз."
+        )
+
+    if isinstance(error, GitCommandError):
+        if error.kind is GitErrorKind.INVALID_BRANCH_NAME:
+            return (
+                f"{failed_title}: Git отклонил имя {quoted}. "
+                f"{_BRANCH_NAME_RULES_TEXT}"
+            )
+        if error.kind is GitErrorKind.BRANCH_ALREADY_EXISTS:
+            return (
+                f"Ветка {quoted} уже существует. Выберите другое имя или "
+                "переключитесь на неё в списке веток."
+            )
+        if error.kind is GitErrorKind.REF_NOT_FOUND:
+            if is_create and start_point:
+                short = start_point[:12]
+                return (
+                    f"Ветка не создана: коммит «{short}» не найден в репозитории. "
+                    "Обновите историю и выберите коммит заново."
+                )
+            return (
+                f"Переключение отменено: ветка {quoted} не найдена. Возможно, её "
+                "удалили; обновите список веток и повторите."
+            )
+        if error.kind is GitErrorKind.DIRTY_WORKTREE:
+            lines = [
+                f"{failed_title}: Git не может {action}, потому что незакоммиченные "
+                "изменения в рабочей директории были бы перезаписаны. Изменения "
+                "не тронуты."
+            ]
+            excerpt = _output_excerpt(error)
+            if excerpt:
+                lines.append(f"Сообщение Git:\n\n{excerpt}")
+            lines.append(
+                "Закоммитьте изменения или уберите их вручную и повторите операцию."
+            )
+            return "\n\n".join(lines)
+        if error.kind is GitErrorKind.OPERATION_IN_PROGRESS:
+            return (
+                f"{failed_title}: в репозитории есть незавершённая операция "
+                "(merge, rebase или cherry-pick). Завершите или прервите её, "
+                "затем повторите."
+            )
+        if error.kind is GitErrorKind.UNMERGED_FILES:
+            return (
+                f"{failed_title}: в индексе есть неразрешённые конфликты. "
+                "Разрешите их (например, через git add) и повторите операцию."
+            )
+        if error.kind is GitErrorKind.UNKNOWN:
+            excerpt = _output_excerpt(error)
+            if excerpt:
+                return (
+                    f"Git не смог {action} (код {error.returncode}). "
+                    "Сообщение Git:\n\n"
+                    f"{excerpt}\n\n"
+                    "Полная команда и вывод — в разделе «Подробнее»."
+                )
+            return (
+                f"Git не смог {action} (код {error.returncode}). Проверьте список "
+                "веток и состояние рабочей директории; технические подробности — "
+                "в разделе «Подробнее»."
+            )
+    return user_message(error)
+
+
 def _output_excerpt(error: GitCommandError, *, max_lines: int = 8) -> str:
-    """Первые непустые строки stderr и stdout для основного текста ошибки коммита."""
+    """Первые непустые строки stderr и stdout для основного текста ошибки."""
     lines: list[str] = []
     for stream in (error.stderr, error.stdout):
         for raw_line in stream.splitlines():
