@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QFileDialog, QFrame, QLabel
 from git_visualizer.application.errors import NotAGitRepositoryError
 from git_visualizer.application.services.git_environment_service import GitEnvironment
 from git_visualizer.application.services.graph_service import GraphService
+from git_visualizer.application.services.history_service import HistoryPage
 from git_visualizer.application.services.remote_service import RemoteOperationResult
 from git_visualizer.domain.enums import FileChangeType
 from git_visualizer.domain.models import (
@@ -133,6 +134,8 @@ class FakeRepositoryService:
 
 
 class FakeHistoryService:
+    """История постранично: тот же срез, что ``git log --skip --max-count``."""
+
     def __init__(
         self, commits: tuple[Commit, ...], *, error: BaseException | None = None
     ) -> None:
@@ -140,15 +143,20 @@ class FakeHistoryService:
         self.error = error
         self.requests = 0
         self.limits: list[int] = []
+        self.skips: list[int] = []
 
     def get_history(
-        self, repository: Repository, *, limit: int
-    ) -> tuple[Commit, ...]:
+        self, repository: Repository, *, limit: int, skip: int = 0
+    ) -> HistoryPage:
         self.requests += 1
         self.limits.append(limit)
+        self.skips.append(skip)
         if self.error is not None:
             raise self.error
-        return self.commits
+        return HistoryPage(
+            commits=self.commits[skip : skip + limit],
+            has_more=len(self.commits) > skip + limit,
+        )
 
 
 class FakeBranchService:
@@ -2547,3 +2555,229 @@ def test_graph_view_settings_are_independent_for_each_repository(
     stored = make_settings(tmp_path)
     assert_view_state_close(stored.graph_view_state(str(big_path)), saved_big)
     assert_view_state_close(stored.graph_view_state(str(small_path)), saved_small)
+
+
+# --- ограниченная история: уведомление и догрузка (ТЗ FR-HIST-07) ---
+
+
+def make_linear_history(*labels: str) -> tuple[Commit, ...]:
+    """Линейная история от нового к старому: ``labels[0]`` — самый новый коммит."""
+    ordered: list[Commit] = []
+    for label in reversed(labels):
+        parents = (ordered[-1].hash,) if ordered else ()
+        ordered.append(make_commit(label, parents=parents))
+    return tuple(reversed(ordered))
+
+
+def wait_for_changes_loaded(
+    qt_app, controller: RepositoryController, loaded: list[object]
+) -> None:
+    """Ждёт фоновой загрузки статуса Changes, чтобы она не затёрла статус-строку.
+
+    ``MainWindow._on_changes_loaded`` пишет в статусную строку свой итог. Подписка
+    ``loaded`` создаётся тестом до открытия репозитория.
+    """
+    wait_until(qt_app, lambda: bool(loaded))
+
+
+def test_truncated_history_notice_and_load_more(
+    qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    newest, middle, oldest = make_linear_history("a", "b", "c")
+    commits = (newest, middle, oldest)
+    controller, history = build_controller(
+        repository=make_repository(tmp_path, head_commit=newest.hash),
+        commits=commits,
+        branches=(
+            Branch(
+                name="main",
+                is_remote=False,
+                is_current=True,
+                commit_hash=newest.hash,
+            ),
+        ),
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller, app_settings) as window:
+        changes_loaded: list[object] = []
+        controller.changes_loaded.connect(changes_loaded.append)
+        window.resize(1280, 800)
+        window.show()
+        # Пользовательская настройка лимита: в истории три коммита, лимит — два.
+        window.controller.set_history_limit(2)
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None
+            and window.workspace_page.graph_view.commit_count == 2,
+        )
+
+        workspace = window.workspace_page
+        notice = workspace.history_notice
+        assert not notice.isHidden()
+        assert "Показаны последние 2 коммитов" in notice.label.text()
+        assert "есть более старая история" in notice.label.text()
+
+        workspace.graph_view.commit_selected.emit(middle.hash)
+        view_before = workspace.graph_view.view_state()
+        assert view_before is not None
+
+        wait_for_changes_loaded(qt_app, controller, changes_loaded)
+        notice.button.click()
+        wait_until(qt_app, lambda: workspace.graph_view.commit_count == 3)
+        qt_app.processEvents()
+
+        assert notice.isHidden()
+        data = workspace.workspace_data
+        assert data is not None
+        assert data.commits == commits
+        assert data.has_more_history is False
+        assert history.skips == [0, 2]
+        # Выбор коммита и положение графа после догрузки сохранены.
+        assert window.selected_commit_hash == middle.hash
+        assert workspace.details_panel.current_commit == middle
+        restored = workspace.graph_view.view_state()
+        assert restored is not None
+        assert abs(restored.zoom - view_before.zoom) < 1e-6
+        assert "История загружена полностью" in window.statusBar().currentMessage()
+
+
+def test_complete_history_has_no_truncation_notice(
+    qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    newest, oldest = make_linear_history("a", "b")
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=newest.hash),
+        commits=(newest, oldest),
+        branches=(
+            Branch(
+                name="main",
+                is_remote=False,
+                is_current=True,
+                commit_hash=newest.hash,
+            ),
+        ),
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller, app_settings) as window:
+        window.controller.set_history_limit(2)
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None
+            and window.workspace_page.graph_view.commit_count == 2,
+        )
+        qt_app.processEvents()
+
+        workspace = window.workspace_page
+        data = workspace.workspace_data
+        assert data is not None
+        # Ровно limit коммитов — история полная, предупреждения нет.
+        assert data.has_more_history is False
+        assert workspace.history_notice.isHidden()
+        assert "есть более старая история" not in window.statusBar().currentMessage()
+
+
+def test_load_more_failure_is_reported_and_history_stays(
+    qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    newest, middle, oldest = make_linear_history("a", "b", "c")
+    controller, history = build_controller(
+        repository=make_repository(tmp_path, head_commit=newest.hash),
+        commits=(newest, middle, oldest),
+        branches=(
+            Branch(
+                name="main",
+                is_remote=False,
+                is_current=True,
+                commit_hash=newest.hash,
+            ),
+        ),
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller, app_settings) as window:
+        changes_loaded: list[object] = []
+        controller.changes_loaded.connect(changes_loaded.append)
+        window.controller.set_history_limit(2)
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None
+            and window.workspace_page.graph_view.commit_count == 2,
+        )
+        workspace = window.workspace_page
+        errors: list[tuple[str, BaseException]] = []
+        monkeypatch.setattr(
+            window,
+            "_show_error",
+            lambda title, error, *, message=None: errors.append((title, error)),
+        )
+
+        error = GitCommandError(128, command=("git", "log"), stderr="fatal")
+        history.error = error
+        wait_for_changes_loaded(qt_app, controller, changes_loaded)
+        workspace.history_notice.button.click()
+        wait_until(qt_app, lambda: bool(errors))
+        qt_app.processEvents()
+
+        assert errors == [("Не удалось загрузить более старую историю", error)]
+        # Загруженная страница остаётся, кнопку можно нажать снова.
+        assert workspace.graph_view.commit_count == 2
+        assert not workspace.history_notice.isHidden()
+        assert workspace.history_notice.button.isEnabled()
+        assert "Не удалось загрузить более старую историю" in (
+            window.statusBar().currentMessage()
+        )
+
+
+def test_load_more_reports_external_history_change(
+    qt_app, tmp_path: Path, app_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Внешние коммиты сдвинули окно: страница повторяет уже показанное."""
+    newest, middle, oldest = make_linear_history("a", "b", "c")
+    controller, history = build_controller(
+        repository=make_repository(tmp_path, head_commit=newest.hash),
+        commits=(newest, middle, oldest),
+        branches=(
+            Branch(
+                name="main",
+                is_remote=False,
+                is_current=True,
+                commit_hash=newest.hash,
+            ),
+        ),
+    )
+    patch_folder_dialog(monkeypatch, tmp_path)
+
+    with opened_window(controller, app_settings) as window:
+        changes_loaded: list[object] = []
+        controller.changes_loaded.connect(changes_loaded.append)
+        window.controller.set_history_limit(2)
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None
+            and window.workspace_page.graph_view.commit_count == 2,
+        )
+        workspace = window.workspace_page
+
+        # Снаружи появились два коммита: страница skip=2 — это уже показанное.
+        external = make_commit("d", parents=(newest.hash,))
+        newer = make_commit("e", parents=(external.hash,))
+        history.commits = (newer, external, newest, middle, oldest)
+
+        wait_for_changes_loaded(qt_app, controller, changes_loaded)
+        workspace.history_notice.button.click()
+        wait_until(
+            qt_app,
+            lambda: "Обновите историю" in window.statusBar().currentMessage(),
+        )
+        qt_app.processEvents()
+
+        assert workspace.graph_view.commit_count == 2
+        assert not workspace.history_notice.isHidden()
+        assert workspace.history_notice.button.isEnabled()
+

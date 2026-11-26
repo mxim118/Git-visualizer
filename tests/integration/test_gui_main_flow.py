@@ -1,4 +1,4 @@
-"""Integration-тесты основного потока на реальном Git и реальных репозиториях."""
+﻿"""Integration-тесты основного потока на реальном Git и реальных репозиториях."""
 
 from __future__ import annotations
 
@@ -446,3 +446,58 @@ def test_empty_repository_flow_with_real_git(
         assert workspace.top_bar.branch_label.text() == "Ветка: main (коммитов нет)"
     finally:
         window.close()
+
+
+def test_gui_loads_more_old_history(
+    qt_app,
+    make_repo,
+    monkeypatch,
+    app_settings,
+) -> None:
+    """FR-HIST-07: история не вмещается в лимит — показано уведомление и догрузка."""
+    path = make_repo("gui-old-history", commits=3)
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(path)
+    )
+    controller = build_controller()
+    window = MainWindow(controller, app_settings)
+
+    try:
+        # Небольшой лимит: первая страница — два коммита, третий догружается.
+        controller.set_history_limit(2)
+        window.start_screen.open_button.click()
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None
+            and window.workspace_page.graph_view.commit_count == 2,
+        )
+
+        workspace = window.workspace_page
+        data = workspace.workspace_data
+        assert data is not None
+        assert data.has_more_history is True
+        assert not workspace.history_notice.isHidden()
+        assert "Показаны последние 2 коммитов" in workspace.history_notice.label.text()
+
+        newest = data.commits[0]
+        workspace.graph_view.commit_selected.emit(newest.hash)
+
+        workspace.history_notice.button.click()
+        wait_until(qt_app, lambda: workspace.graph_view.commit_count == 3)
+        qt_app.processEvents()
+
+        data = workspace.workspace_data
+        assert data is not None
+        assert [commit.subject for commit in data.commits] == [
+            "commit 2",
+            "commit 1",
+            "commit 0",
+        ]
+        assert data.has_more_history is False
+        assert workspace.history_notice.isHidden()
+        assert workspace.graph_view.edge_count == 2
+        # Выбор коммита не сброшен догрузкой страницы.
+        assert window.selected_commit_hash == newest.hash
+    finally:
+        window.close()
+

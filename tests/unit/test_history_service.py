@@ -7,6 +7,7 @@ import pytest
 
 from git_visualizer.application.services.history_service import (
     DEFAULT_HISTORY_LIMIT,
+    HistoryPage,
     HistoryService,
 )
 from git_visualizer.domain.models import Commit, Repository
@@ -32,16 +33,22 @@ def make_commit(hash_char: str, parents: tuple[str, ...] = ()) -> Commit:
 
 
 class FakeGit:
-    def __init__(self, commits: tuple[Commit, ...] = (), error: Exception | None = None) -> None:
+    """Порт Git: отдаёт историю тем же срезом, что ``git log --skip --max-count``."""
+
+    def __init__(
+        self,
+        commits: tuple[Commit, ...] = (),
+        error: Exception | None = None,
+    ) -> None:
         self.commits = commits
         self.error = error
-        self.limits: list[int] = []
+        self.requests: list[tuple[int, int]] = []
 
-    def get_history(self, *, limit: int) -> tuple[Commit, ...]:
-        self.limits.append(limit)
+    def get_history(self, *, limit: int, skip: int) -> tuple[Commit, ...]:
+        self.requests.append((limit, skip))
         if self.error is not None:
             raise self.error
-        return self.commits
+        return self.commits[skip : skip + limit]
 
 
 @pytest.fixture
@@ -61,11 +68,15 @@ def service_for(fake: FakeGit, requested: list[Path] | None = None) -> HistorySe
 def test_returns_commits_in_the_order_given_by_git(repository: Repository) -> None:
     commits = (make_commit("c", ("b" * 40,)), make_commit("b", ("a" * 40,)), make_commit("a"))
 
-    assert service_for(FakeGit(commits)).get_history(repository) == commits
+    page = service_for(FakeGit(commits)).get_history(repository)
+
+    assert page == HistoryPage(commits=commits, has_more=False)
 
 
 def test_empty_history(repository: Repository) -> None:
-    assert service_for(FakeGit(())).get_history(repository) == ()
+    assert service_for(FakeGit(())).get_history(repository) == HistoryPage(
+        commits=(), has_more=False
+    )
 
 
 def test_uses_repository_root_path(repository: Repository) -> None:
@@ -81,7 +92,8 @@ def test_default_limit_is_the_single_constant(repository: Repository) -> None:
 
     service_for(fake).get_history(repository)
 
-    assert fake.limits == [DEFAULT_HISTORY_LIMIT]
+    # На один коммит больше лимита — так видно, что страница не последняя.
+    assert fake.requests == [(DEFAULT_HISTORY_LIMIT + 1, 0)]
 
 
 def test_default_limit_is_within_the_range_from_the_spec() -> None:
@@ -89,11 +101,66 @@ def test_default_limit_is_within_the_range_from_the_spec() -> None:
 
 
 def test_explicit_limit_is_passed_through(repository: Repository) -> None:
-    fake = FakeGit()
+    fake = FakeGit(tuple(make_commit("a") for _ in range(5)))
 
-    service_for(fake).get_history(repository, limit=50)
+    page = service_for(fake).get_history(repository, limit=50)
 
-    assert fake.limits == [50]
+    assert fake.requests == [(51, 0)]
+    assert len(page.commits) == 5
+    assert page.has_more is False
+
+
+def test_truncated_history_is_reported_and_cut_to_the_limit(
+    repository: Repository,
+) -> None:
+    commits = tuple(make_commit(ch) for ch in "abc")
+    fake = FakeGit(commits)
+
+    page = service_for(fake).get_history(repository, limit=2)
+
+    assert fake.requests == [(3, 0)]
+    assert page.commits == commits[:2]
+    assert page.has_more is True
+
+
+def test_history_of_exactly_the_limit_is_not_truncated(repository: Repository) -> None:
+    # len == limit неоднозначен, поэтому запрашивается limit + 1: ровно limit
+    # коммитов — это полная история, а не обрезанная.
+    commits = (make_commit("b"), make_commit("a"))
+
+    page = service_for(FakeGit(commits)).get_history(repository, limit=2)
+
+    assert page.commits == commits
+    assert page.has_more is False
+
+
+def test_skip_loads_the_next_older_page(repository: Repository) -> None:
+    commits = tuple(make_commit(ch) for ch in "abcde")
+    fake = FakeGit(commits)
+
+    page = service_for(fake).get_history(repository, limit=2, skip=2)
+
+    assert fake.requests == [(3, 2)]
+    assert page.commits == commits[2:4]
+    assert page.has_more is True
+
+
+def test_last_page_has_nothing_more(repository: Repository) -> None:
+    commits = tuple(make_commit(ch) for ch in "abc")
+
+    page = service_for(FakeGit(commits)).get_history(repository, limit=2, skip=2)
+
+    assert page.commits == commits[2:]
+    assert page.has_more is False
+
+
+def test_skip_beyond_history_is_empty(repository: Repository) -> None:
+    page = service_for(FakeGit((make_commit("a"),))).get_history(
+        repository, limit=2, skip=5
+    )
+
+    assert page.commits == ()
+    assert page.has_more is False
 
 
 @pytest.mark.parametrize("limit", [0, -5])
@@ -105,7 +172,19 @@ def test_non_positive_limit_is_rejected_before_calling_git(
     with pytest.raises(ValueError):
         service_for(fake).get_history(repository, limit=limit)
 
-    assert fake.limits == []
+    assert fake.requests == []
+
+
+@pytest.mark.parametrize("skip", [-1, -100])
+def test_negative_skip_is_rejected_before_calling_git(
+    repository: Repository, skip: int
+) -> None:
+    fake = FakeGit()
+
+    with pytest.raises(ValueError):
+        service_for(fake).get_history(repository, skip=skip)
+
+    assert fake.requests == []
 
 
 @pytest.mark.parametrize(

@@ -275,6 +275,30 @@ def test_arguments_without_head() -> None:
     assert args[:3] == ["log", "--branches", "--remotes"]
 
 
+def test_arguments_with_skip_continue_the_page() -> None:
+    # --skip применяется после сортировки, поэтому продолжает историю без пропусков
+    # и повторов (ТЗ FR-HIST-07).
+    args = build_history_arguments(
+        include_head=True, limit=10, skip=250, separator=SEP
+    )
+
+    assert args.index("--skip=250") < args.index("--max-count=10")
+
+
+def test_arguments_without_skip_do_not_pass_the_option() -> None:
+    args = build_history_arguments(include_head=True, limit=10, separator=SEP)
+
+    assert not any(arg.startswith("--skip") for arg in args)
+
+
+@pytest.mark.parametrize("skip", [-1, -100])
+def test_arguments_reject_negative_skip(skip: int) -> None:
+    with pytest.raises(ValueError):
+        build_history_arguments(
+            include_head=True, limit=5, skip=skip, separator=SEP
+        )
+
+
 def test_arguments_never_use_all_refs() -> None:
     # --all добавил бы refs/stash и служебные коммиты stash в граф (ТЗ FR-HIST-01).
     for include_head in (True, False):

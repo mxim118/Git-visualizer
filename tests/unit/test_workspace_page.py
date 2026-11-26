@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
-from git_visualizer.domain.models import Repository
+from git_visualizer.application.services.graph_service import GraphService
+from git_visualizer.domain.models import Branch, Commit, Repository
+from git_visualizer.presentation.controllers.repository_controller import WorkspaceData
 from git_visualizer.presentation.widgets.workspace_page import WorkspacePage
 
 
@@ -182,3 +185,148 @@ def test_top_bar_remote_settings_signal_is_forwarded(qt_app) -> None:
         assert calls == [True]
     finally:
         page.close()
+
+
+# --- ограниченная история: уведомление и сохранение выбора (FR-HIST-07) ---
+
+
+def make_commit(label: str, parents: tuple[str, ...] = ()) -> Commit:
+    commit_hash = label.ljust(40, "0")
+    return Commit(
+        hash=commit_hash,
+        short_hash=commit_hash[:7],
+        parent_hashes=parents,
+        author_name="Test Author",
+        author_email="author@example.com",
+        authored_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        committer_name="Test Author",
+        committer_email="author@example.com",
+        committed_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        subject=f"commit {label}",
+        body="",
+    )
+
+
+def workspace_data(
+    commits: tuple[Commit, ...], *, has_more: bool
+) -> WorkspaceData:
+    repository = Repository(
+        path=Path("C:/repo"),
+        name="repo",
+        current_branch="main",
+        head_commit=commits[0].hash if commits else None,
+    )
+    return WorkspaceData(
+        repository=repository,
+        commits=commits,
+        branches=(
+            Branch(
+                name="main",
+                is_remote=False,
+                is_current=True,
+                commit_hash=commits[0].hash if commits else None,
+            ),
+        ),
+        remotes=(),
+        ref_labels={},
+        layout=GraphService().build_layout(commits),
+        has_more_history=has_more,
+    )
+
+
+def linear_history(*labels: str) -> tuple[Commit, ...]:
+    ordered: list[Commit] = []
+    for label in reversed(labels):
+        parents = (ordered[-1].hash,) if ordered else ()
+        ordered.append(make_commit(label, parents=parents))
+    return tuple(reversed(ordered))
+
+
+def test_history_notice_is_shown_only_for_truncated_history(qt_app) -> None:
+    page = WorkspacePage()
+    try:
+        page.set_workspace_data(workspace_data(linear_history("a", "b"), has_more=False))
+        assert page.history_notice.isHidden()
+
+        page.set_workspace_data(workspace_data(linear_history("a", "b"), has_more=True))
+        assert not page.history_notice.isHidden()
+        assert "Показаны последние 2 коммитов" in page.history_notice.label.text()
+
+        page.set_workspace_data(workspace_data(linear_history("a", "b"), has_more=False))
+        assert page.history_notice.isHidden()
+    finally:
+        page.close()
+
+
+def test_history_loading_blocks_repeat_page_requests(qt_app) -> None:
+    page = WorkspacePage()
+    try:
+        page.set_workspace_data(workspace_data(linear_history("a", "b"), has_more=True))
+        requested: list[bool] = []
+        page.older_history_requested.connect(lambda: requested.append(True))
+
+        page.set_history_loading(True)
+        assert page.history_notice.is_loading
+        assert not page.history_notice.button.isEnabled()
+        assert "Загрузка более старой истории" in page.history_notice.label.text()
+
+        page.set_history_loading(False)
+        assert not page.history_notice.is_loading
+        assert page.history_notice.button.isEnabled()
+        page.history_notice.button.click()
+        assert requested == [True]
+    finally:
+        page.close()
+
+
+def test_appended_history_keeps_selected_commit_and_file(qt_app) -> None:
+    commits = linear_history("a", "b", "c")
+    newest, middle, oldest = commits
+    page = WorkspacePage()
+    try:
+        page.set_workspace_data(workspace_data((newest, middle), has_more=True))
+        page.graph_view.commit_selected.emit(middle.hash)
+        assert page.selected_commit_hash == middle.hash
+
+        page.set_workspace_data(
+            workspace_data(commits, has_more=False), preserve_selection=True
+        )
+
+        assert page.workspace_data is not None
+        assert page.workspace_data.commits == commits
+        assert page.selected_commit_hash == middle.hash
+        assert page.details_panel.current_commit == middle
+        assert page.graph_view.commit_count == 3
+        assert page.history_notice.isHidden()
+    finally:
+        page.close()
+
+
+def test_regular_reload_resets_selection(qt_app) -> None:
+    commits = linear_history("a", "b", "c", "d")
+    page = WorkspacePage()
+    try:
+        page.set_workspace_data(workspace_data(commits, has_more=True))
+        page.graph_view.commit_selected.emit(commits[1].hash)
+
+        page.set_workspace_data(workspace_data(commits, has_more=True))
+
+        assert page.selected_commit_hash is None
+        assert page.details_panel.current_commit is None
+    finally:
+        page.close()
+
+
+def test_clear_hides_history_notice(qt_app) -> None:
+    page = WorkspacePage()
+    try:
+        page.set_workspace_data(workspace_data(linear_history("a", "b"), has_more=True))
+        assert not page.history_notice.isHidden()
+
+        page.clear()
+
+        assert page.history_notice.isHidden()
+        assert page.workspace_data is None
+    finally:
+        page.close()
+

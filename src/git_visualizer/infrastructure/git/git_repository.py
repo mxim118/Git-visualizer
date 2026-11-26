@@ -41,8 +41,10 @@ from git_visualizer.infrastructure.git.git_parser import (
 from git_visualizer.infrastructure.git.git_runner import GitResult, GitRunner
 
 
-def build_history_arguments(*, include_head: bool, limit: int, separator: str) -> list[str]:
-    """Аргументы ``git log`` для получения истории (ТЗ 5.2, FR-HIST-01).
+def build_history_arguments(
+    *, include_head: bool, limit: int, skip: int = 0, separator: str
+) -> list[str]:
+    """Аргументы ``git log`` для получения истории (ТЗ 5.2, FR-HIST-01, FR-HIST-07).
 
     * ``--branches --remotes`` — локальные и remote-tracking ветки. ``--all`` не
       используется: он добавляет ``refs/stash`` и служебные коммиты stash в граф.
@@ -51,6 +53,9 @@ def build_history_arguments(*, include_head: bool, limit: int, separator: str) -
       завершается ошибкой.
     * ``--topo-order`` — потомки всегда выводятся раньше своих родителей, даже если даты
       коммитов «перепутаны»; порядок по дате граф бы ломал (ТЗ FR-HIST-03).
+    * ``--skip``/``--max-count`` применяются к уже отсортированному списку, поэтому
+      ``--skip=N`` продолжает историю ровно с того места, где закончилась страница из
+      ``N`` коммитов: страницы не пересекаются и не теряют коммитов (FR-HIST-07).
     * ``--decorate-refs`` — явный список декорируемых refs (``HEAD``, ветки, remote-tracking
       ветки): настройка пользователя ``log.excludeDecoration`` иначе молча скрывала бы
       ветки в ``%D``; теги и ``refs/stash`` отсекаются тут же. ``HEAD`` нужно перечислять
@@ -63,11 +68,16 @@ def build_history_arguments(*, include_head: bool, limit: int, separator: str) -
     """
     if limit < 1:
         raise ValueError(f"History limit must be positive, got {limit}")
+    if skip < 0:
+        raise ValueError(f"History skip must not be negative, got {skip}")
     arguments = ["log", "--branches", "--remotes"]
     if include_head:
         arguments.append("HEAD")
+    arguments += ["--topo-order"]
+    if skip:
+        # Нулевой --skip не передаём: аргумент ничего не меняет и только шумит в логах.
+        arguments.append(f"--skip={skip}")
     arguments += [
-        "--topo-order",
         f"--max-count={limit}",
         "--decorate=full",
         "--decorate-refs=HEAD",
@@ -515,24 +525,32 @@ class GitRepository:
     def has_head(self) -> bool:
         return self.get_head_commit() is not None
 
-    def get_history(self, *, limit: int) -> tuple[Commit, ...]:
+    def get_history(self, *, limit: int, skip: int = 0) -> tuple[Commit, ...]:
         """История коммитов всех локальных и remote-tracking веток и ``HEAD``.
 
         Коммиты идут в топологическом порядке (потомок раньше родителей), новые — первыми.
-        Не более ``limit`` коммитов; значение по умолчанию намеренно не задаётся здесь —
-        оно определено в одном месте (``application``). Если ``limit`` обрезал историю,
-        родители последних коммитов в результате отсутствуют: это обычная ситуация для
-        потребителя (граф). Пустой кортеж — коммитов нет.
+        Не более ``limit`` коммитов после пропуска первых ``skip``: ``skip`` — смещение
+        в том же топологическом порядке, поэтому страницы продолжают друг друга
+        (ТЗ FR-HIST-07, загрузка более старой истории). Значение по умолчанию
+        ``limit`` намеренно не задаётся здесь — оно определено в одном месте
+        (``application``). Если ``limit`` обрезал историю, родители последних коммитов
+        в результате отсутствуют: это обычная ситуация для потребителя (граф).
+        Пустой кортеж — коммитов нет или ``skip`` больше всей истории.
 
         Запускает два процесса Git: проверку ``HEAD`` и ``git log``.
 
-        :raises ValueError: ``limit`` меньше 1.
+        :raises ValueError: ``limit`` меньше 1 или ``skip`` отрицателен.
         :raises GitCommandError: команда Git завершилась с ошибкой.
         :raises GitOutputParseError: вывод Git не соответствует ожидаемому формату.
         """
+        if skip < 0:
+            raise ValueError(f"History skip must not be negative, got {skip}")
         separator = new_history_separator()
         arguments = build_history_arguments(
-            include_head=self.has_head(), limit=limit, separator=separator
+            include_head=self.has_head(),
+            limit=limit,
+            skip=skip,
+            separator=separator,
         )
         result = self._run(arguments)
         return parse_history(result.stdout, separator=separator, command=result.command)

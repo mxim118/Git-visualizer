@@ -248,6 +248,9 @@ class MainWindow(QMainWindow):
         self.workspace_page.branch_switch_requested.connect(
             self._on_branch_switch_requested
         )
+        self.workspace_page.older_history_requested.connect(
+            self._on_load_older_history
+        )
         self.commit_overlay.submitted.connect(self._on_commit_submitted)
         self.diff_overlay.close_requested.connect(self._close_file_diff)
 
@@ -259,6 +262,15 @@ class MainWindow(QMainWindow):
         self._controller.history_loading.connect(self._on_history_loading)
         self._controller.repository_loaded.connect(self._on_workspace_loaded)
         self._controller.load_failed.connect(self._on_load_failed)
+        self._controller.older_history_loading.connect(
+            self._on_older_history_loading
+        )
+        self._controller.older_history_loaded.connect(
+            self._on_older_history_loaded
+        )
+        self._controller.older_history_failed.connect(
+            self._on_older_history_failed
+        )
         self._controller.repository_closed.connect(self._on_repository_closed)
         self._controller.commit_files_loading.connect(self._on_commit_files_loading)
         self._controller.commit_files_loaded.connect(self._on_commit_files_loaded)
@@ -648,6 +660,9 @@ class MainWindow(QMainWindow):
         # или смена HEAD не сбрасывали вид на «вписать заново».
         previous_view = self.workspace_page.graph_view.view_state()
         self.workspace_page.set_workspace_data(data)
+        # Полная загрузка могла обогнать незавершённую догрузку страницы
+        # (контроллер отбрасывает её результат по сессии): снимаем её индикацию.
+        self.workspace_page.set_history_loading(False)
         self.workspace_page.set_busy(False)
         if self._remote_settings_dialog is not None:
             self._remote_settings_dialog.set_remotes(data.remotes)
@@ -662,10 +677,18 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(self._pending_workspace_status)
             self._pending_workspace_status = None
         elif data.commits:
-            self.statusBar().showMessage(
+            message = (
                 f"Коммитов загружено: {len(data.commits)}. "
                 f"Веток: {len(data.branches)}."
             )
+            if data.has_more_history:
+                # Пользователь должен знать, что граф — не вся история (FR-HIST-07).
+                message = (
+                    f"Коммитов загружено: {len(data.commits)} — показаны последние, "
+                    "есть более старая история. "
+                    f"Веток: {len(data.branches)}."
+                )
+            self.statusBar().showMessage(message)
         else:
             self.statusBar().showMessage(
                 "В репозитории пока нет коммитов. Создайте первый коммит в Git, "
@@ -685,8 +708,63 @@ class MainWindow(QMainWindow):
                     "Не удалось обновить список remote.", error=True
                 )
         self.workspace_page.set_busy(False)
+        self.workspace_page.set_history_loading(False)
         self.statusBar().showMessage("Не удалось загрузить историю.")
         self._show_error("Не удалось загрузить историю", failure.exception)
+
+    def _on_load_older_history(self) -> None:
+        """Догружает страницу более старой истории по кнопке уведомления."""
+        if self._controller.repository is None:
+            return
+        if not self._controller.load_more_history():
+            self.statusBar().showMessage(
+                "История уже загружается или загружена полностью."
+            )
+
+    def _on_older_history_loading(self) -> None:
+        self.workspace_page.set_history_loading(True)
+        self.statusBar().showMessage("Загрузка более старой истории…")
+
+    def _on_older_history_loaded(self, data: WorkspaceData) -> None:
+        """Показывает догруженную историю, сохраняя выбор и вид графа.
+
+        Новые коммиты дописываются вниз, поэтому координаты уже загруженных
+        узлов не меняются: восстанавливается только масштаб и положение окна.
+        """
+        previous_view = self.workspace_page.graph_view.view_state()
+        loaded_before = self._loaded_commit_count()
+        self.workspace_page.set_workspace_data(data, preserve_selection=True)
+        self.workspace_page.set_history_loading(False)
+        self._apply_preferred_graph_view(previous_view)
+        added = len(data.commits) - loaded_before
+        if added == 0:
+            # Вся страница уже была в графе: история изменилась снаружи, и окно
+            # skip сдвинулось. Догружать нечего — нужен refresh.
+            message = (
+                "Новых коммитов не загружено: история изменилась снаружи. "
+                "Обновите историю."
+            )
+        elif data.has_more_history:
+            message = (
+                f"Загружено более старой истории: {added}. "
+                f"Всего коммитов: {len(data.commits)}."
+            )
+        else:
+            message = (
+                f"История загружена полностью: {len(data.commits)} коммитов."
+            )
+        self.statusBar().showMessage(message)
+
+    def _on_older_history_failed(self, failure: TaskFailure) -> None:
+        self.workspace_page.set_history_loading(False)
+        self.statusBar().showMessage("Не удалось загрузить более старую историю.")
+        self._show_error(
+            "Не удалось загрузить более старую историю", failure.exception
+        )
+
+    def _loaded_commit_count(self) -> int:
+        data = self.workspace_page.workspace_data
+        return len(data.commits) if data is not None else 0
 
     # --- детали выбранного коммита и diff ---
 

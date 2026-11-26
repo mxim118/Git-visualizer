@@ -129,8 +129,8 @@ def test_fetch_updates_remote_tracking_refs_without_moving_head(
     assert rev(git, local, "HEAD") == old_head
     assert git(local, "status", "--porcelain") == ""
     # История после fetch видит коммит из remote-tracking ветки.
-    history = HistoryService(make_factory()).get_history(open_repository(local))
-    assert new_head in {commit.hash for commit in history}
+    page = HistoryService(make_factory()).get_history(open_repository(local))
+    assert new_head in {commit.hash for commit in page.commits}
 
 
 def test_pull_fast_forwards_current_branch(

@@ -13,6 +13,7 @@ from git_visualizer.presentation.widgets.branches_panel import BranchesPanel
 from git_visualizer.presentation.widgets.changes_panel import ChangesPanel
 from git_visualizer.presentation.widgets.commit_details_panel import CommitDetailsPanel
 from git_visualizer.presentation.widgets.graph_view import GraphView
+from git_visualizer.presentation.widgets.history_notice import HistoryNoticeBar
 from git_visualizer.presentation.widgets.top_bar import TopBar
 
 # Ручку вертикального сплиттера можно утянуть за край: верхняя область (граф и
@@ -41,7 +42,10 @@ class WorkspacePage(QWidget):
     """Основное окно репозитория с изменяемыми по размеру панелями.
 
     Центральная область — ``GraphView``; слева ветки и remote, справа детали
-    коммита со списком файлов, снизу панель Changes. Diff выбранного файла коммита
+    коммита со списком файлов, снизу панель Changes. Под графом показывается
+    ``HistoryNoticeBar``, если загружена не вся история (ТЗ FR-HIST-07): она
+    сообщает, сколько коммитов загружено, и догружает следующую страницу по
+    кнопке. Diff выбранного файла коммита
     открывается большой панелью поверх окна (``DiffOverlay``). Выбор узла сохраняется
     в ``selected_commit_hash``, обновляет панель деталей и сообщается сигналом
     ``commit_selected``; выбор файла коммита сохраняется в ``selected_file`` и
@@ -78,6 +82,7 @@ class WorkspacePage(QWidget):
     changes_commit_requested = Signal()  # открыть окно сообщения коммита
     branch_create_requested = Signal(str, object)  # имя, hash коммита или None
     branch_switch_requested = Signal(str)  # имя локальной ветки
+    older_history_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -87,12 +92,24 @@ class WorkspacePage(QWidget):
         self._commits_by_hash: dict[str, Commit] = {}
         self._selected_commit_hash: str | None = None
         self._selected_file: FileChange | None = None
+        self._history_loading = False
 
         self.top_bar = TopBar(self)
         self.graph_view = GraphView(self)
+        self.history_notice = HistoryNoticeBar(self)
         self.branches_panel = BranchesPanel(self)
         self.details_panel = CommitDetailsPanel(self)
         self.changes_panel = ChangesPanel(self)
+
+        # Граф и уведомление об ограниченной истории живут в одной области
+        # сплиттера: при догрузке страницы уведомление не сдвигает панели.
+        self.graph_area = QWidget(self)
+        self.graph_area.setObjectName("graph_area")
+        graph_layout = QVBoxLayout(self.graph_area)
+        graph_layout.setContentsMargins(0, 0, 0, 0)
+        graph_layout.setSpacing(0)
+        graph_layout.addWidget(self.graph_view, 1)
+        graph_layout.addWidget(self.history_notice)
 
         self.body_splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.body_splitter.setObjectName("body_splitter")
@@ -100,7 +117,7 @@ class WorkspacePage(QWidget):
         # ширины, исчезая с экрана: панели не должны «съедать» центральную область.
         self.body_splitter.setChildrenCollapsible(False)
         self.body_splitter.addWidget(self.branches_panel)
-        self.body_splitter.addWidget(self.graph_view)
+        self.body_splitter.addWidget(self.graph_area)
         self.body_splitter.addWidget(self.details_panel)
         self.body_splitter.setStretchFactor(0, 0)
         self.body_splitter.setStretchFactor(1, 1)
@@ -180,6 +197,9 @@ class WorkspacePage(QWidget):
         self.branches_panel.switch_branch_requested.connect(
             self.branch_switch_requested
         )
+        self.history_notice.load_more_requested.connect(
+            self.older_history_requested.emit
+        )
         # Сворачивание меняет размеры панелей: при перетаскивании ручки, при
         # изменении размеров окна и программном setSizes. Уведомителем служит
         # resize любого из трех виджетов, поэтому свернутая в ноль панель тоже
@@ -194,12 +214,33 @@ class WorkspacePage(QWidget):
         """Показывает репозиторий в верхней панели до загрузки истории."""
         self.top_bar.set_repository(repository)
 
-    def set_workspace_data(self, data: WorkspaceData) -> None:
-        """Отображает загруженные историю, граф, ветки и remote."""
+    def set_workspace_data(
+        self, data: WorkspaceData, *, preserve_selection: bool = False
+    ) -> None:
+        """Отображает загруженные историю, граф, ветки и remote.
+
+        :param preserve_selection: сохранить выбранный коммит и файл. Догрузка
+            более старой истории перерисовывает граф целиком, но продолжает его
+            вниз: выбранный коммит остаётся на месте, и панель деталей не
+            сбрасывается. При обычной загрузке и обновлении выбор снимается.
+        """
+        selected_hash = (
+            self._selected_commit_hash if preserve_selection else None
+        )
+        selected_file = self._selected_file if preserve_selection else None
         self._data = data
         self._commits_by_hash = {commit.hash: commit for commit in data.commits}
-        self._selected_commit_hash = None
-        self._selected_file = None
+        self._selected_commit_hash = (
+            selected_hash if selected_hash in self._commits_by_hash else None
+        )
+        if self._selected_commit_hash is None:
+            selected_file = None
+        self._selected_file = selected_file
+        selected_commit = (
+            self._commits_by_hash[self._selected_commit_hash]
+            if self._selected_commit_hash is not None
+            else None
+        )
 
         self.top_bar.set_repository(data.repository)
         self.top_bar.set_remotes(data.remotes)
@@ -208,13 +249,27 @@ class WorkspacePage(QWidget):
             commits=data.commits,
             ref_labels=data.ref_labels,
         )
+        if self._selected_commit_hash is not None:
+            # set_graph пересоздаёт узлы, поэтому выделение возвращается отдельно.
+            self.graph_view.select_commit(self._selected_commit_hash)
         self.branches_panel.set_branches(data.branches, data.remotes)
-        self.branches_panel.set_selected_commit(None)
+        self.branches_panel.set_selected_commit(selected_commit)
 
-        if data.commits:
-            self.details_panel.clear()
-        else:
-            self.details_panel.show_empty_repository()
+        if selected_commit is None:
+            if data.commits:
+                self.details_panel.clear()
+            else:
+                self.details_panel.show_empty_repository()
+        self._update_history_notice()
+
+    def set_history_loading(self, loading: bool) -> None:
+        """Показывает загрузку более старой страницы истории (FR-HIST-07).
+
+        Пока идёт запрос, кнопка догрузки заблокирована: следующая страница
+        запрашивается только после завершения текущей.
+        """
+        self._history_loading = loading
+        self._update_history_notice()
 
     def set_busy(self, busy: bool, message: str | None = None) -> None:
         self.top_bar.set_busy(busy, message)
@@ -226,8 +281,10 @@ class WorkspacePage(QWidget):
         self._commits_by_hash = {}
         self._selected_commit_hash = None
         self._selected_file = None
+        self._history_loading = False
         self.top_bar.clear()
         self.graph_view.clear()
+        self.history_notice.hide()
         self.branches_panel.clear()
         self.details_panel.clear()
         self.changes_panel.clear()
@@ -292,6 +349,17 @@ class WorkspacePage(QWidget):
             return
         self._selected_file = file_change
         self.file_selected.emit(commit_hash, file_change)
+
+    def _update_history_notice(self) -> None:
+        """Показывает уведомление, только если история обрезана лимитом."""
+        data = self._data
+        if data is None or not data.has_more_history:
+            self.history_notice.hide()
+            return
+        if self._history_loading:
+            self.history_notice.show_loading()
+        else:
+            self.history_notice.show_truncated(len(data.commits))
 
     # --- кнопки возврата свернутых панелей ---
 

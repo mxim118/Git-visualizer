@@ -427,7 +427,7 @@ def test_labels_agree_with_refs_attached_to_commits_by_history(
     repository = open_repo(work)
 
     labels = branch_service.get_ref_labels(repository)
-    commits = HistoryService(factory).get_history(repository)
+    commits = HistoryService(factory).get_history(repository).commits
 
     assert commits
     for commit in commits:

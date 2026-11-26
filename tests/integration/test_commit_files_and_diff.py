@@ -31,7 +31,7 @@ def make_factory():
 def load_repository(path: Path) -> tuple[Repository, tuple[Commit, ...], DiffService]:
     factory = make_factory()
     repository = RepositoryService(factory).open_repository(path)
-    commits = HistoryService(factory).get_history(repository)
+    commits = HistoryService(factory).get_history(repository).commits
     return repository, commits, DiffService(factory)
 
 
@@ -202,7 +202,7 @@ def test_large_diff_is_truncated(make_repo: MakeRepo, git: Git) -> None:
 
     factory = make_factory()
     repository = RepositoryService(factory).open_repository(path)
-    commits = HistoryService(factory).get_history(repository)
+    commits = HistoryService(factory).get_history(repository).commits
     latest = by_subject(commits, "large change")
     service = DiffService(factory, max_diff_chars=80)
 

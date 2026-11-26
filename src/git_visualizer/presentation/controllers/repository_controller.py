@@ -52,7 +52,12 @@ from git_visualizer.presentation.workers.task_runner import TaskFailure, TaskRun
 
 @dataclass(frozen=True, kw_only=True)
 class WorkspaceData:
-    """Всё, что нужно основному окну для отображения открытого репозитория."""
+    """Всё, что нужно основному окну для отображения открытого репозитория.
+
+    ``has_more_history`` — загружены не все коммиты: среди refs репозитория есть
+    более старые, и их можно догрузить (ТЗ FR-HIST-07). Признак приходит из
+    ``HistoryPage`` и показывается пользователю в рабочей области.
+    """
 
     repository: Repository
     commits: tuple[Commit, ...]
@@ -60,6 +65,7 @@ class WorkspaceData:
     remotes: tuple[Remote, ...]
     ref_labels: Mapping[str, tuple[RefLabel, ...]]
     layout: GraphLayout
+    has_more_history: bool
 
 
 class RepositoryController(QObject):
@@ -80,6 +86,10 @@ class RepositoryController(QObject):
     history_loading = Signal()
     repository_loaded = Signal(object)  # WorkspaceData
     load_failed = Signal(object)  # TaskFailure
+
+    older_history_loading = Signal()
+    older_history_loaded = Signal(object)  # WorkspaceData
+    older_history_failed = Signal(object)  # TaskFailure
 
     commit_files_loading = Signal(str)  # commit hash
     commit_files_loaded = Signal(str, object)  # commit hash, tuple[FileChange, ...]
@@ -228,6 +238,41 @@ class RepositoryController(QObject):
             не открыт или загрузка уже идёт.
         """
         return self._load_workspace()
+
+    def load_more_history(self) -> bool:
+        """Догружает страницу более старой истории (ТЗ FR-HIST-07).
+
+        Следующая страница запрашивается со смещением, равным числу уже
+        загруженных коммитов, и добавляется к ним: граф продолжается вниз, а
+        координаты уже загруженных узлов не меняются (раскладка назначает дорожки
+        сверху вниз). Ветки, remote и метки refs не изменились и переиспользуются.
+
+        Задача делит ключ с загрузкой истории, поэтому не выполняется параллельно
+        с ней и с ручным обновлением.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт, история загружена полностью или загрузка уже идёт.
+        """
+        repository = self._repository
+        workspace = self._workspace
+        if (
+            repository is None
+            or workspace is None
+            or not workspace.has_more_history
+        ):
+            return False
+        session = self._session
+        task = self._runner.submit(
+            partial(self._load_older_history, repository, workspace),
+            name="load-older-history",
+            key=self._load_key(),
+        )
+        if task is None:
+            return False
+        self.older_history_loading.emit()
+        task.succeeded.connect(partial(self._handle_older_history_loaded, session))
+        task.failed.connect(partial(self._handle_older_history_failed, session))
+        return True
 
     def close_repository(self) -> None:
         """Закрывает текущий репозиторий; результаты старых задач игнорируются."""
@@ -766,20 +811,50 @@ class RepositoryController(QObject):
 
     def _load_data(self, repository: Repository) -> WorkspaceData:
         """Worker-функция: выполняется вне GUI-потока, без обращения к виджетам."""
-        commits = self._history_service.get_history(
+        page = self._history_service.get_history(
             repository, limit=self._history_limit
         )
         branches = self._branch_service.get_branches(repository)
         remotes = self._repository_service.get_remotes(repository)
-        layout = self._graph_service.build_layout(commits)
+        layout = self._graph_service.build_layout(page.commits)
         ref_labels = build_ref_labels(repository, branches)
         return WorkspaceData(
             repository=repository,
-            commits=commits,
+            commits=page.commits,
             branches=branches,
             remotes=remotes,
             ref_labels=ref_labels,
             layout=layout,
+            has_more_history=page.has_more,
+        )
+
+    def _load_older_history(
+        self, repository: Repository, workspace: WorkspaceData
+    ) -> WorkspaceData:
+        """Worker-функция: дочитывает более старую историю и продолжает граф.
+
+        Репозиторий могли изменить снаружи между загрузками (новый коммит или
+        переписанная ветка смещают окно ``skip``): коммиты, которые уже есть в
+        графе, отбрасываются, чтобы раскладка не получила повторяющийся hash.
+        """
+        page = self._history_service.get_history(
+            repository,
+            limit=self._history_limit,
+            skip=len(workspace.commits),
+        )
+        known = {commit.hash for commit in workspace.commits}
+        commits = (
+            *workspace.commits,
+            *(commit for commit in page.commits if commit.hash not in known),
+        )
+        return WorkspaceData(
+            repository=workspace.repository,
+            commits=commits,
+            branches=workspace.branches,
+            remotes=workspace.remotes,
+            ref_labels=workspace.ref_labels,
+            layout=self._graph_service.build_layout(commits),
+            has_more_history=page.has_more,
         )
 
     def _handle_repository_opened(
@@ -807,6 +882,23 @@ class RepositoryController(QObject):
         if session != self._session:
             return
         self.load_failed.emit(failure)
+
+    def _handle_older_history_loaded(
+        self, session: int, data: WorkspaceData
+    ) -> None:
+        if session != self._session:
+            return
+        self._workspace = data
+        self.older_history_loaded.emit(data)
+
+    def _handle_older_history_failed(
+        self, session: int, failure: TaskFailure
+    ) -> None:
+        if session != self._session:
+            return
+        # Уже загруженная история остаётся на месте и пригодна к работе:
+        # показываем ошибку и даём повторить догрузку.
+        self.older_history_failed.emit(failure)
 
     def _load_commit_files(
         self, repository: Repository, commit: Commit

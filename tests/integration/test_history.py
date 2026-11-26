@@ -22,8 +22,10 @@ LIMIT = 5000
 def history() -> Callable[..., tuple[Commit, ...]]:
     runner = GitRunner(default_timeout=60)
 
-    def get(path: Path, *, limit: int = LIMIT) -> tuple[Commit, ...]:
-        return GitRepository(runner, path).get_history(limit=limit)
+    def get(
+        path: Path, *, limit: int = LIMIT, skip: int = 0
+    ) -> tuple[Commit, ...]:
+        return GitRepository(runner, path).get_history(limit=limit, skip=skip)
 
     return get
 
@@ -436,6 +438,87 @@ def test_limit_larger_than_history_returns_everything(make_repo: MakeRepo, histo
     assert len(history(make_repo(commits=3), limit=100)) == 3
 
 
+# --- загрузка более старой истории (skip, FR-HIST-07) ---
+
+
+def test_skip_loads_the_next_older_page(make_repo: MakeRepo, history) -> None:
+    repo = make_repo(commits=7)
+    everything = history(repo)
+
+    first = history(repo, limit=3)
+    second = history(repo, limit=3, skip=3)
+    last = history(repo, limit=3, skip=6)
+
+    assert [c.subject for c in first] == ["commit 6", "commit 5", "commit 4"]
+    assert [c.subject for c in second] == ["commit 3", "commit 2", "commit 1"]
+    assert [c.subject for c in last] == ["commit 0"]
+    assert first + second + last == everything
+
+
+def test_skip_beyond_history_is_empty(make_repo: MakeRepo, history) -> None:
+    assert history(make_repo(commits=2), skip=100) == ()
+
+
+def test_skip_windows_match_git_rev_list_on_branched_history(
+    make_repo: MakeRepo, commit, git: Git, history
+) -> None:
+    repo = make_repo(commits=2)
+    git(repo, "switch", "-q", "-c", "feature")
+    commit(repo, "feature 1")
+    commit(repo, "feature 2")
+    git(repo, "switch", "-q", "main")
+    commit(repo, "main 1")
+    expected = git(
+        repo, "rev-list", "--topo-order", "--branches", "--remotes", "HEAD"
+    ).split()
+
+    pages: list[str] = []
+    for skip in range(0, len(expected), 2):
+        page = history(repo, limit=2, skip=skip)
+        assert_topological(page)
+        pages.extend(hashes(page))
+
+    assert pages == expected
+
+
+def test_service_loads_pages_until_history_is_complete(make_repo: MakeRepo) -> None:
+    root = make_repo("pages", commits=5)
+    runner = GitRunner(default_timeout=60)
+    factory = lambda path: GitRepository(runner, path)  # noqa: E731
+    repository = RepositoryService(factory).open_repository(root)
+    service = HistoryService(factory)
+
+    loaded: list[Commit] = []
+    has_more = True
+    while has_more:
+        page = service.get_history(repository, limit=2, skip=len(loaded))
+        assert len(page.commits) <= 2
+        loaded.extend(page.commits)
+        has_more = page.has_more
+
+    assert [c.subject for c in loaded] == [
+        "commit 4", "commit 3", "commit 2", "commit 1", "commit 0",
+    ]
+
+
+def test_service_reports_whether_history_is_truncated(make_repo: MakeRepo) -> None:
+    root = make_repo("truncated", commits=3)
+    runner = GitRunner(default_timeout=60)
+    factory = lambda path: GitRepository(runner, path)  # noqa: E731
+    repository = RepositoryService(factory).open_repository(root)
+    service = HistoryService(factory)
+
+    # Ровно limit коммитов — история полная: len == limit неоднозначен.
+    complete = service.get_history(repository, limit=3)
+    # На один меньше — история обрезана, и это видно пользователю.
+    truncated = service.get_history(repository, limit=2)
+
+    assert complete.has_more is False
+    assert len(complete.commits) == 3
+    assert truncated.has_more is True
+    assert len(truncated.commits) == 2
+
+
 # --- сверка с независимым источником ---
 
 
@@ -489,7 +572,8 @@ def test_services_open_repository_and_load_history(make_repo: MakeRepo) -> None:
     factory = lambda path: GitRepository(runner, path)  # noqa: E731
 
     repository = RepositoryService(factory).open_repository(root / "." )
-    commits = HistoryService(factory).get_history(repository)
+    page = HistoryService(factory).get_history(repository)
 
-    assert [c.subject for c in commits] == ["commit 2", "commit 1", "commit 0"]
-    assert commits[0].hash == repository.head_commit
+    assert [c.subject for c in page.commits] == ["commit 2", "commit 1", "commit 0"]
+    assert page.commits[0].hash == repository.head_commit
+    assert page.has_more is False

@@ -16,7 +16,10 @@ from git_visualizer.application.errors import (
 )
 from git_visualizer.application.services.git_environment_service import GitEnvironment
 from git_visualizer.application.services.graph_service import GraphService
-from git_visualizer.application.services.history_service import DEFAULT_HISTORY_LIMIT
+from git_visualizer.application.services.history_service import (
+    DEFAULT_HISTORY_LIMIT,
+    HistoryPage,
+)
 from git_visualizer.application.services.remote_service import (
     RemoteConfigurationResult,
     RemoteOperationResult,
@@ -121,6 +124,8 @@ class FakeRepositoryService:
 
 
 class FakeHistoryService:
+    """История постранично: тот же срез, что ``git log --skip --max-count``."""
+
     def __init__(
         self,
         commits: tuple[Commit, ...] = (),
@@ -134,18 +139,23 @@ class FakeHistoryService:
         self._gate = gate
         self._started = started
         self.limits: list[int] = []
+        self.skips: list[int] = []
 
     def get_history(
-        self, repository: Repository, *, limit: int
-    ) -> tuple[Commit, ...]:
+        self, repository: Repository, *, limit: int, skip: int = 0
+    ) -> HistoryPage:
         self.limits.append(limit)
+        self.skips.append(skip)
         if self._started is not None:
             self._started.set()
         if self._gate is not None:
             assert self._gate.wait(5.0)
         if self.error is not None:
             raise self.error
-        return self.commits
+        return HistoryPage(
+            commits=self.commits[skip : skip + limit],
+            has_more=len(self.commits) > skip + limit,
+        )
 
 
 class FakeBranchService:
@@ -1603,3 +1613,147 @@ def test_set_history_limit_rejects_non_positive_value(qt_app) -> None:
         controller.set_history_limit(0)
 
     assert controller.history_limit == DEFAULT_HISTORY_LIMIT
+
+
+# --- догрузка более старой истории (ТЗ FR-HIST-07) ---
+
+
+def make_history(*labels: str) -> tuple[Commit, ...]:
+    """Линейная история от нового к старому: ``labels[0]`` — самый новый коммит."""
+    ordered: list[Commit] = []
+    for label in reversed(labels):
+        parents = (ordered[-1].hash,) if ordered else ()
+        ordered.append(make_commit(label, parents=parents))
+    return tuple(reversed(ordered))
+
+
+def open_truncated_controller(
+    qt_app,
+    tmp_path: Path,
+    commits: tuple[Commit, ...],
+    *,
+    limit: int,
+) -> tuple[RepositoryController, FakeHistoryService, list[WorkspaceData]]:
+    """Открывает репозиторий с лимитом ``limit`` и дожидается первой страницы."""
+    controller, _, history, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commits[0].hash),
+        commits=commits,
+        branches=(
+            Branch(
+                name="main",
+                is_remote=False,
+                is_current=True,
+                commit_hash=commits[0].hash,
+            ),
+        ),
+        history_limit=limit,
+    )
+    loaded: list[WorkspaceData] = []
+    controller.repository_loaded.connect(loaded.append)
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: bool(loaded))
+    return controller, history, loaded
+
+
+def test_older_history_is_appended_and_completes_the_graph(
+    qt_app, tmp_path: Path
+) -> None:
+    commits = make_history("d", "c", "b", "a")
+    controller, history, loaded = open_truncated_controller(
+        qt_app, tmp_path, commits, limit=2
+    )
+    older: list[WorkspaceData] = []
+    loading: list[bool] = []
+    controller.older_history_loading.connect(lambda: loading.append(True))
+    controller.older_history_loaded.connect(older.append)
+
+    assert [c.hash for c in loaded[0].commits] == [commits[0].hash, commits[1].hash]
+    assert loaded[0].has_more_history is True
+
+    assert controller.load_more_history() is True
+    wait_until(qt_app, lambda: bool(older))
+
+    assert loading == [True]
+    assert [c.hash for c in older[0].commits] == [c.hash for c in commits]
+    assert older[0].has_more_history is False
+    assert history.skips == [0, 2]
+    # Граф продолжен: ребро к ранее отсутствовавшему родителю появилось.
+    edges = {(edge.child_hash, edge.parent_hash) for edge in older[0].layout.edges}
+    assert (commits[1].hash, commits[2].hash) in edges
+    assert controller.workspace is older[0]
+    controller.wait_for_done()
+
+
+def test_load_more_history_requires_truncated_history(qt_app, tmp_path: Path) -> None:
+    commits = make_history("b", "a")
+    controller, _, loaded = open_truncated_controller(
+        qt_app, tmp_path, commits, limit=DEFAULT_HISTORY_LIMIT
+    )
+
+    assert loaded[0].has_more_history is False
+    assert controller.load_more_history() is False
+    controller.wait_for_done()
+
+
+def test_load_more_history_requires_open_repository(qt_app) -> None:
+    controller, _, _, _ = build_controller(
+        repository=make_repository(Path("repo"), head_commit=None)
+    )
+
+    assert controller.load_more_history() is False
+
+
+def test_load_more_history_is_not_started_twice(qt_app, tmp_path: Path) -> None:
+    commits = make_history("c", "b", "a")
+    controller, _, _ = open_truncated_controller(
+        qt_app, tmp_path, commits, limit=2
+    )
+
+    assert controller.load_more_history() is True
+    assert controller.load_more_history() is False  # задача уже идёт
+    controller.wait_for_done()
+
+
+def test_load_more_history_drops_commits_already_in_the_graph(
+    qt_app, tmp_path: Path
+) -> None:
+    commits = make_history("c", "b", "a")
+    controller, history, _ = open_truncated_controller(
+        qt_app, tmp_path, commits, limit=2
+    )
+    older: list[WorkspaceData] = []
+    controller.older_history_loaded.connect(older.append)
+
+    # Снаружи появился новый коммит: окно skip сдвинулось, и страница начинается
+    # с уже загруженного коммита. Повторный hash сломал бы раскладку графа.
+    history.commits = make_history("d", "c", "b", "a")
+    assert controller.load_more_history() is True
+    wait_until(qt_app, lambda: bool(older))
+
+    assert [c.hash for c in older[0].commits] == [
+        commits[0].hash,
+        commits[1].hash,
+        commits[2].hash,
+    ]
+    controller.wait_for_done()
+
+
+def test_older_history_failure_keeps_loaded_history(
+    qt_app, tmp_path: Path
+) -> None:
+    commits = make_history("b", "a")
+    controller, history, loaded = open_truncated_controller(
+        qt_app, tmp_path, commits, limit=1
+    )
+    failed: list[TaskFailure] = []
+    controller.older_history_failed.connect(failed.append)
+
+    error = GitCommandError(128, command=("git", "log"), stderr="fatal: bad object")
+    history.error = error
+    assert controller.load_more_history() is True
+    wait_until(qt_app, lambda: bool(failed))
+
+    assert failed[0].exception is error
+    # Уже загруженная история остаётся: догрузку можно повторить.
+    assert controller.workspace is loaded[0]
+    controller.wait_for_done()
