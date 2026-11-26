@@ -1,11 +1,15 @@
 """Русские тексты сетевых операций: ход, итог и причины отказа."""
 
 from git_visualizer.application.errors import (
+    InvalidRemoteNameError,
+    InvalidRemoteUrlError,
     NoCurrentBranchError,
     UnknownRemoteError,
     UpstreamNotConfiguredError,
 )
 from git_visualizer.application.services.remote_service import (
+    RemoteConfigurationContext,
+    RemoteConfigurationResult,
     RemoteOperationContext,
     RemoteOperationResult,
 )
@@ -14,6 +18,10 @@ from git_visualizer.infrastructure.git.git_errors import (
     GitTimeoutError,
 )
 from git_visualizer.presentation.remote_texts import (
+    remote_configuration_error_title,
+    remote_configuration_progress_text,
+    remote_configuration_result_text,
+    remote_configuration_user_message,
     remote_error_title,
     remote_progress_text,
     remote_result_text,
@@ -61,6 +69,9 @@ DIRTY_WORKTREE_STDERR = (
     "Please commit your changes or stash them before you merge.\n"
     "Aborting\n"
 )
+REMOTE_ALREADY_EXISTS_STDERR = "error: remote origin already exists.\n"
+INVALID_REMOTE_NAME_STDERR = "fatal: 'bad name' is not a valid remote name\n"
+REMOTE_NOT_CONFIGURED_STDERR = "error: No such remote: 'origin'\n"
 
 
 def test_progress_text_names_remote_and_branch() -> None:
@@ -263,3 +274,152 @@ def test_error_titles_are_russian() -> None:
     assert remote_error_title("fetch") == "Не удалось выполнить Fetch"
     assert remote_error_title("pull") == "Не удалось выполнить Pull"
     assert remote_error_title("push") == "Не удалось выполнить Push"
+
+
+# --- настройка remote ---
+
+
+def test_configuration_progress_text_names_operation_and_remote() -> None:
+    add = remote_configuration_progress_text(
+        RemoteConfigurationContext(operation="add", remote_name="origin")
+    )
+    edit = remote_configuration_progress_text(
+        RemoteConfigurationContext(
+            operation="edit", remote_name="origin", new_name="upstream"
+        )
+    )
+    remove = remote_configuration_progress_text(
+        RemoteConfigurationContext(operation="remove", remote_name="fork")
+    )
+
+    assert "Добавление" in add and "«origin»" in add
+    assert "Изменение" in edit and "«origin»" in edit
+    assert "Удаление" in remove and "«fork»" in remove
+
+
+def test_configuration_result_texts() -> None:
+    assert (
+        remote_configuration_result_text(
+            RemoteConfigurationResult(operation="add", remote_name="origin")
+        )
+        == "Remote «origin» добавлен."
+    )
+    assert (
+        remote_configuration_result_text(
+            RemoteConfigurationResult(operation="remove", remote_name="fork")
+        )
+        == "Remote «fork» удалён."
+    )
+    assert (
+        remote_configuration_result_text(
+            RemoteConfigurationResult(
+                operation="edit",
+                remote_name="origin",
+                new_name="upstream",
+            )
+        )
+        == "Remote «origin» переименован в «upstream»."
+    )
+    assert (
+        remote_configuration_result_text(
+            RemoteConfigurationResult(
+                operation="edit", remote_name="origin", new_name="origin"
+            )
+        )
+        == "Remote «origin» изменён."
+    )
+
+
+def test_configuration_error_titles() -> None:
+    assert (
+        remote_configuration_error_title(
+            RemoteConfigurationContext(operation="add")
+        )
+        == "Не удалось добавить remote"
+    )
+    assert (
+        remote_configuration_error_title(
+            RemoteConfigurationContext(operation="edit")
+        )
+        == "Не удалось изменить remote"
+    )
+    assert (
+        remote_configuration_error_title(
+            RemoteConfigurationContext(operation="remove")
+        )
+        == "Не удалось удалить remote"
+    )
+
+
+def test_invalid_remote_name_message_explains_rules() -> None:
+    message = remote_configuration_user_message(
+        InvalidRemoteNameError("empty"),
+        context=RemoteConfigurationContext(operation="add", remote_name="bad name"),
+    )
+
+    assert "недопустимо" in message
+    assert "пробелы" in message
+
+
+def test_invalid_remote_url_message_explains_supported_urls() -> None:
+    message = remote_configuration_user_message(
+        InvalidRemoteUrlError("no host"),
+        context=RemoteConfigurationContext(operation="add", remote_name="origin"),
+    )
+
+    assert "недопустим" in message
+    assert "HTTPS" in message
+    assert "SSH" in message
+    assert "https://" in message
+
+
+def test_duplicate_remote_message_uses_new_name_when_editing() -> None:
+    message = remote_configuration_user_message(
+        GitCommandError(3, stderr=REMOTE_ALREADY_EXISTS_STDERR),
+        context=RemoteConfigurationContext(
+            operation="edit", remote_name="origin", new_name="upstream"
+        ),
+    )
+
+    assert "«upstream»" in message
+    assert "уже существует" in message
+
+
+def test_invalid_remote_name_git_error_is_translated() -> None:
+    message = remote_configuration_user_message(
+        GitCommandError(128, stderr=INVALID_REMOTE_NAME_STDERR),
+        context=RemoteConfigurationContext(
+            operation="add", remote_name="bad name"
+        ),
+    )
+
+    assert "Git отклонил имя remote" in message
+    assert "«bad name»" in message
+
+
+def test_missing_remote_during_configuration_is_translated() -> None:
+    message = remote_configuration_user_message(
+        GitCommandError(2, stderr=REMOTE_NOT_CONFIGURED_STDERR),
+        context=RemoteConfigurationContext(
+            operation="remove", remote_name="origin"
+        ),
+    )
+
+    assert "не найден" in message
+    assert "«origin»" in message
+
+
+def test_unknown_configuration_error_includes_git_output() -> None:
+    message = remote_configuration_user_message(
+        GitCommandError(
+            1,
+            command=("git", "remote", "remove", "--", "origin"),
+            stderr="fatal: could not remove config section\n",
+        ),
+        context=RemoteConfigurationContext(
+            operation="remove", remote_name="origin"
+        ),
+    )
+
+    assert "could not remove config section" in message
+    assert "Подробнее" in message

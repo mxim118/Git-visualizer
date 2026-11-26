@@ -30,6 +30,8 @@ from git_visualizer.application.services.history_service import (
 )
 from git_visualizer.application.services.repository_service import RepositoryService
 from git_visualizer.application.services.remote_service import (
+    RemoteConfigurationContext,
+    RemoteConfigurationResult,
     RemoteOperationContext,
     RemoteOperationResult,
     RemoteService,
@@ -106,6 +108,10 @@ class RepositoryController(QObject):
     remote_operation_started = Signal(object)  # RemoteOperationContext
     remote_operation_succeeded = Signal(object)  # RemoteOperationResult
     remote_operation_failed = Signal(object, object)  # контекст, TaskFailure
+
+    remote_configuration_started = Signal(object)  # RemoteConfigurationContext
+    remote_configuration_succeeded = Signal(object)  # RemoteConfigurationResult
+    remote_configuration_failed = Signal(object, object)  # контекст, TaskFailure
 
     worktree_diff_loading = Signal(str, bool)  # path, staged
     worktree_diff_loaded = Signal(str, bool, object)  # path, staged, Diff
@@ -512,6 +518,96 @@ class RepositoryController(QObject):
             partial(self._remote_service.push_initial, repository, remote_name),
         )
 
+    def add_remote(self, name: str, url: str) -> bool:
+        """Добавляет remote в фоновой задаче.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или другая операция Git уже выполняется.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+        context = RemoteConfigurationContext(
+            operation="add", remote_name=name
+        )
+        return self._submit_remote_configuration(
+            context,
+            partial(self._remote_service.add_remote, repository, name, url),
+        )
+
+    def edit_remote(self, name: str, *, new_name: str, url: str) -> bool:
+        """Меняет имя и/или URL remote в фоновой задаче.
+
+        Обе правки выполняются одной задачей и последовательно: переименование
+        штатно обновляет настройки веток, после чего меняется URL.
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или другая операция Git уже выполняется.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+        context = RemoteConfigurationContext(
+            operation="edit", remote_name=name, new_name=new_name
+        )
+        return self._submit_remote_configuration(
+            context,
+            partial(
+                self._remote_service.edit_remote,
+                repository,
+                name,
+                new_name=new_name,
+                url=url,
+            ),
+        )
+
+    def remove_remote(self, name: str) -> bool:
+        """Удаляет remote в фоновой задаче (после подтверждения в Presentation).
+
+        :return: ``True``, если задача поставлена; ``False`` — репозиторий не
+            открыт или другая операция Git уже выполняется.
+        """
+        repository = self._repository
+        if repository is None:
+            return False
+        context = RemoteConfigurationContext(
+            operation="remove", remote_name=name
+        )
+        return self._submit_remote_configuration(
+            context,
+            partial(self._remote_service.remove_remote, repository, name),
+        )
+
+    def _submit_remote_configuration(
+        self,
+        context: RemoteConfigurationContext,
+        work: Callable[[], object],
+    ) -> bool:
+        """Запускает настройку remote, не параллеля её с другими операциями Git.
+
+        Ключ общий с индексом, коммитом, ветками и сетью: переименование remote
+        меняет настройки веток и remote-tracking refs, поэтому параллельный Git
+        не должен видеть промежуточное состояние конфигурации.
+        """
+        session = self._session
+        task = self._runner.submit(
+            work,
+            name=f"remote-config-{context.operation}",
+            key=f"changes-operation:{session}",
+        )
+        if task is None:
+            return False
+        self.remote_configuration_started.emit(context)
+        task.succeeded.connect(
+            partial(self._handle_remote_configuration_succeeded, session)
+        )
+        task.failed.connect(
+            partial(
+                self._handle_remote_configuration_failed, session, context
+            )
+        )
+        return True
+
     def _submit_remote_operation(
         self,
         context: RemoteOperationContext,
@@ -846,6 +942,33 @@ class RepositoryController(QObject):
         if isinstance(failure.exception, ValueError):
             return
         self._reload_after_head_change("reload-after-remote-failure")
+
+    def _handle_remote_configuration_succeeded(
+        self, session: int, result: RemoteConfigurationResult
+    ) -> None:
+        if session != self._session:
+            return
+        self.remote_configuration_succeeded.emit(result)
+        # Изменился список remote (а при переименовании — настройки веток и
+        # remote-tracking refs). Перечитываем историю, ветки/refs, remote и
+        # связанные элементы интерфейса.
+        self._reload_after_head_change("reload-after-remote-config")
+
+    def _handle_remote_configuration_failed(
+        self,
+        session: int,
+        context: RemoteConfigurationContext,
+        failure: TaskFailure,
+    ) -> None:
+        if session != self._session:
+            return
+        self.remote_configuration_failed.emit(context, failure)
+        # Отказ до Git (пустое имя/URL, неизвестный remote) ничего не менял.
+        # Ошибка Git могла случиться после частичной правки (rename выполнен,
+        # set-url — нет), поэтому список remote перечитывается.
+        if isinstance(failure.exception, ValueError):
+            return
+        self._reload_after_head_change("reload-after-remote-config-failure")
 
     def _reload_after_head_change(self, task_name: str) -> bool:
         """Переоткрывает репозиторий и загружает данные после смены HEAD."""

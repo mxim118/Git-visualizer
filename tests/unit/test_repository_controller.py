@@ -17,7 +17,10 @@ from git_visualizer.application.errors import (
 from git_visualizer.application.services.git_environment_service import GitEnvironment
 from git_visualizer.application.services.graph_service import GraphService
 from git_visualizer.application.services.history_service import DEFAULT_HISTORY_LIMIT
-from git_visualizer.application.services.remote_service import RemoteOperationResult
+from git_visualizer.application.services.remote_service import (
+    RemoteConfigurationResult,
+    RemoteOperationResult,
+)
 from git_visualizer.domain.enums import FileChangeType
 from git_visualizer.domain.models import (
     Branch,
@@ -297,22 +300,74 @@ class FakeRemoteService:
         self,
         *,
         error: BaseException | None = None,
+        configuration_error: BaseException | None = None,
+        remotes: tuple[Remote, ...] = (Remote(name="origin"),),
         gate: threading.Event | None = None,
         started: threading.Event | None = None,
     ) -> None:
         self.error = error
+        self.configuration_error = configuration_error
+        self.remotes = remotes
         self._gate = gate
         self._started = started
         self.fetch_requests: list[str] = []
         self.pull_requests = 0
         self.push_requests = 0
         self.initial_push_requests: list[str] = []
+        self.add_requests: list[tuple[str, str]] = []
+        self.edit_requests: list[tuple[str, str, str]] = []
+        self.remove_requests: list[str] = []
 
     def _wait(self) -> None:
         if self._started is not None:
             self._started.set()
         if self._gate is not None:
             assert self._gate.wait(5.0)
+
+    def _configuration_result(
+        self,
+        operation: str,
+        *,
+        remote_name: str,
+        new_name: str | None = None,
+    ) -> RemoteConfigurationResult:
+        if self._started is not None:
+            self._started.set()
+        if self._gate is not None:
+            assert self._gate.wait(5.0)
+        if self.configuration_error is not None:
+            raise self.configuration_error
+        return RemoteConfigurationResult(
+            operation=operation,
+            remote_name=remote_name,
+            new_name=new_name,
+            remotes=self.remotes,
+        )
+
+    def add_remote(
+        self, repository: Repository, name: str, url: str
+    ) -> RemoteConfigurationResult:
+        self.add_requests.append((name, url))
+        return self._configuration_result("add", remote_name=name)
+
+    def edit_remote(
+        self,
+        repository: Repository,
+        name: str,
+        *,
+        new_name: str,
+        url: str,
+    ) -> RemoteConfigurationResult:
+        self.edit_requests.append((name, new_name, url))
+        return self._configuration_result(
+            "edit", remote_name=name, new_name=new_name
+        )
+
+    def remove_remote(
+        self, repository: Repository, name: str
+    ) -> RemoteConfigurationResult:
+        self.remove_requests.append(name)
+        return self._configuration_result("remove", remote_name=name)
 
     def fetch(self, repository: Repository, remote_name: str) -> RemoteOperationResult:
         self.fetch_requests.append(remote_name)
@@ -1281,6 +1336,222 @@ def test_remote_operations_require_open_repository(qt_app) -> None:
     assert controller.pull() is False
     assert controller.push() is False
     assert controller.push_initial("origin") is False
+
+
+# --- конфигурация remote через контроллер ---
+
+
+def test_remote_configuration_add_runs_in_background_and_reloads_workspace(
+    qt_app, tmp_path: Path
+) -> None:
+    started = threading.Event()
+    gate = threading.Event()
+    remote_service = FakeRemoteService(gate=gate, started=started)
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        remote_service=remote_service,
+    )
+    contexts = []
+    results: list[RemoteConfigurationResult] = []
+    loaded: list[WorkspaceData] = []
+    controller.remote_configuration_started.connect(contexts.append)
+    controller.remote_configuration_succeeded.connect(results.append)
+    controller.repository_loaded.connect(loaded.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert len(loaded) == 1
+
+    assert (
+        controller.add_remote("upstream", "https://example.com/r.git") is True
+    )
+    wait_until(qt_app, started.is_set)
+    assert contexts[0].operation == "add"
+    assert contexts[0].remote_name == "upstream"
+    assert remote_service.add_requests == [
+        ("upstream", "https://example.com/r.git")
+    ]
+    assert results == []
+    assert len(loaded) == 1
+
+    gate.set()
+    wait_until(qt_app, lambda: bool(results))
+    wait_until(qt_app, lambda: len(loaded) == 2)
+
+    assert results[0].operation == "add"
+    assert results[0].remote_name == "upstream"
+    assert results[0].remotes == remote_service.remotes
+    controller.wait_for_done()
+
+
+def test_remote_configuration_edit_and_remove_use_service(
+    qt_app, tmp_path: Path
+) -> None:
+    remote_service = FakeRemoteService()
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        remote_service=remote_service,
+    )
+    results: list[RemoteConfigurationResult] = []
+    controller.remote_configuration_succeeded.connect(results.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+
+    assert (
+        controller.edit_remote(
+            "origin", new_name="upstream", url="git@example.com:me/r.git"
+        )
+        is True
+    )
+    wait_until(qt_app, lambda: len(results) == 1)
+    assert remote_service.edit_requests == [
+        ("origin", "upstream", "git@example.com:me/r.git")
+    ]
+    assert results[0].new_name == "upstream"
+
+    assert controller.remove_remote("upstream") is True
+    wait_until(qt_app, lambda: len(results) == 2)
+    assert remote_service.remove_requests == ["upstream"]
+    assert results[1].operation == "remove"
+    controller.wait_for_done()
+
+
+def test_remote_configuration_git_failure_reloads_workspace(
+    qt_app, tmp_path: Path
+) -> None:
+    error = GitCommandError(
+        3, stderr="error: remote upstream already exists.\n"
+    )
+    remote_service = FakeRemoteService(configuration_error=error)
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        remote_service=remote_service,
+    )
+    failures = []
+    loaded: list[WorkspaceData] = []
+    controller.remote_configuration_failed.connect(
+        lambda context, failure: failures.append((context, failure))
+    )
+    controller.repository_loaded.connect(loaded.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert len(loaded) == 1
+
+    assert (
+        controller.edit_remote(
+            "origin", new_name="upstream", url="https://example.com/r.git"
+        )
+        is True
+    )
+    wait_until(qt_app, lambda: bool(failures))
+    assert failures[0][1].exception is error
+    # Git-ошибка могла произойти после частичной правки: состояние перечитывается.
+    wait_until(qt_app, lambda: len(loaded) == 2)
+    controller.wait_for_done()
+
+
+def test_remote_configuration_validation_failure_does_not_reload_workspace(
+    qt_app, tmp_path: Path
+) -> None:
+    error = ValueError("Remote URL must not be empty")
+    remote_service = FakeRemoteService(configuration_error=error)
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        remote_service=remote_service,
+    )
+    failures: list[TaskFailure] = []
+    loaded: list[WorkspaceData] = []
+    controller.remote_configuration_failed.connect(
+        lambda context, failure: failures.append(failure)
+    )
+    controller.repository_loaded.connect(loaded.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+
+    assert controller.add_remote("origin", "  ") is True
+    wait_until(qt_app, lambda: bool(failures))
+
+    assert failures[0].exception is error
+    assert len(loaded) == 1
+    controller.wait_for_done()
+
+
+def test_remote_configuration_is_blocked_while_another_operation_runs(
+    qt_app, tmp_path: Path
+) -> None:
+    started = threading.Event()
+    gate = threading.Event()
+    remote_service = FakeRemoteService(gate=gate, started=started)
+    commit = make_commit("only")
+    controller, _, _, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit=commit.hash),
+        commits=(commit,),
+        branches=(
+            Branch(name="main", is_remote=False, is_current=True, commit_hash=commit.hash),
+        ),
+        remote_service=remote_service,
+    )
+    succeeded: list[object] = []
+    controller.remote_operation_succeeded.connect(succeeded.append)
+
+    controller.open_repository(str(tmp_path))
+    wait_until(qt_app, lambda: controller.workspace is not None)
+    assert controller.fetch("origin") is True
+    wait_until(qt_app, started.is_set)
+
+    assert controller.add_remote("fork", "https://example.com/fork.git") is False
+    assert (
+        controller.edit_remote(
+            "origin", new_name="upstream", url="https://example.com/r.git"
+        )
+        is False
+    )
+    assert controller.remove_remote("origin") is False
+    assert remote_service.add_requests == []
+    assert remote_service.edit_requests == []
+    assert remote_service.remove_requests == []
+
+    gate.set()
+    wait_until(qt_app, lambda: bool(succeeded))
+    controller.wait_for_done()
+
+
+def test_remote_configuration_requires_open_repository(qt_app) -> None:
+    controller, _, _, _ = build_controller(
+        repository=make_repository(Path("repo"), head_commit=None)
+    )
+
+    assert controller.add_remote("origin", "https://example.com/r.git") is False
+    assert (
+        controller.edit_remote(
+            "origin", new_name="upstream", url="https://example.com/r.git"
+        )
+        is False
+    )
+    assert controller.remove_remote("origin") is False
 
 
 # --- лимит загрузки коммитов (пользовательская настройка) ---

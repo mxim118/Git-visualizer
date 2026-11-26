@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from git_visualizer.domain.models import Repository
 from git_visualizer.presentation.widgets.workspace_page import WorkspacePage
 
 
@@ -156,5 +159,26 @@ def test_restore_button_stays_at_edge_after_window_resize(qt_app) -> None:
         assert button.bottom() == area.bottom() - 2
         assert abs(button.center().x() - area.center().x()) <= 1
         assert page.changes_restore_button.isVisible()
+    finally:
+        page.close()
+
+
+def test_top_bar_remote_settings_signal_is_forwarded(qt_app) -> None:
+    page = WorkspacePage()
+    try:
+        page.set_repository(
+            Repository(
+                path=Path("C:/repo"),
+                name="repo",
+                current_branch="main",
+                head_commit="a" * 40,
+            )
+        )
+        calls: list[bool] = []
+        page.remote_settings_requested.connect(lambda: calls.append(True))
+
+        page.top_bar.remote_settings_button.click()
+
+        assert calls == [True]
     finally:
         page.close()

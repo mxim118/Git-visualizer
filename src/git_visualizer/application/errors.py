@@ -72,6 +72,14 @@ class RemoteOperationValidationError(ValueError):
     """Операция с remote отклонена до запуска Git: состояние не менялось."""
 
 
+class InvalidRemoteNameError(RemoteOperationValidationError):
+    """Имя remote заведомо недопустимо (пустое или содержит управляющие символы)."""
+
+
+class InvalidRemoteUrlError(RemoteOperationValidationError):
+    """URL remote заведомо недопустим (пустой или имеет неполную схему)."""
+
+
 class UnknownRemoteError(RemoteOperationValidationError):
     """Запрошенный remote не настроен в репозитории."""
 

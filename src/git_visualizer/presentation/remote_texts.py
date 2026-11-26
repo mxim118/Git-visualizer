@@ -10,12 +10,16 @@ Git (SSH, Git Credential Manager, credential helpers).
 from __future__ import annotations
 
 from git_visualizer.application.errors import (
+    InvalidRemoteNameError,
+    InvalidRemoteUrlError,
     NoCurrentBranchError,
     RemoteOperationValidationError,
     UnknownRemoteError,
     UpstreamNotConfiguredError,
 )
 from git_visualizer.application.services.remote_service import (
+    RemoteConfigurationContext,
+    RemoteConfigurationResult,
     RemoteOperationContext,
     RemoteOperationResult,
 )
@@ -38,6 +42,28 @@ _ERROR_TITLES = {
     "pull": "Не удалось выполнить Pull",
     "push": "Не удалось выполнить Push",
 }
+
+_CONFIG_PROGRESS = {
+    "add": "Добавление remote",
+    "edit": "Изменение remote",
+    "remove": "Удаление remote",
+}
+
+_CONFIG_ERROR_TITLES = {
+    "add": "Не удалось добавить remote",
+    "edit": "Не удалось изменить remote",
+    "remove": "Не удалось удалить remote",
+}
+
+_REMOTE_NAME_RULES_TEXT = (
+    "Имя remote не должно быть пустым, содержать пробелы и символы «: ? * [ \\»; "
+    "Git проверяет имя до изменения конфигурации."
+)
+_REMOTE_URL_RULES_TEXT = (
+    "Укажите полный URL: HTTPS (https://host/path), SSH (git@host:path или "
+    "ssh://git@host/path) либо локальный путь. Схема без хоста (например, "
+    "https://) недопустима."
+)
 
 _AUTH_TEXT = (
     "Git не смог авторизоваться на remote {remote}. Приложение не хранит и не "
@@ -130,6 +156,101 @@ def remote_result_text(result: RemoteOperationResult) -> str:
     if result.remote and result.upstream:
         base += f" Upstream: {result.upstream}."
     return base
+
+
+def remote_configuration_progress_text(context: RemoteConfigurationContext) -> str:
+    """Короткое сообщение о выполняемой настройке remote."""
+    name = context.remote_name or context.new_name
+    action = _CONFIG_PROGRESS.get(context.operation, "Операция с remote")
+    return f"{action} «{name}»…" if name else f"{action}…"
+
+
+def remote_configuration_result_text(result: RemoteConfigurationResult) -> str:
+    """Короткий итог успешной настройки remote для окна и статусной строки."""
+    name = result.remote_name or "remote"
+    if result.operation == "add":
+        return f"Remote «{name}» добавлен."
+    if result.operation == "remove":
+        return f"Remote «{name}» удалён."
+    if result.new_name and result.new_name != result.remote_name:
+        return f"Remote «{name}» переименован в «{result.new_name}»."
+    return f"Remote «{name}» изменён."
+
+
+def remote_configuration_error_title(context: RemoteConfigurationContext) -> str:
+    """Заголовок диалога ошибки настройки remote."""
+    return _CONFIG_ERROR_TITLES.get(
+        context.operation, "Не удалось изменить remote"
+    )
+
+
+def remote_configuration_user_message(
+    error: BaseException,
+    *,
+    context: RemoteConfigurationContext,
+) -> str:
+    """Понятное пользователю сообщение об отказе настройки remote.
+
+    Для неопознанной ошибки Git в основной текст добавляется начало вывода: Git
+    может сообщить собственную причину (ограничения файловой системы, блокировка
+    конфигурации). Полный вывод остаётся в разделе «Подробнее».
+    """
+    name = context.remote_name or context.new_name or "remote"
+
+    if isinstance(error, InvalidRemoteNameError):
+        return (
+            f"Имя remote «{name}» недопустимо. "
+            f"{_REMOTE_NAME_RULES_TEXT}"
+        )
+    if isinstance(error, InvalidRemoteUrlError):
+        return (
+            f"URL remote «{name}» недопустим. "
+            f"{_REMOTE_URL_RULES_TEXT}"
+        )
+    if isinstance(error, UnknownRemoteError):
+        return (
+            f"Remote «{error.remote_name}» не найден в этом репозитории. "
+            "Возможно, его удалили; обновите список remote и повторите операцию."
+        )
+    if isinstance(error, RemoteOperationValidationError):
+        return (
+            "Операция с remote не выполнена: проверьте имя remote и URL. "
+            "Технические подробности доступны в разделе «Подробнее»."
+        )
+
+    if isinstance(error, GitCommandError):
+        if error.kind is GitErrorKind.REMOTE_ALREADY_EXISTS:
+            target = context.new_name or context.remote_name or "remote"
+            return (
+                f"Remote «{target}» уже существует. Выберите другое имя или "
+                "измените существующий remote."
+            )
+        if error.kind is GitErrorKind.INVALID_REMOTE_NAME:
+            return (
+                f"Git отклонил имя remote «{name}». "
+                f"{_REMOTE_NAME_RULES_TEXT}"
+            )
+        if error.kind is GitErrorKind.REMOTE_NOT_CONFIGURED:
+            return (
+                f"Remote «{name}» не найден в локальной конфигурации Git. "
+                "Обновите список remote и повторите операцию."
+            )
+        if error.kind is GitErrorKind.UNKNOWN:
+            excerpt = _output_excerpt(error)
+            title = _CONFIG_PROGRESS.get(context.operation, "Операция с remote")
+            if excerpt:
+                return (
+                    f"{title} не выполнено (код {error.returncode}). "
+                    "Сообщение Git:\n\n"
+                    f"{excerpt}\n\n"
+                    "Полная команда и вывод — в разделе «Подробнее»."
+                )
+            return (
+                f"{title} не выполнено (код {error.returncode}). Проверьте "
+                "локальную конфигурацию Git; технические подробности — в разделе "
+                "«Подробнее»."
+            )
+    return user_message(error)
 
 
 def remote_error_title(operation: str) -> str:

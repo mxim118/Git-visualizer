@@ -183,6 +183,11 @@ PULL_DIRTY_WORKTREE_STDERR = (
     "Please commit your changes or stash them before you merge.\n"
     "Aborting\n"
 )
+# Реальные сообщения Git 2.54.0 (LC_ALL=C) при управлении remote.
+REMOTE_ALREADY_EXISTS_STDERR = "error: remote origin already exists.\n"
+INVALID_REMOTE_NAME_STDERR = "fatal: 'bad name' is not a valid remote name\n"
+REMOTE_NOT_CONFIGURED_STDERR = "error: No such remote: 'missing'\n"
+REMOTE_SET_URL_NOT_CONFIGURED_STDERR = "error: No such remote 'missing'\n"
 
 
 @pytest.mark.parametrize(
@@ -213,6 +218,13 @@ PULL_DIRTY_WORKTREE_STDERR = (
         (NETWORK_STDERR, GitErrorKind.NETWORK_ERROR),
         (CONNECTION_REFUSED_STDERR, GitErrorKind.NETWORK_ERROR),
         (PULL_DIRTY_WORKTREE_STDERR, GitErrorKind.DIRTY_WORKTREE),
+        (REMOTE_ALREADY_EXISTS_STDERR, GitErrorKind.REMOTE_ALREADY_EXISTS),
+        (INVALID_REMOTE_NAME_STDERR, GitErrorKind.INVALID_REMOTE_NAME),
+        (REMOTE_NOT_CONFIGURED_STDERR, GitErrorKind.REMOTE_NOT_CONFIGURED),
+        (
+            REMOTE_SET_URL_NOT_CONFIGURED_STDERR,
+            GitErrorKind.REMOTE_NOT_CONFIGURED,
+        ),
         ("FATAL: NOT A GIT REPOSITORY", GitErrorKind.NOT_A_REPOSITORY),  # регистр не важен
         ("fatal: pathspec 'x' did not match any files\n", GitErrorKind.UNKNOWN),
         ("", GitErrorKind.UNKNOWN),
@@ -240,5 +252,17 @@ def test_command_error_kind_is_derived_from_stderr() -> None:
     assert (
         GitCommandError(128, stderr=INDEX_LOCK_EXISTS_STDERR).kind
         is GitErrorKind.INDEX_LOCKED
+    )
+    assert (
+        GitCommandError(3, stderr=REMOTE_ALREADY_EXISTS_STDERR).kind
+        is GitErrorKind.REMOTE_ALREADY_EXISTS
+    )
+    assert (
+        GitCommandError(128, stderr=INVALID_REMOTE_NAME_STDERR).kind
+        is GitErrorKind.INVALID_REMOTE_NAME
+    )
+    assert (
+        GitCommandError(2, stderr=REMOTE_NOT_CONFIGURED_STDERR).kind
+        is GitErrorKind.REMOTE_NOT_CONFIGURED
     )
     assert GitCommandError(1).kind is GitErrorKind.UNKNOWN

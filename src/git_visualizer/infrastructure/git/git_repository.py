@@ -396,6 +396,64 @@ def build_push_set_upstream_arguments(remote_name: str, branch_name: str) -> lis
     return ["push", "--set-upstream", remote, branch]
 
 
+def build_remote_add_arguments(name: str, url: str) -> list[str]:
+    """Аргументы добавления remote: ``git remote add -- <имя> <url>``.
+
+    ``--`` отделяет имя и URL от опций: Git разрешает имена, начинающиеся с
+    дефиса. Команда меняет только локальную конфигурацию и не обращается к
+    серверу, поэтому HTTPS, SSH и локальный путь одинаково безопасны.
+    """
+    remote = name.strip()
+    repository_url = url.strip()
+    if not remote:
+        raise ValueError("Remote name must not be empty")
+    if not repository_url:
+        raise ValueError("Remote URL must not be empty")
+    return ["remote", "add", "--", remote, repository_url]
+
+
+def build_remote_rename_arguments(name: str, new_name: str) -> list[str]:
+    """Аргументы переименования remote: ``git remote rename -- <имя> <новое>``.
+
+    Git сам обновляет ``branch.<имя>.remote`` у веток, отслеживающих этот remote,
+    и переносит remote-tracking refs — приложение не дублирует эту логику.
+    """
+    remote = name.strip()
+    renamed = new_name.strip()
+    if not remote:
+        raise ValueError("Remote name must not be empty")
+    if not renamed:
+        raise ValueError("New remote name must not be empty")
+    return ["remote", "rename", "--", remote, renamed]
+
+
+def build_remote_set_url_arguments(name: str, url: str) -> list[str]:
+    """Аргументы изменения URL remote: ``git remote set-url -- <имя> <url>``.
+
+    Без ``--push`` Git меняет fetch-URL; push-URL обновляется вместе с ним, если
+    раньше совпадал. Отдельно настроенный push-URL не перезаписывается.
+    """
+    remote = name.strip()
+    repository_url = url.strip()
+    if not remote:
+        raise ValueError("Remote name must not be empty")
+    if not repository_url:
+        raise ValueError("Remote URL must not be empty")
+    return ["remote", "set-url", "--", remote, repository_url]
+
+
+def build_remote_remove_arguments(name: str) -> list[str]:
+    """Аргументы удаления remote: ``git remote remove -- <имя>``.
+
+    Удаляется только запись remote в локальной конфигурации Git; файлы рабочей
+    директории и репозиторий на сервере не затрагиваются.
+    """
+    remote = name.strip()
+    if not remote:
+        raise ValueError("Remote name must not be empty")
+    return ["remote", "remove", "--", remote]
+
+
 class GitRepository:
     """Запросы к репозиторию, расположенному в каталоге ``path`` или внутри него."""
 
@@ -538,6 +596,45 @@ class GitRepository:
         """Настроенные remote; пустой кортеж, если их нет."""
         result = self._run(["remote", "-v"])
         return parse_remotes(result.stdout)
+
+    def add_remote(self, name: str, url: str) -> None:
+        """Добавляет remote в локальную конфигурацию (``git remote add``).
+
+        URL не проверяется сетью: HTTPS, SSH и локальный путь одинаково допустимы.
+        Дублирование имени и недопустимое имя отклоняет Git.
+
+        :raises ValueError: пустое имя или URL.
+        :raises GitError: Git отказал (remote уже существует, недопустимое имя и т. п.).
+        """
+        self._run(build_remote_add_arguments(name, url))
+
+    def rename_remote(self, name: str, new_name: str) -> None:
+        """Переименовывает remote (``git remote rename``).
+
+        Git сам переносит настройки веток и remote-tracking refs.
+
+        :raises ValueError: пустое имя.
+        :raises GitError: Git отказал (remote не найден, новое имя занято и т. п.).
+        """
+        self._run(build_remote_rename_arguments(name, new_name))
+
+    def set_remote_url(self, name: str, url: str) -> None:
+        """Меняет URL remote (``git remote set-url``).
+
+        :raises ValueError: пустое имя или URL.
+        :raises GitError: Git отказал (remote не найден и т. п.).
+        """
+        self._run(build_remote_set_url_arguments(name, url))
+
+    def remove_remote(self, name: str) -> None:
+        """Удаляет remote из локальной конфигурации (``git remote remove``).
+
+        Рабочая директория и сам удалённый репозиторий не затрагиваются.
+
+        :raises ValueError: пустое имя.
+        :raises GitError: Git отказал (remote не найден и т. п.).
+        """
+        self._run(build_remote_remove_arguments(name))
 
     def get_branch_upstream(self, branch_name: str) -> str | None:
         """Короткое имя upstream ветки (например, ``origin/main``) или ``None``.

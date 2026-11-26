@@ -30,6 +30,9 @@ class GitErrorKind(Enum):
     LFS_FILTER_FAILED = "lfs_filter_failed"  # не сработал фильтр Git LFS
     REPOSITORY_NOT_WRITABLE = "repository_not_writable"  # нет прав на запись в .git
     INDEX_LOCKED = "index_locked"  # index.lock занят другим Git-процессом
+    REMOTE_ALREADY_EXISTS = "remote_already_exists"  # имя remote уже занято
+    INVALID_REMOTE_NAME = "invalid_remote_name"  # Git отклонил имя remote
+    REMOTE_NOT_CONFIGURED = "remote_not_configured"  # remote не настроен в репозитории
     REMOTE_NOT_FOUND = "remote_not_found"  # remote недоступен / не является репозиторием
     AUTHENTICATION_FAILED = "authentication_failed"  # Git не смог авторизоваться
     PERMISSION_DENIED = "permission_denied"  # remote отклонил операцию: нет прав
@@ -95,6 +98,10 @@ _STDERR_RULES: tuple[tuple[GitErrorKind, str], ...] = (
     (GitErrorKind.MISSING_AUTHOR, "please tell me who you are"),
     (GitErrorKind.INVALID_BRANCH_NAME, "is not a valid branch name"),
     (GitErrorKind.BRANCH_ALREADY_EXISTS, "a branch named"),
+    # Команды управления remote (git remote add/rename/set-url/remove).
+    (GitErrorKind.REMOTE_ALREADY_EXISTS, "error: remote "),
+    (GitErrorKind.INVALID_REMOTE_NAME, "is not a valid remote name"),
+    (GitErrorKind.REMOTE_NOT_CONFIGURED, "no such remote"),
     (GitErrorKind.REF_NOT_FOUND, "invalid reference:"),
     (GitErrorKind.REF_NOT_FOUND, "not a valid object name"),
     (GitErrorKind.DIRTY_WORKTREE, "would be overwritten by checkout"),

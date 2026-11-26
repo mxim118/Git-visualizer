@@ -64,6 +64,7 @@ class WorkspacePage(QWidget):
     fetch_requested = Signal()
     pull_requested = Signal()
     push_requested = Signal()
+    remote_settings_requested = Signal()
     commit_selected = Signal(str)
     file_selected = Signal(str, object)  # commit hash, FileChange
     worktree_file_selected = Signal(object, bool)  # ChangedFile, staged
@@ -151,6 +152,9 @@ class WorkspacePage(QWidget):
         self.top_bar.fetch_requested.connect(self.fetch_requested)
         self.top_bar.pull_requested.connect(self.pull_requested)
         self.top_bar.push_requested.connect(self.push_requested)
+        self.top_bar.remote_settings_requested.connect(
+            self.remote_settings_requested
+        )
         self.graph_view.commit_selected.connect(self._on_commit_selected)
         self.details_panel.file_selected.connect(self._on_file_selected)
         self.changes_panel.file_selected.connect(self.worktree_file_selected)

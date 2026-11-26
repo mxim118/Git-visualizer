@@ -30,6 +30,8 @@ from PySide6.QtWidgets import (
 
 from git_visualizer.application.services.changes_service import ChangesService
 from git_visualizer.application.services.remote_service import (
+    RemoteConfigurationContext,
+    RemoteConfigurationResult,
     RemoteOperationContext,
     RemoteOperationResult,
 )
@@ -45,6 +47,9 @@ from git_visualizer.presentation.controllers.repository_controller import (
     RepositoryController,
     WorkspaceData,
 )
+from git_visualizer.presentation.dialogs.remote_settings_dialog import (
+    RemoteSettingsDialog,
+)
 from git_visualizer.presentation.dialogs.settings_dialog import SettingsDialog
 from git_visualizer.presentation.error_texts import (
     branch_user_message,
@@ -53,6 +58,10 @@ from git_visualizer.presentation.error_texts import (
     user_message,
 )
 from git_visualizer.presentation.remote_texts import (
+    remote_configuration_error_title,
+    remote_configuration_progress_text,
+    remote_configuration_result_text,
+    remote_configuration_user_message,
     remote_error_title,
     remote_progress_text,
     remote_result_text,
@@ -160,6 +169,10 @@ class MainWindow(QMainWindow):
         # Контекст и результат последней сетевой операции.
         self._remote_context: RemoteOperationContext | None = None
         self._pending_remote_result: RemoteOperationResult | None = None
+        # Открытое окно настроек remote.
+        self._remote_settings_dialog: RemoteSettingsDialog | None = None
+        # После успешной настройки remote окно остаётся занятым до перезагрузки.
+        self._pending_remote_configuration_refresh = False
 
         self._connect_signals()
         self.statusBar().showMessage("Проверка Git…")
@@ -199,6 +212,9 @@ class MainWindow(QMainWindow):
         self.workspace_page.fetch_requested.connect(self._on_fetch_requested)
         self.workspace_page.pull_requested.connect(self._on_pull_requested)
         self.workspace_page.push_requested.connect(self._on_push_requested)
+        self.workspace_page.remote_settings_requested.connect(
+            self._open_remote_settings_dialog
+        )
         self.workspace_page.commit_selected.connect(self._on_commit_selected)
         self.workspace_page.file_selected.connect(self._on_file_selected)
         self.workspace_page.worktree_file_selected.connect(
@@ -283,6 +299,15 @@ class MainWindow(QMainWindow):
         self._controller.remote_operation_failed.connect(
             self._on_remote_operation_failed
         )
+        self._controller.remote_configuration_started.connect(
+            self._on_remote_configuration_started
+        )
+        self._controller.remote_configuration_succeeded.connect(
+            self._on_remote_configuration_succeeded
+        )
+        self._controller.remote_configuration_failed.connect(
+            self._on_remote_configuration_failed
+        )
         self._controller.worktree_diff_loading.connect(
             self._on_worktree_diff_loading
         )
@@ -349,6 +374,119 @@ class MainWindow(QMainWindow):
         self._settings.sync()
         self._controller.set_history_limit(limit)
         self.statusBar().showMessage(f"Лимит загрузки коммитов: {limit}.")
+
+    # --- настройки remote ---
+
+    def _open_remote_settings_dialog(self) -> None:
+        """Открывает окно управления remote текущего репозитория."""
+        if self._controller.repository is None:
+            return
+        existing = self._remote_settings_dialog
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        data = self.workspace_page.workspace_data
+        if data is None:
+            self.statusBar().showMessage(
+                "Данные репозитория ещё загружаются: повторите через мгновение."
+            )
+            return
+
+        dialog = RemoteSettingsDialog(remotes=data.remotes, parent=self)
+        dialog.add_requested.connect(self._on_remote_add_requested)
+        dialog.edit_requested.connect(self._on_remote_edit_requested)
+        dialog.remove_requested.connect(self._on_remote_remove_requested)
+        dialog.finished.connect(self._on_remote_settings_dialog_finished)
+        self._remote_settings_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+
+    def _close_remote_settings_dialog(self) -> None:
+        """Закрывает окно настроек remote (смена или закрытие репозитория)."""
+        dialog = self._remote_settings_dialog
+        self._remote_settings_dialog = None
+        self._pending_remote_configuration_refresh = False
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
+
+    def _on_remote_settings_dialog_finished(self, _result: int) -> None:
+        self._remote_settings_dialog = None
+
+    def _on_remote_add_requested(self, name: str, url: str) -> None:
+        if self._controller.repository is None:
+            return
+        if not self._controller.add_remote(name, url):
+            self._announce_remote_configuration_busy()
+
+    def _on_remote_edit_requested(
+        self, name: str, new_name: str, url: str
+    ) -> None:
+        if self._controller.repository is None:
+            return
+        if not self._controller.edit_remote(
+            name, new_name=new_name, url=url
+        ):
+            self._announce_remote_configuration_busy()
+
+    def _on_remote_remove_requested(self, name: str) -> None:
+        if self._controller.repository is None:
+            return
+        if not self._controller.remove_remote(name):
+            self._announce_remote_configuration_busy()
+
+    def _announce_remote_configuration_busy(self) -> None:
+        message = "Другая операция Git уже выполняется…"
+        dialog = self._remote_settings_dialog
+        if dialog is not None:
+            dialog.set_busy(False)
+            dialog.show_status(message, error=True)
+        self.statusBar().showMessage(message)
+
+    def _on_remote_configuration_started(
+        self, context: RemoteConfigurationContext
+    ) -> None:
+        self._pending_remote_configuration_refresh = False
+        text = remote_configuration_progress_text(context)
+        dialog = self._remote_settings_dialog
+        if dialog is not None:
+            dialog.set_busy(True, text)
+        self.workspace_page.set_busy(True, text)
+        self.statusBar().showMessage(text)
+
+    def _on_remote_configuration_succeeded(
+        self, result: RemoteConfigurationResult
+    ) -> None:
+        text = remote_configuration_result_text(result)
+        dialog = self._remote_settings_dialog
+        if dialog is not None:
+            dialog.set_remotes(
+                result.remotes,
+                selected=result.new_name or result.remote_name,
+            )
+            dialog.show_status(text)
+            # Кнопки вернутся после того, как контроллер перечитает репозиторий:
+            # иначе можно запустить вторую правку параллельно с обновлением.
+            self._pending_remote_configuration_refresh = True
+        self.statusBar().showMessage(text)
+
+    def _on_remote_configuration_failed(
+        self, context: RemoteConfigurationContext, failure: TaskFailure
+    ) -> None:
+        self._pending_remote_configuration_refresh = False
+        self.workspace_page.set_busy(False)
+        title = remote_configuration_error_title(context)
+        message = remote_configuration_user_message(
+            failure.exception, context=context
+        )
+        dialog = self._remote_settings_dialog
+        if dialog is not None:
+            dialog.set_busy(False)
+            dialog.show_status(f"{title}.", error=True)
+        self.statusBar().showMessage(f"{title}.")
+        self._show_error(title, failure.exception, message=message)
 
     # --- положение графа ---
 
@@ -441,6 +579,7 @@ class MainWindow(QMainWindow):
     def _on_repository_opening(self, path: str) -> None:
         self._hide_diff_overlay()
         self.commit_overlay.hide_overlay()
+        self._close_remote_settings_dialog()
         self._pending_worktree_diff_refresh = None
         self._changes_operation = None
         self._reset_branch_operation()
@@ -480,6 +619,7 @@ class MainWindow(QMainWindow):
     def _on_repository_closed(self) -> None:
         self._hide_diff_overlay()
         self.commit_overlay.hide_overlay()
+        self._close_remote_settings_dialog()
         self._pending_worktree_diff_refresh = None
         self._changes_operation = None
         self._reset_branch_operation()
@@ -509,6 +649,12 @@ class MainWindow(QMainWindow):
         previous_view = self.workspace_page.graph_view.view_state()
         self.workspace_page.set_workspace_data(data)
         self.workspace_page.set_busy(False)
+        if self._remote_settings_dialog is not None:
+            self._remote_settings_dialog.set_remotes(data.remotes)
+        if self._pending_remote_configuration_refresh:
+            self._pending_remote_configuration_refresh = False
+            if self._remote_settings_dialog is not None:
+                self._remote_settings_dialog.set_busy(False)
         self._apply_preferred_graph_view(previous_view)
         # Статус рабочей директории — отдельный запрос: он меняется независимо от HEAD.
         self._controller.load_changes()
@@ -530,6 +676,14 @@ class MainWindow(QMainWindow):
     def _on_load_failed(self, failure: TaskFailure) -> None:
         self._pending_workspace_status = None
         self._reset_branch_operation()
+        if self._pending_remote_configuration_refresh:
+            self._pending_remote_configuration_refresh = False
+            dialog = self._remote_settings_dialog
+            if dialog is not None:
+                dialog.set_busy(False)
+                dialog.show_status(
+                    "Не удалось обновить список remote.", error=True
+                )
         self.workspace_page.set_busy(False)
         self.statusBar().showMessage("Не удалось загрузить историю.")
         self._show_error("Не удалось загрузить историю", failure.exception)

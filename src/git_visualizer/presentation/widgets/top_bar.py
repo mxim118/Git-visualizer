@@ -36,6 +36,7 @@ class TopBar(QFrame):
     fetch_requested = Signal()
     pull_requested = Signal()
     push_requested = Signal()
+    remote_settings_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -88,6 +89,13 @@ class TopBar(QFrame):
         self.pull_button = self._make_action_button("Pull", "pull_button")
         self.push_button = self._make_action_button("Push", "push_button")
 
+        self.remote_settings_button = self._make_action_button(
+            "Настройки remote", "remote_settings_button"
+        )
+        self.remote_settings_button.clicked.connect(
+            self.remote_settings_requested
+        )
+
         self.refresh_button = self._make_action_button("Обновить", "refresh_button")
         self.refresh_button.setToolTip("Обновить историю репозитория")
         self.refresh_button.clicked.connect(self.refresh_requested)
@@ -110,6 +118,7 @@ class TopBar(QFrame):
         layout.addWidget(self.branch_label)
         layout.addWidget(self.remote_label)
         layout.addWidget(self.remote_combo)
+        layout.addWidget(self.remote_settings_button)
         layout.addStretch(1)
         layout.addWidget(self.remote_status_label)
         layout.addWidget(self.status_label)
@@ -247,12 +256,26 @@ class TopBar(QFrame):
 
         self.refresh_button.setEnabled(ready)
         self.remote_combo.setEnabled(ready and has_remotes)
+        self.remote_settings_button.setEnabled(ready)
         self.fetch_button.setEnabled(ready and has_remotes)
         self.pull_button.setEnabled(branch_ready)
         self.push_button.setEnabled(branch_ready)
+        self.remote_settings_button.setToolTip(
+            self._remote_settings_tooltip(ready)
+        )
         self.fetch_button.setToolTip(self._fetch_tooltip(ready, has_remotes))
         self.pull_button.setToolTip(self._branch_tooltip(ready, has_remotes))
         self.push_button.setToolTip(self._push_tooltip(ready, has_remotes))
+
+    def _remote_settings_tooltip(self, ready: bool) -> str:
+        if self._busy:
+            return "Выполняется операция Git…"
+        if not self._has_repository:
+            return "Репозиторий ещё не открыт."
+        return (
+            "Просмотреть, добавить, изменить или удалить remote. "
+            "Операции выполняются через Git CLI."
+        )
 
     def _fetch_tooltip(self, ready: bool, has_remotes: bool) -> str:
         if self._busy:

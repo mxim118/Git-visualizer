@@ -135,6 +135,56 @@ def test_buttons_emit_signals(qt_app) -> None:
     assert calls == ["fetch", "pull", "push"]
 
 
+def test_remote_settings_button_requires_open_repository(qt_app) -> None:
+    bar = TopBar()
+
+    assert not bar.remote_settings_button.isEnabled()
+    assert bar.remote_settings_button.text() == "Настройки remote"
+
+    bar.set_repository(repository())
+
+    assert bar.remote_settings_button.isEnabled()
+    assert "Git CLI" in bar.remote_settings_button.toolTip()
+
+
+def test_remote_settings_button_is_available_without_remotes(qt_app) -> None:
+    bar = TopBar()
+    bar.set_repository(repository())
+
+    bar.set_remotes(())
+
+    # Даже без remote окно настроек нужно, чтобы добавить первый remote.
+    assert bar.remote_settings_button.isEnabled()
+    assert not bar.fetch_button.isEnabled()
+
+
+def test_remote_settings_button_is_disabled_while_busy_and_emits_signal(
+    qt_app,
+) -> None:
+    bar = TopBar()
+    bar.set_repository(repository())
+    calls: list[bool] = []
+    bar.remote_settings_requested.connect(lambda: calls.append(True))
+
+    bar.set_busy(True, "Операция Git…")
+    assert not bar.remote_settings_button.isEnabled()
+
+    bar.set_busy(False)
+    bar.remote_settings_button.click()
+
+    assert calls == [True]
+
+
+def test_clear_disables_remote_settings_button(qt_app) -> None:
+    bar = TopBar()
+    bar.set_repository(repository())
+
+    bar.clear()
+
+    assert not bar.remote_settings_button.isEnabled()
+    assert "не открыт" in bar.remote_settings_button.toolTip()
+
+
 def test_clear_resets_remotes_and_status(qt_app) -> None:
     bar = TopBar()
     bar.set_repository(repository())
