@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QSettings, QSize
+from PySide6.QtCore import QSettings, QSize, QTimer
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import QFileDialog, QFrame, QLabel
 
@@ -48,7 +48,10 @@ from git_visualizer.presentation.widgets.diff_view import (
     classify_diff_line,
 )
 from git_visualizer.presentation.widgets.graph_view import GraphViewState
-from git_visualizer.presentation.windows.main_window import MainWindow
+from git_visualizer.presentation.windows.main_window import (
+    MainWindow,
+    describe_active_tasks,
+)
 
 NOW = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -110,6 +113,28 @@ class FakeEnvironmentService:
         if self._error is not None:
             raise self._error
         return self._environment
+
+
+class BlockingEnvironmentService(FakeEnvironmentService):
+    """Проверка Git, которая может «зависнуть» в фоновой задаче.
+
+    Нужна тестам закрытия окна: первая проверка (при создании окна) проходит
+    сразу, а последующие ждут ``release`` — так задача остаётся активной,
+    пока тест не отпустит её.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block = False
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def check(self) -> GitEnvironment:
+        if self.block:
+            self.entered.set()
+            if not self.release.wait(timeout=10):
+                raise AssertionError("тест не отпустил фоновую задачу")
+        return super().check()
 
 
 class FakeRepositoryService:
@@ -374,6 +399,7 @@ def build_controller(
     changes_service: FakeChangesService | None = None,
     commit_service: FakeCommitService | None = None,
     remote_service: FakeRemoteService | None = None,
+    environment_service: FakeEnvironmentService | None = None,
 ) -> tuple[RepositoryController, FakeHistoryService]:
     history = FakeHistoryService(commits, error=history_error)
     controller = RepositoryController(
@@ -389,8 +415,11 @@ def build_controller(
         changes_service=changes_service or FakeChangesService(),
         commit_service=commit_service or FakeCommitService(),
         remote_service=remote_service or FakeRemoteService(),
-        git_environment_service=FakeEnvironmentService(
-            environment=environment, error=environment_error
+        git_environment_service=(
+            environment_service
+            or FakeEnvironmentService(
+                environment=environment, error=environment_error
+            )
         ),
     )
     return controller, history
@@ -2780,4 +2809,161 @@ def test_load_more_reports_external_history_change(
         assert workspace.graph_view.commit_count == 2
         assert not workspace.history_notice.isHidden()
         assert workspace.history_notice.button.isEnabled()
+
+
+# --- закрытие окна во время фоновых операций ---
+# Вопрос «Дождаться/Закрыть без ожидания» в тестах отключён фикстурой из
+# tests/conftest.py (по умолчанию — «Дождаться»); конкретные тесты ниже
+# переопределяют метод на экземпляре окна.
+
+
+def start_blocking_git_check(qt_app, controller, environment) -> None:
+    """Оставляет активную фоновую задачу: проверка Git ждёт ``environment.release``."""
+    wait_until(qt_app, lambda: not controller.active_task_names())
+    environment.block = True
+    controller.check_git_environment()
+    wait_until(qt_app, environment.entered.is_set)
+
+
+def test_describe_active_tasks_uses_russian_labels() -> None:
+    assert describe_active_tasks(("remote-fetch",)) == "Fetch"
+    assert describe_active_tasks(("remote-push-initial",)) == "первый Push"
+    assert describe_active_tasks(("stage-file", "discard-file")) == (
+        "добавление файла в индекс, отмена изменений файла"
+    )
+    assert describe_active_tasks(("unknown-task",)) == "операция Git"
+    assert describe_active_tasks(("remote-fetch", "remote-fetch")) == "Fetch"
+
+
+def test_close_without_active_tasks_does_not_ask(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit="a" * 40)
+    )
+    window = MainWindow(controller, memory_settings())
+    wait_until(qt_app, lambda: not controller.active_task_names())
+    asked: list[tuple[str, ...]] = []
+
+    def confirm(tasks: tuple[str, ...]) -> bool:
+        asked.append(tasks)
+        return True
+
+    monkeypatch.setattr(window, "_confirm_close_with_active_tasks", confirm)
+
+    window.close()
+
+    assert asked == []
+    assert not window.isVisible()
+
+
+def test_close_waits_for_active_task_and_saves_settings_first(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = BlockingEnvironmentService()
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit="a" * 40),
+        environment_service=environment,
+    )
+    settings = memory_settings()
+    window = MainWindow(controller, settings)
+    start_blocking_git_check(qt_app, controller, environment)
+
+    confirmations: list[tuple[str, ...]] = []
+
+    def confirm(tasks: tuple[str, ...]) -> bool:
+        confirmations.append(tasks)
+        return True
+
+    monkeypatch.setattr(window, "_confirm_close_with_active_tasks", confirm)
+
+    waits: list[tuple[str, ...]] = []
+    real_wait = window._wait_for_active_tasks
+
+    def wait(tasks: tuple[str, ...]) -> bool:
+        # Настройки сохраняются до ожидания, а не после него.
+        assert settings.window_geometry() is not None
+        waits.append(tasks)
+        return real_wait(tasks)
+
+    monkeypatch.setattr(window, "_wait_for_active_tasks", wait)
+
+    QTimer.singleShot(900, environment.release.set)
+    started = time.monotonic()
+    window.close()
+    elapsed = time.monotonic() - started
+
+    assert confirmations == [("git-environment",)]
+    assert waits == [("git-environment",)]
+    assert elapsed >= 0.8  # окно дождалось завершения задачи
+    assert controller.active_task_names() == ()
+    assert not window.isVisible()
+
+
+def test_close_short_task_waits_without_asking(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Короткая фоновая задача не вызывает вопрос: окно тихо дожидается её."""
+    environment = BlockingEnvironmentService()
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit="a" * 40),
+        environment_service=environment,
+    )
+    window = MainWindow(controller, memory_settings())
+    start_blocking_git_check(qt_app, controller, environment)
+
+    asked: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        window,
+        "_confirm_close_with_active_tasks",
+        lambda tasks: asked.append(tasks) or True,
+    )
+
+    QTimer.singleShot(100, environment.release.set)
+    started = time.monotonic()
+    window.close()
+    elapsed = time.monotonic() - started
+
+    assert asked == []
+    assert elapsed >= 0.05
+    assert elapsed < 1.0
+    assert controller.active_task_names() == ()
+    assert not window.isVisible()
+
+
+def test_close_without_waiting_returns_immediately(
+    qt_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = BlockingEnvironmentService()
+    controller, _ = build_controller(
+        repository=make_repository(tmp_path, head_commit="a" * 40),
+        environment_service=environment,
+    )
+    settings = memory_settings()
+    window = MainWindow(controller, settings)
+    start_blocking_git_check(qt_app, controller, environment)
+
+    monkeypatch.setattr(
+        window, "_confirm_close_with_active_tasks", lambda tasks: False
+    )
+    waits: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        window,
+        "_wait_for_active_tasks",
+        lambda tasks: waits.append(tasks) or False,
+    )
+
+    started = time.monotonic()
+    window.close()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert waits == []  # пользователь отказался ждать
+    assert controller.active_task_names() == ("git-environment",)
+    assert settings.window_geometry() is not None
+    assert not window.isVisible()
+
+    # Отпускаем задачу, чтобы тест не оставлял работающий поток.
+    environment.release.set()
+    assert controller.wait_for_done(5000)
 

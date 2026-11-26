@@ -352,6 +352,18 @@ class RepositoryController(QObject):
         """Дожидается завершения фоновых задач (используется при закрытии окна)."""
         return self._runner.wait_for_done(msecs)
 
+    def active_task_names(self) -> tuple[str, ...]:
+        """Имена незавершённых фоновых задач (pending/running) без повторов.
+
+        Presentation использует список при закрытии окна: по именам видно, какие
+        операции ещё выполняются, и пользователь решает, ждать их или нет.
+        Вызывается только в GUI-потоке.
+        """
+        names: dict[str, None] = {}
+        for task in self._runner.active_tasks():
+            names.setdefault(task.name)
+        return tuple(names)
+
     def load_changes(self) -> bool:
         """Запускает фоновое обновление состояния рабочей директории.
 

@@ -29,3 +29,20 @@ def app_settings(tmp_path: Path):
         QSettings.Format.IniFormat,
     )
     return AppSettings(storage)
+
+
+@pytest.fixture(autouse=True)
+def close_waits_without_dialog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Тесты не упираются в модальный вопрос при закрытии главного окна.
+
+    По умолчанию выбирается «Дождаться»: так закрытие ведёт себя как раньше
+    (ждало фоновые задачи), но тест не блокируется диалогом. Тесты закрытия в
+    ``tests/unit/test_main_window.py`` переопределяют метод на экземпляре окна.
+    """
+    from git_visualizer.presentation.windows.main_window import MainWindow
+
+    monkeypatch.setattr(
+        MainWindow,
+        "_confirm_close_with_active_tasks",
+        lambda self, tasks: True,
+    )

@@ -16,14 +16,16 @@ MainWindow не содержит бизнес-логики: открытие р�
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QEventLoop, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QStackedWidget,
     QWidget,
 )
@@ -105,6 +107,55 @@ _BRANCH_ERROR_TITLES: dict[str, str] = {
     "switch": "Не удалось переключить ветку",
 }
 
+# Имена фоновых задач (``TaskRunner.submit(name=...)``) → понятное описание операции.
+# Используется диалогом закрытия: пользователь видит, что именно ещё выполняется.
+_CLOSE_TASK_LABELS: dict[str, str] = {
+    "git-environment": "проверка Git",
+    "open-repository": "открытие репозитория",
+    "load-workspace": "загрузка истории",
+    "load-older-history": "загрузка старой истории",
+    "changes": "обновление состояния рабочей директории",
+    "commit-files": "загрузка списка файлов коммита",
+    "file-diff": "загрузка diff коммита",
+    "worktree-diff": "загрузка diff файла",
+    "commit": "создание коммита",
+    "branch-create": "создание ветки",
+    "branch-switch": "переключение ветки",
+    "stage-file": "добавление файла в индекс",
+    "unstage-file": "удаление файла из индекса",
+    "stage-all": "добавление всех изменений в индекс",
+    "unstage-all": "удаление всех изменений из индекса",
+    "discard-file": "отмена изменений файла",
+    "remote-fetch": "Fetch",
+    "remote-pull": "Pull",
+    "remote-push": "Push",
+    "remote-push-initial": "первый Push",
+    "remote-config-add": "добавление remote",
+    "remote-config-edit": "изменение remote",
+    "remote-config-remove": "удаление remote",
+}
+_UNKNOWN_TASK_LABEL = "операция Git"
+# Период проверки завершения задач при закрытии окна: событийный цикл остаётся
+# живым, поэтому окно перерисовывается и кнопка «Не ждать» доступна.
+_CLOSE_WAIT_POLL_MSEC = 100
+# Короткие операции (проверка Git, обновление статуса) успевают завершиться за
+# это время — тогда вопрос о закрытии не задаётся.
+_CLOSE_GRACE_MSEC = 500
+
+
+def describe_active_tasks(names: Sequence[str]) -> str:
+    """Русское описание выполняющихся фоновых операций для диалога закрытия.
+
+    Имена задач берутся из ``RepositoryController.active_task_names()``; повторы
+    и неизвестные имена не создают дублей (неизвестное — «операция Git»).
+    """
+    labels: list[str] = []
+    for name in names:
+        label = _CLOSE_TASK_LABELS.get(name, _UNKNOWN_TASK_LABEL)
+        if label not in labels:
+            labels.append(label)
+    return ", ".join(labels)
+
 
 class MainWindow(QMainWindow):
     """Координирует стартовый экран и рабочую область репозитория."""
@@ -173,6 +224,9 @@ class MainWindow(QMainWindow):
         self._remote_settings_dialog: RemoteSettingsDialog | None = None
         # После успешной настройки remote окно остаётся занятым до перезагрузки.
         self._pending_remote_configuration_refresh = False
+        # Окно закрывается: повторные closeEvent игнорируются, а модальные
+        # диалоги ошибок не открываются (они заблокировали бы завершение).
+        self._closing = False
 
         self._connect_signals()
         self.statusBar().showMessage("Проверка Git…")
@@ -189,10 +243,152 @@ class MainWindow(QMainWindow):
         return self._controller
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
-        # Фоновые задачи должны завершиться раньше окна: их слоты меняют виджеты.
-        self._controller.wait_for_done()
+        """Закрывает окно, не блокируя интерфейс фоновыми задачами.
+
+        Настройки сохраняются **до** любого ожидания: если пользователь закроет
+        окно без ожидания (или снимет зависший процесс), геометрия, панели и
+        положение графа останутся. Короткие операции успевают завершиться за
+        ``_CLOSE_GRACE_MSEC`` и не вызывают вопрос; если задача ещё выполняется,
+        пользователь выбирает «Дождаться» или «Закрыть без ожидания», а ожидание
+        идёт с живым событийным циклом и индикатором — окно не замирает до
+        сетевого таймаута (120 с у Fetch/Pull/Push).
+        """
+        if self._closing:
+            # Повторный closeEvent во время ожидания (например, Alt+F4).
+            event.accept()
+            return
+        self._closing = True
         self._save_settings()
+
+        tasks = self._controller.active_task_names()
+        if not tasks:
+            super().closeEvent(event)
+            return
+        if self._wait_for_tasks_quietly(_CLOSE_GRACE_MSEC):
+            super().closeEvent(event)
+            return
+
+        remaining = self._controller.active_task_names() or tasks
+        if not self._confirm_close_with_active_tasks(remaining):
+            super().closeEvent(event)
+            return
+        self._wait_for_active_tasks(remaining)
         super().closeEvent(event)
+
+    def _wait_for_tasks_quietly(self, msecs: int) -> bool:
+        """Ждёт завершения задач не дольше ``msecs``, не показывая диалогов.
+
+        Нужна, чтобы обычное закрытие не спрашивало про короткие фоновые
+        операции. Событийный цикл при этом живой (окно перерисовывается).
+
+        :return: ``True``, если все задачи завершились за отведённое время.
+        """
+        if not self._controller.active_task_names():
+            return True
+
+        loop = QEventLoop(self)
+        poll = QTimer(self)
+        poll.setInterval(_CLOSE_WAIT_POLL_MSEC)
+        deadline = QTimer(loop)
+        deadline.setSingleShot(True)
+        deadline.timeout.connect(loop.quit)
+        finished = False
+
+        def check() -> None:
+            nonlocal finished
+            if not self._controller.wait_for_done(0):
+                return
+            if self._controller.active_task_names():
+                # Пул свободен, но задача ещё не снята: ждём доставку finished.
+                return
+            finished = True
+            loop.quit()
+
+        poll.timeout.connect(check)
+        poll.start()
+        deadline.start(msecs)
+        check()
+        if not finished:
+            loop.exec()
+        poll.stop()
+        return finished
+
+    def _confirm_close_with_active_tasks(self, tasks: tuple[str, ...]) -> bool:
+        """Спрашивает, дождаться ли фоновых операций перед закрытием.
+
+        :return: ``True``, если выбран вариант «Дождаться».
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Закрытие Git Visualizer")
+        box.setText(
+            "Выполняются фоновые операции Git: "
+            f"{describe_active_tasks(tasks)}."
+        )
+        box.setInformativeText(
+            "Дождаться их завершения перед закрытием? Если закрыть без ожидания, "
+            "операция может продолжиться в фоне, а её результат в приложении уже "
+            "не отобразится."
+        )
+        wait_button = box.addButton(
+            "Дождаться", QMessageBox.ButtonRole.AcceptRole
+        )
+        close_button = box.addButton(
+            "Закрыть без ожидания", QMessageBox.ButtonRole.DestructiveRole
+        )
+        box.setDefaultButton(wait_button)
+        box.exec()
+        # Esc или крестик диалога не должны молча выбирать потерю результата:
+        # всё, кроме явного «Закрыть без ожидания», означает ожидание.
+        return box.clickedButton() is not close_button
+
+    def _wait_for_active_tasks(self, tasks: tuple[str, ...]) -> bool:
+        """Ждёт завершения фоновых задач, не блокируя событийный цикл.
+
+        Показывается индикатор с кнопкой «Не ждать»: ожидание ограничено только
+        самими операциями (у сетевых — их timeout), а не зависанием GUI.
+
+        :return: ``True``, если все задачи завершились; ``False`` — пользователь
+            отказался ждать.
+        """
+        dialog = QProgressDialog(self)
+        dialog.setWindowTitle("Закрытие Git Visualizer")
+        dialog.setLabelText(
+            f"Завершение: {describe_active_tasks(tasks)}…"
+        )
+        dialog.setCancelButtonText("Не ждать")
+        dialog.setRange(0, 0)
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.show()
+
+        loop = QEventLoop(self)
+        timer = QTimer(self)
+        timer.setInterval(_CLOSE_WAIT_POLL_MSEC)
+        finished = False
+
+        def check() -> None:
+            nonlocal finished
+            if not self._controller.wait_for_done(0):
+                return
+            if self._controller.active_task_names():
+                # Пул свободен, но задача ещё не снята: ждём доставку finished.
+                return
+            finished = True
+            loop.quit()
+
+        timer.timeout.connect(check)
+        dialog.canceled.connect(loop.quit)
+        timer.start()
+        check()
+        if not finished:
+            loop.exec()
+        timer.stop()
+        dialog.close()
+        dialog.deleteLater()
+        return finished
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
         super().resizeEvent(event)
@@ -1485,6 +1681,9 @@ class MainWindow(QMainWindow):
 
     def _show_notice(self, title: str, message: str) -> None:
         """Информационное сообщение: действие не запущено."""
+        if self._closing:
+            # Окно закрывается: модальный диалог заблокировал бы завершение.
+            return
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Information)
         box.setWindowTitle(title)
@@ -1582,6 +1781,11 @@ class MainWindow(QMainWindow):
         *,
         message: str | None = None,
     ) -> None:
+        if self._closing:
+            # Ошибка фоновой операции при закрытии: диалог не открывается, иначе
+            # он остановил бы завершение приложения. Технические подробности
+            # остаются в TaskFailure до конца жизни задачи.
+            return
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Critical)
         box.setWindowTitle(title)
