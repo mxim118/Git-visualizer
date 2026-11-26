@@ -24,6 +24,7 @@ from git_visualizer.application.services.repository_service import RepositorySer
 from git_visualizer.application.services.remote_service import RemoteService
 from git_visualizer.infrastructure.git.git_repository import GitRepository
 from git_visualizer.infrastructure.git.git_runner import GitRunner
+from git_visualizer.logging_setup import setup_logging
 from git_visualizer.presentation.controllers.repository_controller import (
     RepositoryController,
 )
@@ -54,6 +55,10 @@ def build_repository_controller() -> RepositoryController:
 
 def main() -> int:
     """Создаёт QApplication, показывает главное окно и запускает цикл событий."""
+    # Журнал Git настраивается до окна и до первых Git-команд. Ошибка создания
+    # файла не мешает запуску: setup_logging сообщает о ней и продолжает работу.
+    setup_logging()
+
     app = QApplication(sys.argv)
     # Организация и приложение задают платформенное место хранения QSettings.
     app.setOrganizationName("GitVisualizer")

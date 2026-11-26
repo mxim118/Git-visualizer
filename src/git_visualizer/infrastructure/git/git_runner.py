@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -27,6 +28,7 @@ from git_visualizer.infrastructure.git.git_errors import (
     GitNotFoundError,
     GitTimeoutError,
 )
+from git_visualizer.infrastructure.git.git_logging import log_git_call, log_git_failure
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
@@ -118,7 +120,21 @@ class GitRunner:
         :raises GitCommandError: ненулевой код завершения при ``check=True``.
         """
         command = self._build_command(args)
-        working_dir = self._validate_cwd(cwd, command)
+        stdin_used = stdin_data is not None
+        try:
+            working_dir = self._validate_cwd(cwd, command)
+        except GitLaunchError as exc:
+            # Проверка cwd выполняется до запуска процесса; это тоже неудачная
+            # попытка вызова Git, которую полезно видеть в журнале.
+            log_git_failure(
+                command[1:],
+                cwd=cwd,
+                duration_ms=0,
+                kind="git_launch",
+                stdin_used=stdin_used,
+                stderr=exc.message,
+            )
+            raise
 
         kwargs: dict[str, Any] = {
             "cwd": working_dir,
@@ -139,27 +155,65 @@ class GitRunner:
                 subprocess, "CREATE_NO_WINDOW", _WINDOWS_CREATE_NO_WINDOW
             )
 
+        # Длительность измеряется только для журнала и только вокруг запуска процесса.
+        started = time.perf_counter()
         try:
             completed = self._process_runner(command, **kwargs)
         except subprocess.TimeoutExpired as exc:
+            duration_ms = _elapsed_ms(started)
+            stdout = _decode(exc.stdout)
+            stderr = _decode(exc.stderr)
+            log_git_failure(
+                command[1:],
+                cwd=working_dir,
+                duration_ms=duration_ms,
+                kind="timeout",
+                stdin_used=stdin_used,
+                stderr=stderr,
+            )
             raise GitTimeoutError(
                 exc.timeout,
                 command=command,
-                stdout=_decode(exc.stdout),
-                stderr=_decode(exc.stderr),
+                stdout=stdout,
+                stderr=stderr,
             ) from exc
         except FileNotFoundError as exc:
             # Каталог cwd проверен выше, поэтому здесь отсутствует сам исполняемый файл.
+            log_git_failure(
+                command[1:],
+                cwd=working_dir,
+                duration_ms=_elapsed_ms(started),
+                kind="git_not_found",
+                stdin_used=stdin_used,
+                stderr=str(exc),
+            )
             raise GitNotFoundError(self._executable, command=command) from exc
         except (OSError, ValueError) as exc:
             # OSError: нет прав на запуск и т. п.; ValueError: например, NUL в аргументе.
+            log_git_failure(
+                command[1:],
+                cwd=working_dir,
+                duration_ms=_elapsed_ms(started),
+                kind="git_launch",
+                stdin_used=stdin_used,
+                stderr=str(exc),
+            )
             raise GitLaunchError(f"Failed to start Git process: {exc}", command=command) from exc
 
+        duration_ms = _elapsed_ms(started)
         result = GitResult(
             command=tuple(command),
             returncode=completed.returncode,
             stdout=_decode(completed.stdout),
             stderr=_decode(completed.stderr),
+        )
+        log_git_call(
+            command[1:],
+            cwd=working_dir,
+            duration_ms=duration_ms,
+            returncode=result.returncode,
+            stdin_used=stdin_used,
+            stderr=result.stderr,
         )
         if check and result.returncode != 0:
             raise GitCommandError(
@@ -220,6 +274,11 @@ class GitRunner:
                 command=command,
             )
         return path
+
+
+def _elapsed_ms(started: float) -> int:
+    """Миллисекунды с момента ``started`` (для журнала; не меньше нуля)."""
+    return max(0, int((time.perf_counter() - started) * 1000))
 
 
 def _decode(data: bytes | str | None) -> str:

@@ -31,6 +31,7 @@ MODULES = [
     "git_visualizer.application.services.commit_service",
     "git_visualizer.application.services.git_environment_service",
     "git_visualizer.infrastructure.git.git_runner",
+    "git_visualizer.infrastructure.git.git_logging",
     "git_visualizer.infrastructure.git.git_errors",
     "git_visualizer.infrastructure.git.git_parser",
     "git_visualizer.infrastructure.git.git_repository",
