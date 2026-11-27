@@ -119,6 +119,61 @@ def test_commit_creates_commit_from_staged_files(
     assert reopened.head_commit == head
 
 
+def test_commit_creates_initial_commit_in_repository_without_commits(
+    make_repo: MakeRepo, git: Git
+) -> None:
+    """Первый коммит в пустом репозитории: HEAD появляется, файлы не теряются."""
+    path = make_repo("commit-initial", commits=0)
+    configure_author(git, path)
+    staged = path / "первый файл.txt"
+    staged.write_text("initial content\n", encoding="utf-8")
+    git(path, "add", "--", staged.name)
+    untracked = path / "untracked.txt"
+    untracked.write_text("untracked content\n", encoding="utf-8")
+    repository, service = load(path)
+
+    assert repository.is_unborn
+    assert repository.head_commit is None
+    assert repository.current_branch == "main"
+
+    service.commit(
+        repository,
+        "Initial commit\n\nПервый коммит в пустом репозитории",
+    )
+
+    head = git(path, "rev-parse", "HEAD").strip()
+    reopened = RepositoryService(make_factory()).open_repository(path)
+    assert not reopened.is_unborn
+    assert not reopened.is_detached
+    assert reopened.head_commit == head
+    assert reopened.current_branch == "main"
+    # У первого коммита нет родителей.
+    assert git(path, "log", "-1", "--format=%P").strip() == ""
+    assert git(path, "log", "-1", "--format=%s").strip() == "Initial commit"
+    assert (
+        git(path, "log", "-1", "--format=%b").strip()
+        == "Первый коммит в пустом репозитории"
+    )
+    changed = [
+        line
+        for line in git(
+            path,
+            "-c",
+            "core.quotePath=false",
+            "show",
+            "--name-only",
+            "--format=",
+            "HEAD",
+        ).splitlines()
+        if line
+    ]
+    assert changed == [staged.name]
+    # Ни рабочая копия, ни untracked-файл не пострадали; в коммит попал только индекс.
+    assert staged.read_text(encoding="utf-8") == "initial content\n"
+    assert untracked.read_text(encoding="utf-8") == "untracked content\n"
+    assert git(path, "status", "--porcelain") == "?? untracked.txt\n"
+
+
 def test_commit_is_rejected_when_index_is_empty(
     make_repo: MakeRepo, git: Git
 ) -> None:
@@ -341,6 +396,101 @@ def test_gui_commit_updates_history_graph_refs_and_changes(
         status = git(path, "status", "--porcelain")
         assert " M file0.txt" in status
         assert "staged.txt" not in status
+    finally:
+        window.close()
+
+
+def test_gui_initial_commit_in_repository_without_commits(
+    qt_app, make_repo: MakeRepo, git: Git, monkeypatch: pytest.MonkeyPatch, app_settings
+) -> None:
+    """GUI: Stage и Commit в пустом репозитории создают первый root-коммит."""
+    path = make_repo("gui-initial-commit", commits=0)
+    configure_author(git, path)
+    staged = path / "первый файл.txt"
+    staged.write_text("initial content\n", encoding="utf-8")
+    untracked = path / "untracked.txt"
+    untracked.write_text("untracked content\n", encoding="utf-8")
+    window = open_window(qt_app, path, monkeypatch, app_settings)
+    shown: list[tuple[str, BaseException]] = []
+    try:
+        monkeypatch.setattr(
+            window,
+            "_show_error",
+            lambda title, exc, **kwargs: shown.append((title, exc)),
+        )
+        panel = window.workspace_page.changes_panel
+        wait_until(
+            qt_app,
+            lambda: {change.path for change in panel.unstaged_files}
+            == {staged.name, untracked.name},
+        )
+        assert panel.staged_files == ()
+        assert not panel.commit_button.isEnabled()
+
+        assert panel.select_file(staged.name, staged=False)
+        panel.stage_button.click()
+
+        wait_until(
+            qt_app,
+            lambda: [change.path for change in panel.staged_files] == [staged.name]
+            and [change.path for change in panel.unstaged_files] == [untracked.name],
+        )
+        assert panel.commit_button.isEnabled()
+
+        panel.commit_button.click()
+        wait_until(qt_app, lambda: not window.commit_overlay.isHidden())
+        window.commit_overlay.message_edit.setPlainText(
+            "Initial commit\n\nПервый коммит в пустом репозитории"
+        )
+        assert window.commit_overlay.commit_button.isEnabled()
+        window.commit_overlay.commit_button.click()
+
+        wait_until(
+            qt_app,
+            lambda: window.workspace_page.workspace_data is not None
+            and bool(window.workspace_page.workspace_data.commits)
+            and window.workspace_page.workspace_data.commits[0].subject
+            == "Initial commit",
+        )
+        wait_until(
+            qt_app,
+            lambda: window.commit_overlay.isHidden()
+            and panel.staged_files == ()
+            and [change.path for change in panel.unstaged_files] == [untracked.name],
+        )
+        assert shown == []
+        assert not panel.is_busy
+
+        data = window.workspace_page.workspace_data
+        head = git(path, "rev-parse", "HEAD").strip()
+        assert data is not None
+        assert not data.repository.is_unborn
+        assert not data.repository.is_detached
+        assert data.repository.head_commit == head
+        assert data.repository.current_branch == "main"
+        assert data.commits[0].is_root
+        assert data.commits[0].parent_hashes == ()
+        assert window.workspace_page.graph_view.commit_count == 1
+        assert any(
+            label.name == "main" for label in data.ref_labels[data.commits[0].hash]
+        )
+        assert staged.read_text(encoding="utf-8") == "initial content\n"
+        assert untracked.read_text(encoding="utf-8") == "untracked content\n"
+        assert git(path, "status", "--porcelain") == "?? untracked.txt\n"
+        changed = [
+            line
+            for line in git(
+                path,
+                "-c",
+                "core.quotePath=false",
+                "show",
+                "--name-only",
+                "--format=",
+                "HEAD",
+            ).splitlines()
+            if line
+        ]
+        assert changed == [staged.name]
     finally:
         window.close()
 
