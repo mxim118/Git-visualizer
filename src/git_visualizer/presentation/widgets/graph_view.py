@@ -9,8 +9,9 @@ from __future__ import annotations
 import html
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from time import perf_counter
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -54,6 +55,14 @@ ZOOM_STEP = 1.2
 MIN_VISIBLE_SHARE = 2.0 / 3.0
 EMPTY_STATE_TEXT = "История пуста"
 
+# Большая сцена строится порциями, чтобы не блокировать GUI на время создания
+# тысяч QGraphicsItem. До порога включительно граф строится синхронно: это
+# сохраняет простое поведение для обычных репозиториев и существующих тестов.
+ASYNC_BUILD_NODE_THRESHOLD = 1000
+# Бюджет одной порции. По истечении этого времени управление возвращается
+# event loop, поэтому окно продолжает реагировать на ввод и перерисовку.
+BUILD_CHUNK_BUDGET_SECONDS = 0.010
+
 _LANE_COLORS = (
     "#2563eb",  # синий
     "#16a34a",  # зелёный
@@ -94,6 +103,9 @@ class GraphView(QGraphicsView):
     """Отображает готовую раскладку истории; выбранный hash сообщается сигналом."""
 
     commit_selected = Signal(str)
+    # Испускается после того, как сцена полностью построена. Для маленьких
+    # графов — синхронно из set_graph, для больших — из следующего цикла event loop.
+    graph_ready = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -107,6 +119,24 @@ class GraphView(QGraphicsView):
         self._selected_hash: str | None = None
         self._panning = False
         self._pan_start = QPoint()
+
+        # Построение сцены. Пока идёт асинхронная сборка, set_graph уже вернул
+        # управление, но часть узлов может отсутствовать: view_state/подсчёт
+        # коммитов отражают только готовую часть, а select_commit запоминает
+        # выбор до завершения.
+        self._building = False
+        self._build_nodes: tuple[GraphNode, ...] = ()
+        self._build_nodes_by_hash: dict[str, GraphNode] = {}
+        self._build_edges_by_child: dict[str, tuple[GraphEdge, ...]] = {}
+        self._build_commits: dict[str, Commit] = {}
+        self._build_labels: dict[str, tuple[_LabelSpec, ...]] = {}
+        self._build_index = 0
+        self._build_fit = False
+        self._pending_view_state: GraphViewState | None = None
+        self._pending_selection_hash: str | None = None
+        self._build_timer = QTimer(self)
+        self._build_timer.setSingleShot(True)
+        self._build_timer.timeout.connect(self._build_next_chunk)
 
         self.setRenderHints(
             QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing
@@ -149,6 +179,12 @@ class GraphView(QGraphicsView):
     ) -> None:
         """Показывает готовую раскладку.
 
+        Для небольших графов сцена строится сразу. Для больших ``set_graph``
+        только подготавливает данные и запускает сборку порциями: управление
+        возвращается в event loop, а ``graph_ready`` испускается после того, как
+        все узлы, рёбра и подписи добавлены. Так создание тысяч
+        ``QGraphicsItem`` не блокирует окно.
+
         :param layout: узлы и рёбра, рассчитанные Application.
         :param commits: метаданные для подсказок (hash, автор, сообщение, дата).
         :param ref_labels: готовые метки ``BranchService.get_ref_labels``; если не
@@ -159,58 +195,123 @@ class GraphView(QGraphicsView):
         self._reset_scene()
         if not layout.nodes:
             self._show_empty_state()
+            self.graph_ready.emit()
             return
 
         nodes_by_hash = {node.commit_hash: node for node in layout.nodes}
         commits_by_hash = {commit.hash: commit for commit in commits}
-
         edges_by_child: dict[str, list[GraphEdge]] = {}
         for edge in layout.edges:
             if edge.child_hash in nodes_by_hash and edge.parent_hash in nodes_by_hash:
                 edges_by_child.setdefault(edge.child_hash, []).append(edge)
 
-        for child_edges in edges_by_child.values():
-            for index, edge in enumerate(child_edges):
-                parent = nodes_by_hash[edge.parent_hash]
-                item = _GraphEdgeItem(
-                    edge,
-                    self._lane_color(parent.lane),
-                    dashed=index > 0,
-                )
-                self._scene.addItem(item)
-                self._edge_items.append(item)
+        self._build_nodes = layout.nodes
+        self._build_nodes_by_hash = nodes_by_hash
+        self._build_edges_by_child = {
+            child_hash: tuple(child_edges)
+            for child_hash, child_edges in edges_by_child.items()
+        }
+        self._build_commits = commits_by_hash
+        self._build_labels = self._display_labels(layout.nodes, ref_labels)
+        self._build_index = 0
+        self._build_fit = fit
+        self._building = True
 
-        labels_by_hash = self._display_labels(layout.nodes, ref_labels)
-        for node in layout.nodes:
-            labels = labels_by_hash.get(node.commit_hash, ())
-            commit = commits_by_hash.get(node.commit_hash)
-            is_merge = bool(commit is not None and commit.is_merge) or (
-                len(edges_by_child.get(node.commit_hash, ())) > 1
-            )
-            is_head = "HEAD" in node.refs or any(label.is_current for label in labels)
-            item = _CommitNodeItem(
-                node,
-                self._lane_color(node.lane),
-                is_merge=is_merge,
-                is_head=is_head,
-                tooltip=self._tooltip(node, commit),
-            )
-            item.setPos(node.x, node.y)
-            self._scene.addItem(item)
-            self._node_items[node.commit_hash] = item
-            self._add_ref_labels(item, labels, self._lane_color(node.lane))
+        if len(layout.nodes) <= ASYNC_BUILD_NODE_THRESHOLD:
+            self._consume_build_queue(budget=None)
+            self._finish_build()
+            return
+        self._build_timer.start(0)
 
+    @property
+    def is_building(self) -> bool:
+        """Идёт ли сейчас постепенная сборка сцены."""
+        return self._building
+
+    def _consume_build_queue(self, *, budget: float | None) -> None:
+        """Добавляет элементы сцены, пока не истёк бюджет времени.
+
+        ``budget=None`` — построить всё сразу (маленький граф).
+        """
+        deadline = None if budget is None else perf_counter() + budget
+        nodes = self._build_nodes
+        while self._build_index < len(nodes):
+            self._add_graph_node(nodes[self._build_index])
+            self._build_index += 1
+            if deadline is not None and perf_counter() >= deadline:
+                break
+
+    def _build_next_chunk(self) -> None:
+        if not self._building:
+            return
+        self._consume_build_queue(budget=BUILD_CHUNK_BUDGET_SECONDS)
+        if self._build_index < len(self._build_nodes):
+            self._build_timer.start(0)
+        else:
+            self._finish_build()
+
+    def _add_graph_node(self, node: GraphNode) -> None:
+        """Добавляет рёбра коммита, его узел и подписи ref."""
+        child_edges = self._build_edges_by_child.get(node.commit_hash, ())
+        for index, edge in enumerate(child_edges):
+            parent = self._build_nodes_by_hash[edge.parent_hash]
+            edge_item = _GraphEdgeItem(
+                edge,
+                self._lane_color(parent.lane),
+                dashed=index > 0,
+            )
+            self._scene.addItem(edge_item)
+            self._edge_items.append(edge_item)
+
+        labels = self._build_labels.get(node.commit_hash, ())
+        commit = self._build_commits.get(node.commit_hash)
+        is_merge = bool(commit is not None and commit.is_merge) or len(child_edges) > 1
+        is_head = "HEAD" in node.refs or any(label.is_current for label in labels)
+        item = _CommitNodeItem(
+            node,
+            self._lane_color(node.lane),
+            is_merge=is_merge,
+            is_head=is_head,
+            tooltip=self._tooltip(node, commit),
+        )
+        item.setPos(node.x, node.y)
+        self._scene.addItem(item)
+        self._node_items[node.commit_hash] = item
+        self._graph_rect = self._graph_rect.united(item.sceneBoundingRect())
+        self._add_ref_labels(item, labels, self._lane_color(node.lane))
+
+    def _finish_build(self) -> None:
+        """Завершает сборку: считает границы, вписывает граф и сообщает готовность."""
+        self._build_timer.stop()
+        self._building = False
         self._content_rect = self._scene.itemsBoundingRect()
-        graph_rect = QRectF()
-        for node_item in self._node_items.values():
-            graph_rect = graph_rect.united(node_item.sceneBoundingRect())
-        self._graph_rect = graph_rect
         self.fit_graph_action.setEnabled(True)
-        if fit:
+
+        pending_view = self._pending_view_state
+        self._pending_view_state = None
+        if pending_view is not None:
+            # Положение, запрошенное во время сборки (например, после refresh),
+            # важнее автоматической подгонки.
+            self.restore_view_state(pending_view)
+        elif self._build_fit:
             self.fit_graph()
         else:
             self._update_scene_rect()
             self.viewport().update()
+
+        pending_selection = self._pending_selection_hash
+        self._pending_selection_hash = None
+        if pending_selection is not None and self._selected_hash is None:
+            self.select_commit(pending_selection)
+
+        self._build_nodes = ()
+        self._build_nodes_by_hash = {}
+        self._build_edges_by_child = {}
+        self._build_commits = {}
+        self._build_labels = {}
+        self._build_index = 0
+        self._build_fit = False
+        self.graph_ready.emit()
 
     def clear(self) -> None:
         """Очищает сцену и показывает пустое состояние."""
@@ -219,6 +320,12 @@ class GraphView(QGraphicsView):
 
     def fit_graph(self) -> None:
         """Вписывает загруженную историю в окно с сохранением пропорций."""
+        if self._building:
+            # Во время порционной сборки граф ещё неполный: откладываем Fit до
+            # завершения, иначе он впишет только уже созданную часть.
+            self._build_fit = True
+            self._pending_view_state = None
+            return
         if not self._node_items:
             self.resetTransform()
             self.centerOn(0.0, 0.0)
@@ -250,8 +357,10 @@ class GraphView(QGraphicsView):
 
         ``None`` — граф не загружен, запоминать нечего. Центр берётся в
         координатах сцены, поэтому состояние не зависит от размера окна.
+        Во время порционной сборки возвращается ``None``: частичное положение
+        не должно попадать в настройки.
         """
-        if not self._node_items:
+        if self._building or not self._node_items:
             return None
         center = self.mapToScene(self.viewport().rect().center())
         return GraphViewState(
@@ -268,8 +377,13 @@ class GraphView(QGraphicsView):
         графа: точного положения там нет. Иначе положение могло быть получено
         на другом графе (другой репозиторий) или при другом размере окна,
         поэтому после установки оно ограничивается теми же пределами, что и
-        перетаскивание мышью: граф не уходит из окна. ``False`` — граф не загружен.
+        перетаскивание мышью: граф не уходит из окна. ``False`` — граф не загружен
+        (в том числе если порционная сборка ещё не завершена: положение будет
+        применено автоматически после её окончания).
         """
+        if self._building:
+            self._pending_view_state = state
+            return False
         if not self._node_items:
             return False
         zoom = max(MIN_ZOOM, min(MAX_ZOOM, float(state.zoom)))
@@ -295,9 +409,17 @@ class GraphView(QGraphicsView):
         return True
 
     def select_commit(self, commit_hash: str, *, emit_signal: bool = False) -> bool:
-        """Выбирает узел по hash; возвращает ``False``, если такого узла нет."""
+        """Выбирает узел по hash; возвращает ``False``, если такого узла нет.
+
+        Если сцена ещё строится порциями, выбор запоминается и применяется после
+        появления узла. Это нужно при refresh/догрузке большой истории, когда
+        ``WorkspacePage`` восстанавливает выбранный коммит сразу после
+        ``set_graph``.
+        """
         item = self._node_items.get(commit_hash)
         if item is None:
+            if self._building:
+                self._pending_selection_hash = commit_hash
             return False
         self._select_commit(item, emit=emit_signal)
         return True
@@ -343,6 +465,7 @@ class GraphView(QGraphicsView):
             else:
                 self._scene.clearSelection()
                 self._selected_hash = None
+                self._pending_selection_hash = None
             self._start_pan(event)
             return
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -408,6 +531,20 @@ class GraphView(QGraphicsView):
     # --- внутренняя реализация ---
 
     def _reset_scene(self) -> None:
+        # Незавершённая порционная сборка больше не должна добавлять элементы
+        # в новую сцену. Таймер принадлежит виджету, поэтому его достаточно
+        # остановить; проверка _building отбросит уже поставленный в очередь тик.
+        self._build_timer.stop()
+        self._building = False
+        self._build_nodes = ()
+        self._build_nodes_by_hash = {}
+        self._build_edges_by_child = {}
+        self._build_commits = {}
+        self._build_labels = {}
+        self._build_index = 0
+        self._build_fit = False
+        self._pending_view_state = None
+        self._pending_selection_hash = None
         self._node_items.clear()
         self._edge_items.clear()
         self._content_rect = QRectF()
@@ -517,6 +654,7 @@ class GraphView(QGraphicsView):
         self._scene.clearSelection()
         item.setSelected(True)
         self._selected_hash = item.commit_hash
+        self._pending_selection_hash = None
         if emit:
             self.commit_selected.emit(item.commit_hash)
 

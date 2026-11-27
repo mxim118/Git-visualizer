@@ -1,8 +1,9 @@
 """GUI-тесты GraphView: отображение, выбор, масштаб, панорамирование и пустое состояние."""
 
+import time
 from datetime import datetime, timezone
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QGraphicsPathItem
@@ -740,4 +741,65 @@ def test_long_ref_labels_do_not_push_the_graph_out_of_view(qt_app) -> None:
     for offset in (QPoint(3000, 0), QPoint(-6000, 0)):
         _drag(view, offset)
         _assert_graph_in_view(view)
+    view.close()
+
+
+def test_large_graph_builds_incrementally_and_keeps_gui_responsive(qt_app) -> None:
+    """Большая сцена строится порциями: event loop успевает обслуживать таймеры."""
+    count = 2500
+    nodes = tuple(
+        GraphNode(commit_hash=f"{i:040x}", x=0.0, y=i * 40.0, lane=0)
+        for i in range(count)
+    )
+    edges = tuple(
+        GraphEdge(
+            child_hash=f"{i:040x}",
+            parent_hash=f"{i + 1:040x}",
+            points=((0.0, i * 40.0), (0.0, (i + 1) * 40.0)),
+        )
+        for i in range(count - 1)
+    )
+    layout = GraphLayout(nodes=nodes, edges=edges)
+
+    view = GraphView()
+    view.resize(640, 480)
+    view.show()
+
+    ticks: list[float] = []
+    heartbeat = QTimer()
+    heartbeat.setInterval(10)
+    heartbeat.timeout.connect(lambda: ticks.append(time.perf_counter()))
+    heartbeat.start()
+
+    ready: list[bool] = []
+    view.graph_ready.connect(lambda: ready.append(True))
+    view.set_graph(layout, fit=False)
+
+    # set_graph вернулся до завершения сборки; выбор и положение запоминаются
+    # до появления узлов и применяются после завершения.
+    assert view.is_building
+    assert not view.select_commit(nodes[-1].commit_hash)
+    assert not view.restore_view_state(
+        GraphViewState(zoom=0.5, center_x=0.0, center_y=100.0)
+    )
+
+    deadline = time.monotonic() + 10.0
+    while not ready and time.monotonic() < deadline:
+        qt_app.processEvents()
+        time.sleep(0.001)
+    heartbeat.stop()
+
+    assert ready, "graph_ready не был испущен"
+    assert not view.is_building
+    assert view.commit_count == count
+    assert view.edge_count == count - 1
+    assert view.selected_commit_hash == nodes[-1].commit_hash
+    assert abs(view.zoom_factor - 0.5) < 1e-9
+    # Пока сцена строилась, таймер успел сработать несколько раз, а самый
+    # длинный разрыв остался заметно меньше секунды.
+    assert len(ticks) >= 3
+    assert max(
+        (later - earlier for earlier, later in zip(ticks, ticks[1:])),
+        default=0.0,
+    ) < 0.5
     view.close()
