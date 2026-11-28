@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timezone
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QWheelEvent
+from PySide6.QtGui import QColor, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QGraphicsPathItem
 
@@ -18,9 +18,13 @@ from git_visualizer.domain.models import (
 )
 from git_visualizer.presentation.widgets.graph_view import (
     EMPTY_STATE_TEXT,
+    LABEL_MIN_ZOOM,
     MAX_ZOOM,
     MIN_VISIBLE_SHARE,
     MIN_ZOOM,
+    OVERVIEW_EXIT_ZOOM,
+    OVERVIEW_MAX_ZOOM,
+    ZOOM_STEP,
     GraphView,
     GraphViewState,
 )
@@ -327,20 +331,34 @@ def show_view(
     return view
 
 
+def send_wheel(view: GraphView, cursor: QPoint) -> None:
+    event = QWheelEvent(
+        QPointF(cursor),
+        QPointF(view.viewport().mapToGlobal(cursor)),
+        QPoint(),
+        QPoint(0, 120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase,
+        False,
+    )
+    QApplication.sendEvent(view.viewport(), event)
+
+
+def wait_for_zoom_frame(view: GraphView) -> None:
+    """Дожидается кадра, в который применяются накопленные события колеса."""
+    deadline = time.monotonic() + 2.0
+    while view._zoom_timer.isActive() and time.monotonic() < deadline:
+        QTest.qWait(5)
+    QApplication.processEvents()
+
+
 def wheel_at(view: GraphView, cursor: QPoint, *, steps: int = 1) -> None:
     for _ in range(steps):
-        event = QWheelEvent(
-            QPointF(cursor),
-            QPointF(view.viewport().mapToGlobal(cursor)),
-            QPoint(),
-            QPoint(0, 120),
-            Qt.MouseButton.NoButton,
-            Qt.KeyboardModifier.NoModifier,
-            Qt.ScrollPhase.NoScrollPhase,
-            False,
-        )
-        QApplication.sendEvent(view.viewport(), event)
-    QApplication.processEvents()
+        send_wheel(view, cursor)
+    # События колеса применяются одним кадром (см. ZOOM_COALESCE_MS), поэтому
+    # дожидаемся окна слияния, иначе шаги останутся непримененными.
+    wait_for_zoom_frame(view)
 
 
 def test_wheel_zoom_keeps_the_point_under_the_cursor(qt_app) -> None:
@@ -802,4 +820,202 @@ def test_large_graph_builds_incrementally_and_keeps_gui_responsive(qt_app) -> No
         (later - earlier for earlier, later in zip(ticks, ticks[1:])),
         default=0.0,
     ) < 0.5
+    view.close()
+
+
+def zoom_out_to_overview(view: GraphView) -> None:
+    """Отдаляет граф до обзорного режима."""
+    for _ in range(64):
+        if view.zoom_factor < OVERVIEW_MAX_ZOOM:
+            return
+        view.zoom_out()
+    raise AssertionError("граф не перешёл в обзорный режим")
+
+
+def test_overview_mode_replaces_detail_items_at_low_zoom(qt_app) -> None:
+    """При сильном отдалении в кадре один обзорный элемент вместо тысяч."""
+    view = show_view(make_narrow_layout())
+    assert view.zoom_factor >= OVERVIEW_MAX_ZOOM
+
+    zoom_out_to_overview(view)
+    qt_app.processEvents()
+
+    assert not any(item.isVisible() for item in view._node_items.values())
+    assert not any(item.isVisible() for item in view._edge_items)
+    assert view._overview_item is not None
+    assert view._overview_item.isVisible()
+    visible = view.mapToScene(view.viewport().rect()).boundingRect()
+    assert len(view.scene().items(visible)) == 1
+    assert view.commit_count == 6
+    view.close()
+
+
+def test_overview_mode_returns_to_detail_when_zooming_in(qt_app) -> None:
+    view = show_view(make_narrow_layout())
+    zoom_out_to_overview(view)
+    assert view._overview_item is not None
+    assert view._overview_item.isVisible()
+
+    while view.zoom_factor < OVERVIEW_MAX_ZOOM * 2:
+        view.zoom_in()
+    qt_app.processEvents()
+
+    assert view._detail_visible
+    assert not view._overview_item.isVisible()
+    assert all(item.isVisible() for item in view._node_items.values())
+    view.close()
+
+
+def test_overview_mode_has_hysteresis_at_the_threshold(qt_app) -> None:
+    """У самого порога шаг зума не переключает режим туда-обратно."""
+    view = show_view(make_narrow_layout())
+    zoom_out_to_overview(view)
+    assert view._overview_active
+    entry_zoom = view.zoom_factor
+
+    view.zoom_in()
+    qt_app.processEvents()
+
+    assert view.zoom_factor > entry_zoom
+    assert view.zoom_factor < OVERVIEW_EXIT_ZOOM
+    assert view._overview_active
+
+    while view.zoom_factor < OVERVIEW_EXIT_ZOOM:
+        view.zoom_in()
+    qt_app.processEvents()
+
+    assert not view._overview_active
+    view.close()
+
+
+def test_overview_mode_draws_the_graph(qt_app) -> None:
+    """Обзорный режим не просто скрывает элементы, а рисует весь граф."""
+    view = show_view(make_narrow_layout())
+    zoom_out_to_overview(view)
+    qt_app.processEvents()
+
+    image = view.viewport().grab().toImage()
+    background = QColor("#f8fafc")
+    painted = any(
+        image.pixelColor(x, y) != background
+        for x in range(0, image.width(), 2)
+        for y in range(0, image.height(), 2)
+    )
+    assert painted
+    view.close()
+
+
+def test_click_in_overview_mode_selects_nearest_commit(qt_app) -> None:
+    view = show_view(make_narrow_layout())
+    zoom_out_to_overview(view)
+    qt_app.processEvents()
+    received: list[str] = []
+    view.commit_selected.connect(received.append)
+
+    target = h("narrow3")
+    point = view.mapFromScene(QPointF(0.0, 3 * 40.0))
+    assert view.viewport().rect().contains(point)
+    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+
+    assert view.selected_commit_hash == target
+    assert received == [target]
+
+    # Клик в стороне от полосы графа снимает выбор и не выбирает случайный узел.
+    QTest.mouseClick(
+        view.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=view.viewport().rect().topLeft() + QPoint(6, 6),
+    )
+    assert view.selected_commit_hash is None
+    view.close()
+
+
+def test_selection_survives_switching_to_overview(qt_app) -> None:
+    view = show_view(make_narrow_layout())
+    target = h("narrow2")
+    assert view.select_commit(target)
+
+    zoom_out_to_overview(view)
+    qt_app.processEvents()
+
+    assert view.selected_commit_hash == target
+    assert view._overview_item is not None
+    assert view._overview_item._selection_position == QPointF(0.0, 2 * 40.0)
+    view.close()
+
+
+def test_ref_label_fill_is_not_taken_from_the_node_color(qt_app) -> None:
+    """Заливка подписи не перекрашивается цветом узла — текст остаётся читаемым.
+
+    Регрессия: при ``DontSavePainterState`` кисть предыдущего элемента попадала
+    в следующий, и ``drawPath`` заливал «таблетку» цветом дорожки поверх белой
+    заливки — тёмное имя ветки сливалось с фоном.
+    """
+    view = make_view(qt_app)
+    image = view.viewport().grab().toImage()
+
+    checked = 0
+    for item in view._label_items:
+        rect = item.boundingRect()
+        point = view.mapFromScene(
+            item.mapToScene(QPointF(3.0, rect.height() / 2.0))
+        )
+        assert view.viewport().rect().contains(point)
+        sampled = image.pixelColor(point).name()
+        assert sampled == item._fill.color().name(), item.label.text
+        if not item.label.is_current:
+            assert sampled == "#ffffff", item.label.text
+        checked += 1
+    assert checked >= 4
+    view.close()
+
+
+def test_ref_labels_are_hidden_below_readable_zoom(qt_app) -> None:
+    """Неразборчивые подписи не тратят кадр на отрисовку текста."""
+    view = show_view(make_narrow_layout(), ref_labels=make_long_label_refs())
+    label = next(item for item in view.scene().items() if hasattr(item, "label"))
+    assert label.isVisible()
+
+    while view.zoom_factor >= LABEL_MIN_ZOOM:
+        view.zoom_out()
+    qt_app.processEvents()
+
+    assert view.zoom_factor >= OVERVIEW_MAX_ZOOM
+    assert view._detail_visible
+    assert not label.isVisible()
+
+    while view.zoom_factor < LABEL_MIN_ZOOM:
+        view.zoom_in()
+    qt_app.processEvents()
+
+    assert label.isVisible()
+    view.close()
+
+
+def test_wheel_events_are_coalesced_into_one_frame(qt_app) -> None:
+    """Несколько событий колеса подряд применяются одним кадром."""
+    view = show_view(make_dense_layout())
+    view.resetTransform()
+    cursor = view.viewport().rect().center()
+
+    for _ in range(3):
+        send_wheel(view, cursor)
+
+    # Первое событие применяется сразу, остальные копятся до конца окна.
+    assert abs(view.zoom_factor - ZOOM_STEP) < 1e-9
+    wait_for_zoom_frame(view)
+
+    assert abs(view.zoom_factor - ZOOM_STEP**3) < 1e-6
+    view.close()
+
+
+def test_scene_rect_is_not_shrunk_by_zoom(qt_app) -> None:
+    """Запас сцены вокруг графа только растёт: setSceneRect стоит кадр."""
+    view = show_view(make_narrow_layout())
+    before = view.scene().sceneRect()
+
+    view.zoom_in()
+    view._update_scene_rect()
+
+    assert view.scene().sceneRect().contains(before)
     view.close()

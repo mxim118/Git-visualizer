@@ -23,6 +23,7 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QPolygonF,
     QTransform,
 )
 from PySide6.QtWidgets import (
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from git_visualizer.application.services.graph_service import ROW_HEIGHT
 from git_visualizer.domain.enums import RefKind
 from git_visualizer.domain.models import Commit, GraphEdge, GraphLayout, GraphNode, RefLabel
 
@@ -62,6 +64,30 @@ ASYNC_BUILD_NODE_THRESHOLD = 1000
 # Бюджет одной порции. По истечении этого времени управление возвращается
 # event loop, поэтому окно продолжает реагировать на ввод и перерисовку.
 BUILD_CHUNK_BUDGET_SECONDS = 0.010
+
+# Обзорный режим (LOD). Когда строка коммита занимает на экране меньше этого
+# числа пикселей, отдельные элементы сцены не рисуются: кадр с тысячами
+# QGraphicsItem стоит десятки и сотни миллисекунд, хотя геометрия уже
+# субпиксельная. Порог выбран по замерам: на 4 px/строку обычный режим ещё
+# укладывается в кадр, ниже — время кадра растёт пропорционально числу
+# элементов в окне.
+OVERVIEW_ROW_PIXEL_THRESHOLD = 4.0
+OVERVIEW_MAX_ZOOM = OVERVIEW_ROW_PIXEL_THRESHOLD / ROW_HEIGHT
+# Гистерезис выхода из обзорного режима. Переключение стоит разовой паузы
+# (скрыть или показать тысячи элементов), а шаг колеса у самого порога иначе
+# переключал бы режим на каждое событие.
+OVERVIEW_EXIT_ZOOM = OVERVIEW_MAX_ZOOM * 1.5
+# Радиус маркеров HEAD и выделения в обзорном режиме, в пикселях окна:
+# в координатах сцены он зависит от масштаба.
+OVERVIEW_MARKER_RADIUS_PX = 4.5
+# Допуск попадания мышью по узлу в обзорном режиме, в пикселях окна.
+OVERVIEW_PICK_RADIUS_PX = 10.0
+# Ниже этого масштаба подписи ref неразборчивы, но их отрисовка (самый
+# дорогой примитив) остаётся, поэтому они скрываются.
+LABEL_MIN_ZOOM = 0.45
+# Окно слияния событий колеса. За один оборот приходит несколько событий, и
+# если применять каждое, каждая перерисовка сцены превращается в отдельный кадр.
+ZOOM_COALESCE_MS = 16
 
 _LANE_COLORS = (
     "#2563eb",  # синий
@@ -114,11 +140,35 @@ class GraphView(QGraphicsView):
         self.setScene(self._scene)
         self._node_items: dict[str, _CommitNodeItem] = {}
         self._edge_items: list[_GraphEdgeItem] = []
+        self._label_items: list[_RefLabelItem] = []
         self._content_rect = QRectF()
         self._graph_rect = QRectF()
         self._selected_hash: str | None = None
         self._panning = False
         self._pan_start = QPoint()
+
+        # Уровни детализации. detail-элементы остаются в сцене верхнего уровня:
+        # вложенность под общим корнем замедляет выборку элементов из индекса
+        # сцены в разы, а переключение видимости происходит только при
+        # пересечении порога масштаба. Обзорный режим рисует весь граф
+        # несколькими примитивами (см. _GraphOverviewItem).
+        self._overview_item: _GraphOverviewItem | None = None
+        self._overview_active = False
+        self._detail_visible = True
+        # Данные обзорного режима накапливаются во время сборки сцены, чтобы не
+        # проходить по всей истории вторым проходом после её завершения.
+        self._overview_edges: dict[int, QPainterPath] = {}
+        self._overview_nodes: dict[int, list[QPointF]] = {}
+        self._overview_head: QPointF | None = None
+        self._labels_visible = True
+
+        # Слияние событий колеса: первое событие применяется сразу, остальные
+        # копятся в пределах ZOOM_COALESCE_MS и применяются одним кадром.
+        self._pending_zoom_factor = 1.0
+        self._pending_zoom_anchor: QPoint | None = None
+        self._zoom_timer = QTimer(self)
+        self._zoom_timer.setSingleShot(True)
+        self._zoom_timer.timeout.connect(self._flush_zoom)
 
         # Построение сцены. Пока идёт асинхронная сборка, set_graph уже вернул
         # управление, но часть узлов может отсутствовать: view_state/подсчёт
@@ -140,6 +190,15 @@ class GraphView(QGraphicsView):
 
         self.setRenderHints(
             QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing
+        )
+        # Поправка области перерисовки под сглаживание не нужна: элементы
+        # сглаживаются сами, а лишний запас только увеличивает область
+        # перерисовки на каждом кадре.
+        # DontSavePainterState здесь не используется: без восстановления
+        # состояния между элементами кисть и перо одного элемента попадают в
+        # следующий, и заливка подписи ref перекрашивается цветом узла.
+        self.setOptimizationFlags(
+            QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing
         )
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
@@ -255,13 +314,11 @@ class GraphView(QGraphicsView):
         child_edges = self._build_edges_by_child.get(node.commit_hash, ())
         for index, edge in enumerate(child_edges):
             parent = self._build_nodes_by_hash[edge.parent_hash]
-            edge_item = _GraphEdgeItem(
-                edge,
-                self._lane_color(parent.lane),
-                dashed=index > 0,
-            )
+            lane_color = self._lane_color(parent.lane)
+            edge_item = _GraphEdgeItem(edge, lane_color, dashed=index > 0)
             self._scene.addItem(edge_item)
             self._edge_items.append(edge_item)
+            self._add_overview_edge(edge, parent.lane)
 
         labels = self._build_labels.get(node.commit_hash, ())
         commit = self._build_commits.get(node.commit_hash)
@@ -278,7 +335,56 @@ class GraphView(QGraphicsView):
         self._scene.addItem(item)
         self._node_items[node.commit_hash] = item
         self._graph_rect = self._graph_rect.united(item.sceneBoundingRect())
+        self._add_overview_node(node)
+        if is_head:
+            self._overview_head = QPointF(node.x, node.y)
         self._add_ref_labels(item, labels, self._lane_color(node.lane))
+
+    def _add_overview_edge(self, edge: GraphEdge, lane: int) -> None:
+        """Копит рёбра обзорного режима одним путём на цвет дорожки."""
+        key = lane % len(_LANE_COLORS)
+        path = self._overview_edges.get(key)
+        if path is None:
+            path = QPainterPath()
+            self._overview_edges[key] = path
+        first_x, first_y = edge.points[0]
+        path.moveTo(first_x, first_y)
+        for x, y in edge.points[1:]:
+            path.lineTo(x, y)
+
+    def _add_overview_node(self, node: GraphNode) -> None:
+        """Копит центры узлов обзорного режима по цветам дорожек."""
+        self._overview_nodes.setdefault(node.lane % len(_LANE_COLORS), []).append(
+            QPointF(node.x, node.y)
+        )
+
+    def _build_overview_item(self) -> None:
+        """Создаёт обзорный элемент по накопленным во время сборки данным."""
+        if self._overview_item is not None:
+            if self._overview_item.scene() is self._scene:
+                self._scene.removeItem(self._overview_item)
+            self._overview_item = None
+        if not self._overview_edges and not self._overview_nodes:
+            return
+        edges = [
+            (self._lane_color(key), path)
+            for key, path in sorted(self._overview_edges.items())
+        ]
+        nodes = [
+            (self._lane_color(key), QPolygonF(points))
+            for key, points in sorted(self._overview_nodes.items())
+        ]
+        item = _GraphOverviewItem(
+            self._content_rect,
+            edges,
+            nodes,
+            head_position=self._overview_head,
+        )
+        # В сцену элемент попадает только в обзорном режиме: в обычном он бы
+        # напрасно участвовал в обходе сцены на каждом кадре.
+        item.setVisible(False)
+        item.sync(self.zoom_factor, self._selected_position())
+        self._overview_item = item
 
     def _finish_build(self) -> None:
         """Завершает сборку: считает границы, вписывает граф и сообщает готовность."""
@@ -311,6 +417,8 @@ class GraphView(QGraphicsView):
         self._build_labels = {}
         self._build_index = 0
         self._build_fit = False
+        self._build_overview_item()
+        self._apply_level_of_detail()
         self.graph_ready.emit()
 
     def clear(self) -> None:
@@ -345,6 +453,7 @@ class GraphView(QGraphicsView):
         self.setTransform(QTransform().scale(scale, scale))
         self._update_scene_rect()
         self.centerOn(padded.center())
+        self._apply_level_of_detail()
 
     def zoom_in(self) -> None:
         self._zoom_by(ZOOM_STEP)
@@ -405,6 +514,7 @@ class GraphView(QGraphicsView):
         )
         # Положение с другого графа не должно уводить узлы из окна.
         self._apply_origin(self.mapToScene(QPoint(0, 0)), strict=True)
+        self._apply_level_of_detail()
         self.viewport().update()
         return True
 
@@ -451,21 +561,33 @@ class GraphView(QGraphicsView):
         if delta == 0:
             super().wheelEvent(event)
             return
-        if delta > 0:
-            self._zoom_by(ZOOM_STEP, anchor=event.position().toPoint())
-        else:
-            self._zoom_by(1.0 / ZOOM_STEP, anchor=event.position().toPoint())
+        step = ZOOM_STEP if delta > 0 else 1.0 / ZOOM_STEP
+        self._pending_zoom_factor *= step
+        self._pending_zoom_anchor = event.position().toPoint()
+        if not self._zoom_timer.isActive():
+            # Одиночный щелчок колеса не должен ждать таймера: первое событие
+            # применяется сразу, а следующие в пределах окна копятся в него.
+            self._flush_zoom(start_window=True)
         event.accept()
+
+    def _flush_zoom(self, *, start_window: bool = False) -> None:
+        """Применяет накопленный за окно слияния шаг масштабирования."""
+        factor = self._pending_zoom_factor
+        anchor = self._pending_zoom_anchor
+        self._pending_zoom_factor = 1.0
+        self._zoom_timer.stop()
+        if abs(factor - 1.0) > 1e-9:
+            self._zoom_by(factor, anchor=anchor)
+        if start_window and self._node_items:
+            self._zoom_timer.start(ZOOM_COALESCE_MS)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt API)
         if event.button() == Qt.MouseButton.LeftButton:
-            item = self._commit_item_at(event.position().toPoint())
+            item = self._node_at(event.position().toPoint())
             if item is not None:
                 self._select_commit(item, emit=True)
             else:
-                self._scene.clearSelection()
-                self._selected_hash = None
-                self._pending_selection_hash = None
+                self._clear_selection()
             self._start_pan(event)
             return
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -510,6 +632,7 @@ class GraphView(QGraphicsView):
         if center is not None:
             self.centerOn(center)
         self._clamp_view()
+        self._apply_level_of_detail()
 
     def paintEvent(self, event) -> None:  # noqa: N802 (Qt API)
         super().paintEvent(event)
@@ -535,6 +658,9 @@ class GraphView(QGraphicsView):
         # в новую сцену. Таймер принадлежит виджету, поэтому его достаточно
         # остановить; проверка _building отбросит уже поставленный в очередь тик.
         self._build_timer.stop()
+        self._zoom_timer.stop()
+        self._pending_zoom_factor = 1.0
+        self._pending_zoom_anchor = None
         self._building = False
         self._build_nodes = ()
         self._build_nodes_by_hash = {}
@@ -547,9 +673,19 @@ class GraphView(QGraphicsView):
         self._pending_selection_hash = None
         self._node_items.clear()
         self._edge_items.clear()
+        self._label_items.clear()
         self._content_rect = QRectF()
         self._graph_rect = QRectF()
         self._scene.clear()
+        # Сцена очищена вместе с обзорным элементом: следующие данные должны
+        # попасть в новую сцену.
+        self._overview_item = None
+        self._overview_active = False
+        self._detail_visible = True
+        self._overview_edges.clear()
+        self._overview_nodes.clear()
+        self._overview_head = None
+        self._labels_visible = True
         self._selected_hash = None
         self._panning = False
         self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
@@ -569,6 +705,10 @@ class GraphView(QGraphicsView):
         сдвиг пределами ``sceneRect``. Запас в один экран с каждой стороны
         позволяет довести видимую область до любой позиции, которую разрешает
         ограничение перетаскивания (``_clamp_view_origin``).
+
+        ``setSceneRect`` пересчитывает диапазоны прокрутки и стоит кадр, поэтому
+        при зуме сцена расширяется только когда прежнего запаса перестало
+        хватать: уменьшать её не нужно, показать лишнее место ползунки не дают.
         """
         content = self._content_rect
         if content.isEmpty():
@@ -578,7 +718,10 @@ class GraphView(QGraphicsView):
         viewport = self.viewport().rect()
         pad_x = max(SCENE_MARGIN, viewport.width() / scale)
         pad_y = max(SCENE_MARGIN, viewport.height() / scale)
-        self._scene.setSceneRect(content.adjusted(-pad_x, -pad_y, pad_x, pad_y))
+        target = content.adjusted(-pad_x, -pad_y, pad_x, pad_y)
+        if self._scene.sceneRect().contains(target):
+            return
+        self._scene.setSceneRect(target)
 
     def _clamp_view_origin(
         self, origin: QPointF, *, current: QPointF | None = None
@@ -650,13 +793,126 @@ class GraphView(QGraphicsView):
             return
         self._apply_origin(self.mapToScene(QPoint(0, 0)))
 
+    # --- уровни детализации ---
+
+    def _apply_level_of_detail(self) -> None:
+        """Выбирает режим отрисовки по текущему масштабу.
+
+        Пока сцена строится порциями, обзорные данные ещё неполные: остаёмся в
+        detail-режиме до ``_finish_build``.
+        """
+        if self._building or not self._node_items:
+            self._set_overview(False)
+            return
+        overview = self._overview_item is not None and self._is_overview_zoom()
+        self._set_overview(overview)
+        self._set_labels_visible(
+            not overview and self.zoom_factor >= LABEL_MIN_ZOOM
+        )
+
+    def _is_overview_zoom(self) -> bool:
+        """Нужен ли обзорный режим; выход из него — с гистерезисом."""
+        zoom = self.zoom_factor
+        limit = OVERVIEW_EXIT_ZOOM if self._overview_active else OVERVIEW_MAX_ZOOM
+        return zoom < limit
+
+    def _set_overview(self, active: bool) -> None:
+        """Переключает detail/overview и обновляет маркеры обзорного режима."""
+        if self._overview_active == active:
+            if active and self._overview_item is not None:
+                self._overview_item.sync(
+                    self.zoom_factor, self._selected_position()
+                )
+            return
+        self._overview_active = active
+        self._set_detail_visible(not active)
+        item = self._overview_item
+        if item is not None:
+            # Скрытый элемент всё равно участвует в обходе сцены на каждом
+            # кадре, поэтому вне обзорного режима он из сцены убирается.
+            if active and item.scene() is not self._scene:
+                self._scene.addItem(item)
+            elif not active and item.scene() is self._scene:
+                self._scene.removeItem(item)
+            item.setVisible(active)
+            item.sync(self.zoom_factor, self._selected_position())
+        self.viewport().update()
+
+    def _set_detail_visible(self, visible: bool) -> None:
+        """Скрывает или показывает элементы обычного режима.
+
+        Переключение поштучное: группа под общим корнем ускорила бы его, но
+        замедлила бы выборку элементов из индекса сцены на каждом кадре. Порог
+        масштаба пересекается редко, поэтому разовая пауза предпочтительнее.
+        """
+        if self._detail_visible == visible:
+            return
+        self._detail_visible = visible
+        for item in self._edge_items:
+            item.setVisible(visible)
+        for item in self._node_items.values():
+            item.setVisible(visible)
+
+    def _set_labels_visible(self, visible: bool) -> None:
+        """Скрывает подписи ref, когда их текст на экране неразборчив."""
+        if self._labels_visible == visible:
+            return
+        self._labels_visible = visible
+        for item in self._label_items:
+            item.setVisible(visible)
+
+    def _selected_position(self) -> QPointF | None:
+        """Положение выбранного узла в координатах сцены для обзорного режима."""
+        if self._selected_hash is None:
+            return None
+        item = self._node_items.get(self._selected_hash)
+        return None if item is None else item.scenePos()
+
+    # --- выбор и попадание мышью ---
+
     def _select_commit(self, item: _CommitNodeItem, *, emit: bool) -> None:
         self._scene.clearSelection()
         item.setSelected(True)
         self._selected_hash = item.commit_hash
         self._pending_selection_hash = None
+        if self._overview_item is not None:
+            self._overview_item.set_selection(item.scenePos())
         if emit:
             self.commit_selected.emit(item.commit_hash)
+
+    def _clear_selection(self) -> None:
+        self._scene.clearSelection()
+        self._selected_hash = None
+        self._pending_selection_hash = None
+        if self._overview_item is not None:
+            self._overview_item.set_selection(None)
+
+    def _node_at(self, position: QPoint) -> _CommitNodeItem | None:
+        """Узел под точкой окна с учётом текущего режима отрисовки."""
+        if self._overview_active:
+            return self._overview_node_at(position)
+        return self._commit_item_at(position)
+
+    def _overview_node_at(self, position: QPoint) -> _CommitNodeItem | None:
+        """Ближайший узел в пределах допуска.
+
+        В обзорном режиме узлы субпиксельные, поэтому попадание по точной фигуре
+        невозможно: выбирается ближайший к клику коммит, если он ближе допуска.
+        """
+        point = self.mapToScene(position)
+        scale = max(self.zoom_factor, MIN_ZOOM)
+        limit = OVERVIEW_PICK_RADIUS_PX / scale
+        best: _CommitNodeItem | None = None
+        best_distance = limit * limit
+        for item in self._node_items.values():
+            position_scene = item.scenePos()
+            dx = position_scene.x() - point.x()
+            dy = position_scene.y() - point.y()
+            distance = dx * dx + dy * dy
+            if distance <= best_distance:
+                best_distance = distance
+                best = item
+        return best
 
     def _commit_item_at(self, position: QPoint) -> _CommitNodeItem | None:
         item = self.itemAt(position)
@@ -706,6 +962,7 @@ class GraphView(QGraphicsView):
         if not on_content:
             # Точка вне содержимого: якорить нечего, зато граф нельзя потерять.
             self._apply_origin(self.mapToScene(QPoint(0, 0)), strict=True)
+        self._apply_level_of_detail()
 
     def _add_ref_labels(
         self,
@@ -723,6 +980,9 @@ class GraphView(QGraphicsView):
             item.setParentItem(node_item)
             item.setPos(NODE_RADIUS + LABEL_OFFSET_X, y)
             y += item.boundingRect().height() + LABEL_GAP
+        self._label_items.extend(label_items)
+        for item in label_items:
+            item.setVisible(self._labels_visible)
 
     def _display_labels(
         self,
@@ -820,10 +1080,16 @@ class _CommitNodeItem(QGraphicsItem):
         super().__init__()
         self.node = node
         self.commit_hash = node.commit_hash
-        self._color = color
         self._is_merge = is_merge
         self._is_head = is_head
         self._radius = NODE_RADIUS + (MERGE_RADIUS_BONUS if is_merge else 0.0)
+        # Перья и кисти не меняются за время жизни элемента: создавать их на
+        # каждый кадр дорого, когда элементов тысячи.
+        self._selection_pen = QPen(QColor("#0f172a"), 2.0)
+        self._head_pen = QPen(color.lighter(140), 2.0)
+        self._body_brush = QBrush(color)
+        self._body_pen = QPen(color.darker(140), 1.2)
+        self._merge_brush = QBrush(QColor("#ffffff"))
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
@@ -847,24 +1113,22 @@ class _CommitNodeItem(QGraphicsItem):
         option: QStyleOptionGraphicsItem,
         widget: QWidget | None = None,
     ) -> None:
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         if self.isSelected():
-            painter.setPen(QPen(QColor("#0f172a"), 2.0))
+            painter.setPen(self._selection_pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(QPointF(0.0, 0.0), self._radius + 4.5, self._radius + 4.5)
 
         if self._is_head:
-            painter.setPen(QPen(self._color.lighter(140), 2.0))
+            painter.setPen(self._head_pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(QPointF(0.0, 0.0), self._radius + 2.5, self._radius + 2.5)
 
-        painter.setBrush(QBrush(self._color))
-        painter.setPen(QPen(self._color.darker(140), 1.2))
+        painter.setBrush(self._body_brush)
+        painter.setPen(self._body_pen)
         painter.drawEllipse(QPointF(0.0, 0.0), self._radius, self._radius)
 
         if self._is_merge:
-            painter.setBrush(QBrush(QColor("#ffffff")))
+            painter.setBrush(self._merge_brush)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(QPointF(0.0, 0.0), 2.8, 2.8)
 
@@ -904,7 +1168,6 @@ class _RefLabelItem(QGraphicsItem):
     def __init__(self, label: _LabelSpec, lane_color: QColor) -> None:
         super().__init__()
         self.label = label
-        self._lane_color = lane_color
 
         font = QFont()
         font.setPointSizeF(LABEL_FONT_SIZE)
@@ -915,6 +1178,30 @@ class _RefLabelItem(QGraphicsItem):
         self._text_width = max(text_width, 8.0)
         self._height = max(metrics.height(), 13.0) + 2.0 * LABEL_PADDING_Y
         self._width = self._text_width + 2.0 * LABEL_PADDING_X
+
+        # Геометрия и оформление подписи постоянны: заполняем их один раз,
+        # чтобы paint не создавал путь и цвета на каждый кадр.
+        self._text_rect = self.boundingRect().adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = min(
+            self._text_rect.height() / 2.0, self._text_rect.width() / 2.0
+        )
+        self._path = QPainterPath()
+        self._path.addRoundedRect(self._text_rect, radius, radius)
+
+        if label.is_current:
+            self._fill = QBrush(lane_color)
+            border = QPen(lane_color.darker(140), 1.0)
+            self._text_color = QColor("#ffffff")
+        elif label.is_remote:
+            self._fill = QBrush(QColor("#ffffff"))
+            border = QPen(QColor("#94a3b8"), 1.0, Qt.PenStyle.DashLine)
+            self._text_color = QColor("#475569")
+        else:
+            self._fill = QBrush(QColor("#ffffff"))
+            border = QPen(QColor("#cbd5e1"), 1.0)
+            self._text_color = QColor("#334155")
+        border.setCosmetic(True)
+        self._border = border
 
         self.setZValue(1.0)
         self.setToolTip(label.full_name or label.text)
@@ -928,33 +1215,117 @@ class _RefLabelItem(QGraphicsItem):
         option: QStyleOptionGraphicsItem,
         widget: QWidget | None = None,
     ) -> None:
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.boundingRect().adjusted(0.5, 0.5, -0.5, -0.5)
-        radius = min(rect.height() / 2.0, rect.width() / 2.0)
-        path = QPainterPath()
-        path.addRoundedRect(rect, radius, radius)
-
-        if self.label.is_current:
-            fill = self._lane_color
-            border = QPen(self._lane_color.darker(140), 1.0)
-            text_color = QColor("#ffffff")
-        elif self.label.is_remote:
-            fill = QColor("#ffffff")
-            border = QPen(QColor("#94a3b8"), 1.0, Qt.PenStyle.DashLine)
-            text_color = QColor("#475569")
-        else:
-            fill = QColor("#ffffff")
-            border = QPen(QColor("#cbd5e1"), 1.0)
-            text_color = QColor("#334155")
-        border.setCosmetic(True)
-
-        painter.fillPath(path, QBrush(fill))
-        painter.setPen(border)
-        painter.drawPath(path)
+        # Кисть и перо выставляются явно: drawPath и заливает, и обводит путь,
+        # поэтому от унаследованной кисти не должно зависеть ничего.
+        painter.setBrush(self._fill)
+        painter.setPen(self._border)
+        painter.drawPath(self._path)
         painter.setFont(self._font)
-        painter.setPen(text_color)
+        painter.setPen(self._text_color)
         painter.drawText(
-            rect,
+            self._text_rect,
             int(Qt.AlignmentFlag.AlignCenter),
             self.label.text,
         )
+
+
+class _GraphOverviewItem(QGraphicsItem):
+    """Обзорный режим: весь граф рисуется несколькими примитивами.
+
+    Кадр с тысячами отдельных ``QGraphicsItem`` стоит десятки и сотни
+    миллисекунд, хотя при сильном отдалении геометрия уже субпиксельная. Здесь
+    рёбра каждой дорожки сведены в один путь, а узлы — в один набор точек на
+    цвет, поэтому время кадра не зависит от размера истории.
+
+    Подписи ref, маркеры merge и кольцо HEAD в этом режиме не рисуются: они
+    неразличимы на таком масштабе. Остаются маркеры HEAD и выделения — уже
+    постоянного размера в пикселях окна, чтобы выбор не терялся.
+    """
+
+    def __init__(
+        self,
+        content_rect: QRectF,
+        edges: Sequence[tuple[QColor, QPainterPath]],
+        nodes: Sequence[tuple[QColor, QPolygonF]],
+        *,
+        head_position: QPointF | None,
+    ) -> None:
+        super().__init__()
+        self._rect = QRectF(content_rect)
+        self._edges: list[tuple[QPen, QPainterPath]] = [
+            (self._edge_pen(color), path) for color, path in edges
+        ]
+        self._nodes: list[tuple[QPen, QPolygonF]] = [
+            (self._dot_pen(color), points) for color, points in nodes
+        ]
+        self._head_position = head_position
+        self._selection_position: QPointF | None = None
+        self._zoom = 1.0
+
+        self._head_pen = QPen(QColor("#ffffff"), 2.0)
+        self._head_pen.setCosmetic(True)
+        self._selection_pen = QPen(QColor("#0f172a"), 2.0)
+        self._selection_pen.setCosmetic(True)
+
+        self.setZValue(-1.0)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+    @staticmethod
+    def _edge_pen(color: QColor) -> QPen:
+        """Ребро — волосок в один пиксель окна независимо от масштаба."""
+        pen = QPen(color, 0.0)
+        pen.setCosmetic(True)
+        return pen
+
+    @staticmethod
+    def _dot_pen(color: QColor) -> QPen:
+        """Узел — точка диаметром с обычный узел в координатах сцены."""
+        pen = QPen(color, 2.0 * NODE_RADIUS)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        return pen
+
+    def sync(self, zoom: float, selection: QPointF | None) -> None:
+        """Передаёт текущий масштаб: от него зависит размер маркеров."""
+        self._selection_position = selection
+        zoom = max(zoom, MIN_ZOOM)
+        if zoom != self._zoom:
+            # Радиус маркеров задан в пикселях окна, поэтому его проекция в
+            # координатах сцены меняется вместе с масштабом.
+            self.prepareGeometryChange()
+            self._zoom = zoom
+        self.update()
+
+    def set_selection(self, position: QPointF | None) -> None:
+        self._selection_position = position
+        self.update()
+
+    def boundingRect(self) -> QRectF:
+        pad = OVERVIEW_MARKER_RADIUS_PX / max(self._zoom, MIN_ZOOM) + 2.0
+        return self._rect.adjusted(-pad, -pad, pad, pad)
+
+    def paint(
+        self,
+        painter: QPainter,
+        option: QStyleOptionGraphicsItem,
+        widget: QWidget | None = None,
+    ) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for pen, path in self._edges:
+            painter.setPen(pen)
+            painter.drawPath(path)
+        for pen, points in self._nodes:
+            painter.setPen(pen)
+            painter.drawPoints(points)
+
+        radius = OVERVIEW_MARKER_RADIUS_PX / max(self._zoom, MIN_ZOOM)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if self._head_position is not None:
+            painter.setPen(self._head_pen)
+            painter.drawEllipse(self._head_position, radius, radius)
+        if self._selection_position is not None:
+            painter.setPen(self._selection_pen)
+            painter.drawEllipse(self._selection_position, radius, radius)
+        painter.restore()
